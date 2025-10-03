@@ -63,7 +63,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.0.0"
+VERSION     = "1.1.0"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -72,7 +72,7 @@ SETTINGS_PAGE = False
 CREATOR_URL = os.getenv("FNP_CREATOR_URL", "https://t.me/tinechelovec")
 GROUP_URL   = os.getenv("FNP_GROUP_URL",   "https://t.me/dev_thc_chat")
 CHANNEL_URL = os.getenv("FNP_CHANNEL_URL", "https://t.me/by_thc")
-GITHUB_URL  = os.getenv("FNP_GITHUB_URL",  "https://github.com/tinechelovec/Funpay-Telegram-Stars")
+GITHUB_URL  = os.getenv("FNP_GITHUB_URL",  "https://github.com/tinechelovec/FPC-Plugin-Telegram-Stars")
 
 FRAGMENT_BASE          = os.getenv("FRAGMENT_BASE", "https://api.fragment-api.com/v1")
 FRAGMENT_AUTH_URL      = os.getenv("FRAGMENT_AUTH_URL", f"{FRAGMENT_BASE}/auth/authenticate/")
@@ -112,6 +112,7 @@ def _get_cfg(chat_id: Any) -> dict:
     data = _load_settings()
     key = str(chat_id)
     cfg = data.get(key) or {}
+    cfg.setdefault("plugin_enabled", True)
     cfg.setdefault("lots_active", False)
     cfg.setdefault("auto_refund", False)
     cfg.setdefault("auto_deactivate", True)
@@ -174,6 +175,9 @@ HELP_TEXT = f"""
 <b>Важно</b>
 Категория FunPay фиксирована: <code>2418</code> (Telegram Stars).
 
+<b>Дисклеймер</b>
+Автор НИКОГДА НЕ ПРОДАВАЛ этот плагин. Любые платные перепродажи совершаются третьими лицами по их инициативе. Исходники доступны на GitHub (см. ссылку внизу).
+
 <b>Как привязать токен (JWT)</b>
 1) Откройте <i>Настройки → Токен → Создать токен</i>.
 2) Введите <b>API-ключ</b> из <code>fragment-api.com/dashboard</code>.
@@ -214,6 +218,7 @@ def _settings_text(chat_id: Any) -> str:
         lots_line += f" <i>(авто-выкл: {reason})</i>"
     return (
         f"<b>Текущие настройки</b>\n\n"
+        f"• Плагин: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n"
         f"{lots_line}\n"
         f"• Автовозврат: <b>{_state_on(cfg.get('auto_refund', False))}</b>\n"
         f"• Автодеактивация: <b>{_state_on(cfg.get('auto_deactivate', True))}</b>\n"
@@ -230,16 +235,26 @@ def _settings_text(chat_id: Any) -> str:
 def _token_text(chat_id: Any) -> str:
     cfg = _get_cfg(chat_id)
     token_state = "Токен привязан ✅" if cfg.get("fragment_jwt") else "Пока не создан токен ❌"
-    wallet_ver  = cfg.get("wallet_version") or "—"
     balance_ton = cfg.get("balance_ton")
     balance_txt = f"{balance_ton} TON" if balance_ton is not None else "—"
     return (
         f"<b>Токен (JWT)</b>\n\n"
         f"• Состояние: <b>{token_state}</b>\n"
-        f"• Версия кошелька: <code>{wallet_ver}</code>\n"
         f"• Баланс: <code>{balance_txt}</code>\n\n"
         "Создайте токен, следуя шагам ниже."
     )
+
+def _toggle_plugin(bot, call):
+    chat_id = call.message.chat.id
+    cfg = _get_cfg(chat_id)
+    new_state = not bool(cfg.get("plugin_enabled", True))
+    _set_cfg(chat_id, plugin_enabled=new_state)
+    try:
+        bot.answer_callback_query(call.id, "Плагин включён." if new_state else "Плагин выключен.")
+    except Exception:
+        pass
+    _open_settings(bot, call)
+
 
 def _stars_text(chat_id: Any) -> str:
     cfg = _get_cfg(chat_id)
@@ -459,6 +474,31 @@ def _authenticate_fragment(api_key: str, phone_number: str, version: str, mnemon
     except Exception as e:
         logger.warning(f"Authenticate failed: {e}")
         return None, {"error": str(e)}, 0
+    
+def _is_too_many_attempts(raw_resp: Any) -> tuple[bool, Optional[int]]:
+    text = ""
+    try:
+        if isinstance(raw_resp, dict):
+            parts = []
+            for k in ("non_field_errors", "errors", "detail", "message", "error"):
+                v = raw_resp.get(k)
+                if isinstance(v, list):
+                    parts.extend([str(x) for x in v])
+                elif isinstance(v, (str, int, float)):
+                    parts.append(str(v))
+            text = " ".join(parts) if parts else json.dumps(raw_resp, ensure_ascii=False)
+        else:
+            text = str(raw_resp)
+    except Exception:
+        text = str(raw_resp)
+
+    low = text.lower()
+    if "too many login attempts" in low:
+        m = _re.search(r"in\s+(\d+)\s+seconds", text, _re.I)
+        sec = int(m.group(1)) if m else None
+        return True, sec
+    return False, None
+
 
 def _get_my_lots_by_category(cardinal: "Cardinal", category_id: int) -> Dict[int, Any]:
     lots: Dict[int, Any] = {}
@@ -472,8 +512,36 @@ def _get_my_lots_by_category(cardinal: "Cardinal", category_id: int) -> Dict[int
         logger.warning(f"_get_my_lots_by_category failed: {e}")
     return lots
 
+def _is_stars_lot(cardinal: "Cardinal", lot_id: int) -> bool:
+    try:
+        fields = cardinal.account.get_lot_fields(int(lot_id))
+        if not fields:
+            return False
+        sub = getattr(fields, "subcategory", None) or getattr(fields, "subcat", None)
+        cid = (getattr(sub, "id", None) if sub else None)
+        if cid is None:
+            cid = getattr(fields, "subcategory_id", None) or getattr(fields, "category_id", None)
+        return int(cid) == int(FNP_STARS_CATEGORY_ID)
+    except Exception:
+        return False
+
+def _order_is_stars(order: Any) -> bool:
+    try:
+        cand = (
+            getattr(order, "subcategory_id", None)
+            or getattr(order, "category_id", None)
+            or getattr(getattr(order, "subcategory", None), "id", None)
+            or getattr(getattr(order, "category", None), "id", None)
+        )
+        return cand is None or int(cand) == int(FNP_STARS_CATEGORY_ID)
+    except Exception:
+        return True
+
 def _activate_lot(cardinal: "Cardinal", lot_id: int) -> bool:
     try:
+        if not _is_stars_lot(cardinal, lot_id):
+            logger.warning(f"_activate_lot skipped: lot {lot_id} not in category {FNP_STARS_CATEGORY_ID}")
+            return False
         fields = cardinal.account.get_lot_fields(int(lot_id))
         if not fields:
             return False
@@ -487,6 +555,9 @@ def _activate_lot(cardinal: "Cardinal", lot_id: int) -> bool:
 
 def _deactivate_lot(cardinal: "Cardinal", lot_id: int) -> bool:
     try:
+        if not _is_stars_lot(cardinal, lot_id):
+            logger.warning(f"_deactivate_lot skipped: lot {lot_id} not in category {FNP_STARS_CATEGORY_ID}")
+            return False
         fields = cardinal.account.get_lot_fields(int(lot_id))
         if not fields:
             return False
@@ -498,7 +569,26 @@ def _deactivate_lot(cardinal: "Cardinal", lot_id: int) -> bool:
         logger.warning(f"_deactivate_lot {lot_id} failed: {e}")
         return False
 
+
+def _apply_star_lots_state(cardinal: "Cardinal", star_lots: List[dict], enabled: bool) -> Dict[str, List[int]]:
+    report = {"ok": [], "skip": [], "err": []}
+    for it in star_lots or []:
+        lot_id = it.get("lot_id")
+        if not lot_id:
+            continue
+        try:
+            if not _is_stars_lot(cardinal, int(lot_id)):
+                report["skip"].append(int(lot_id))
+                continue
+            ok = _activate_lot(cardinal, lot_id) if enabled else _deactivate_lot(cardinal, lot_id)
+            (report["ok"] if ok else report["skip"]).append(int(lot_id))
+        except Exception as e:
+            report["err"].append(int(lot_id))
+            logger.warning(f"apply_star_lots_state {lot_id} failed: {e}")
+    return report
+
 def _apply_category_state(cardinal: "Cardinal", category_id: int, enabled: bool) -> Dict[str, List[int]]:
+    category_id = int(FNP_STARS_CATEGORY_ID)
     report = {"ok": [], "skip": [], "err": []}
     lots = _get_my_lots_by_category(cardinal, category_id)
     for lot_id, _ in (lots or {}).items():
@@ -510,18 +600,6 @@ def _apply_category_state(cardinal: "Cardinal", category_id: int, enabled: bool)
             logger.warning(f"apply_category_state {lot_id} failed: {e}")
     return report
 
-def _apply_star_lots_state(cardinal: "Cardinal", star_lots: List[dict], enabled: bool) -> Dict[str, List[int]]:
-    report = {"ok": [], "skip": [], "err": []}
-    for it in star_lots or []:
-        lot_id = it.get("lot_id")
-        if not lot_id: continue
-        try:
-            ok = _activate_lot(cardinal, lot_id) if enabled else _deactivate_lot(cardinal, lot_id)
-            (report["ok"] if ok else report["skip"]).append(int(lot_id))
-        except Exception as e:
-            report["err"].append(int(lot_id))
-            logger.warning(f"apply_star_lots_state {lot_id} failed: {e}")
-    return report
 
 def _parse_fragment_error_text(response_text: str, status_code: int = 0) -> str:
     fallback = "Ошибка обработки заказа."
@@ -605,6 +683,7 @@ CBT_SETTINGS   = f"{UUID}:settings"
 CBT_HELP       = f"{UUID}:help"
 CBT_FSM_CANCEL = f"{UUID}:fsm_cancel"
 CBT_BACK_PLUGINS = getattr(CBT, "BACK", f"{UUID}:back")
+CBT_TOGGLE_PLUGIN = f"{UUID}:toggle_plugin"
 
 CBT_TOGGLE_LOTS   = f"{UUID}:toggle_lots"
 CBT_TOGGLE_REFUND = f"{UUID}:toggle_refund"
@@ -642,12 +721,13 @@ def _help_kb() -> InlineKeyboardMarkup:
     kb.row(B("👤 Создатель", url=CREATOR_URL), B("👥 Группа", url=GROUP_URL))
     kb.row(B("📣 Канал", url=CHANNEL_URL), B("💻 GitHub", url=GITHUB_URL))
     kb.add(B("🏠 Домой", callback_data=CBT_HOME))
-    kb.add(B("◀️ Назад", callback_data=CBT_BACK_PLUGINS))
+    kb.add(B("◀️ Назад", callback_data=CBT_HOME))
     return kb
 
 def _settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
     cfg = _get_cfg(chat_id)
     kb = K()
+    kb.row(B(f"Плагин: {_state_on(cfg.get('plugin_enabled', True))}", callback_data=CBT_TOGGLE_PLUGIN))
     state_txt, _ = _lots_state_summary(cfg)
     kb.row(B(f"Лоты: {state_txt}", callback_data=CBT_TOGGLE_LOTS))
     kb.row(
@@ -661,7 +741,7 @@ def _settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
     kb.row(B("⭐ Звёзды (лоты)", callback_data=CBT_STARS))
     kb.row(B("🔄 Обновить", callback_data=CBT_REFRESH))
     kb.add(B("🏠 Домой", callback_data=CBT_HOME))
-    kb.add(B("◀️ Назад", callback_data=CBT_BACK_PLUGINS))
+    kb.add(B("◀️ Назад", callback_data=CBT_HOME))
     return kb
 
 
@@ -827,7 +907,6 @@ def init_cardinal(cardinal: Cardinal):
             or c.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}")
             or c.data == f"{UUID}:0"
             or c.data == CBT_HOME
-            or c.data == CBT_BACK_PLUGINS
         )
     )
 
@@ -837,6 +916,7 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _open_token(bot, c), func=lambda c: c.data == CBT_TOKEN)
     tg.cbq_handler(lambda c: _open_stars(bot, c), func=lambda c: c.data == CBT_STARS)
     tg.cbq_handler(lambda c: _fsm_cancel(cardinal, c), func=lambda c: c.data == CBT_FSM_CANCEL)
+    tg.cbq_handler(lambda c: _toggle_plugin(bot, c), func=lambda c: c.data == CBT_TOGGLE_PLUGIN)
 
     tg.cbq_handler(lambda c: _select_wallet_version(bot, c), func=lambda c: c.data.startswith(f"{UUID}:ver:"))
 
@@ -860,11 +940,32 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _cb_confirm_send(cardinal, c),    func=lambda c: c.data == CBT_CONFIRM_SEND)
     tg.cbq_handler(lambda c: _cb_change_username(cardinal, c), func=lambda c: c.data == CBT_CHANGE_USERNAME)
     tg.cbq_handler(lambda c: _cb_cancel_flow(cardinal, c),     func=lambda c: c.data == CBT_CANCEL_FLOW)
+    tg.cbq_handler(lambda c: _go_main_menu(cardinal, c),     func=lambda c: c.data == CBT_BACK_PLUGINS)
+
 
 def _open_home(bot, call):
     _safe_edit(bot, call.message.chat.id, call.message.id, _about_text(), _home_kb())
     try: bot.answer_callback_query(call.id)
     except Exception: pass
+
+def _go_main_menu(cardinal: "Cardinal", call):
+    bot = cardinal.telegram.bot
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    for attr in ("open_main_menu", "show_main_menu", "menu", "open_menu", "start_menu", "home"):
+        fn = getattr(cardinal.telegram, attr, None) or getattr(cardinal, attr, None)
+        if callable(fn):
+            try:
+                fn(call.message.chat.id)
+                return
+            except Exception as e:
+                logger.warning(f"open main menu via {attr} failed: {e}")
+    _open_home(bot, call)
+
+
 
 def _open_settings(bot, call):
     chat_id = call.message.chat.id
@@ -956,8 +1057,8 @@ def _toggle_lots(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
 
-    if not cfg.get("fragment_jwt"):
-        bot.answer_callback_query(call.id, "Нельзя включить лоты без токена.", show_alert=True)
+    if not cfg.get("plugin_enabled", True):
+        bot.answer_callback_query(call.id, "Плагин выключен. Сначала включите его в настройках.", show_alert=True)
         return
 
     current = bool(cfg.get("lots_active", False))
@@ -1056,9 +1157,9 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
         state["step"] = "jwt_phone"
         _fsm[chat_id] = state
         cardinal.telegram.bot.send_message(
-        chat_id,
-        "Укажите телефон (без «+», только цифры), или /cancel:",
-        reply_markup=_kb_cancel_fsm()
+            chat_id,
+            "Укажите телефон (без «+», только цифры), или /cancel:",
+            reply_markup=_kb_cancel_fsm()
         )
         return
 
@@ -1079,11 +1180,29 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
     if state.get("step") == "jwt_seed":
         if text.lower() in ("/cancel", "cancel", "отмена"):
             _fsm.pop(chat_id, None); cardinal.telegram.bot.send_message(chat_id, "❌ Отменено."); return
+
         words = [w.strip() for w in text.replace("\n", " ").split(" ") if w.strip()]
         if len(words) != 24:
             cardinal.telegram.bot.send_message(chat_id, f"⚠️ Должно быть ровно 24 слова (сейчас {len(words)}). Повторите ввод или /cancel."); return
-        state["mnemonic"] = words; _fsm[chat_id] = state
-        api_key = state.get("api_key"); phone = state.get("phone"); wallet_ver = state.get("wallet_version") or "W5"
+
+        state["mnemonic"] = words
+        _fsm[chat_id] = state
+
+        api_key = state.get("api_key")
+        phone = state.get("phone")
+        wallet_ver = state.get("wallet_version") or "W5"
+
+        kb = K()
+        kb.add(B("✅ Я подтвердил вход в Telegram", callback_data=CBT_JWT_CONFIRMED))
+        kb.add(B("🔁 Отправить ещё раз", callback_data=CBT_JWT_RESEND))
+        kb.add(B("◀️ Назад", callback_data=CBT_TOKEN))
+        cardinal.telegram.bot.send_message(
+            chat_id,
+            "⏳ Отправляю запрос на авторизацию в Fragment.\n"
+            "Пожалуйста, подтвердите вход в Telegram и затем нажмите «Я подтвердил вход».",
+            reply_markup=kb, parse_mode="HTML"
+        )
+
         jwt, raw, sc = _authenticate_fragment(api_key=api_key, phone_number=phone, version=wallet_ver, mnemonics=words)
         if jwt:
             _set_cfg(chat_id, fragment_jwt=jwt)
@@ -1091,19 +1210,23 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
             ver, bal, resp = _check_fragment_wallet(jwt)
             if ver is not None or bal is not None or resp is not None:
                 _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
-            _fsm.pop(chat_id, None); return
-        try: pretty = json.dumps(raw, ensure_ascii=False, indent=2)
-        except Exception: pretty = str(raw)
-        msg = (
-            "Я отправил запрос на авторизацию в Fragment.\n"
-            f"Статус: <code>{sc}</code>\n"
-            "Если в Telegram пришёл запрос на вход — подтвердите его. После этого нажмите кнопку ниже.\n\n"
-            "<b>Ответ сервера</b> (для диагностики):\n"
-            f"<code>{pretty[:1500]}</code>"
-        )
-        kb = K(); kb.add(B("✅ Я подтвердил вход в Telegram", callback_data=CBT_JWT_CONFIRMED)); kb.add(B("🔁 Отправить ещё раз", callback_data=CBT_JWT_RESEND)); kb.add(B("◀️ Назад", callback_data=CBT_TOKEN))
-        cardinal.telegram.bot.send_message(chat_id, msg, reply_markup=kb, parse_mode="HTML"); return
-    
+            _fsm.pop(chat_id, None)
+            return
+
+        is_tma, wait_sec = _is_too_many_attempts(raw)
+        if sc == 400 and is_tma:
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                f"Подождите {wait_sec or 'несколько'} секунд, затем подтвредите вход и подождите ответа в плагине. ",
+                parse_mode="HTML"
+            )
+        else:
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                f"Пока токен не выдан (статус {sc}). Подтвердите вход в Telegram и нажмите «Я подтвердил вход».",
+                parse_mode="HTML"
+            )
+        return
 
     if state.get("step") == "star_add_qty":
         if text.lower() in ("/cancel", "cancel", "отмена"):
@@ -1136,7 +1259,7 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
         _set_cfg(chat_id, star_lots=items); _fsm.pop(chat_id, None)
         if _CARDINAL_REF is not None: _activate_lot(_CARDINAL_REF, lot_id)
         cardinal.telegram.bot.send_message(chat_id, f"✅ Добавлено: {qty} ⭐ (LOT {lot_id}). Управляйте в «⭐ Звёзды»."); return
-    
+
     if state.get("step") == "set_min_balance":
         if text.lower() in ("/cancel", "cancel", "отмена"):
             _fsm.pop(chat_id, None); cardinal.telegram.bot.send_message(chat_id, "❌ Отменено."); return
@@ -1152,6 +1275,7 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
         cardinal.telegram.bot.send_message(chat_id, f"✅ Порог сохранён: {val} TON")
         _log("info", f"MIN BALANCE set to {val} TON")
         return
+
 
 
 def _jwt_confirmed(bot, call):
@@ -1173,12 +1297,19 @@ def _jwt_confirmed(bot, call):
             _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
         _fsm.pop(chat_id, None)
     else:
-        try: text = json.dumps(raw, ensure_ascii=False, indent=2)[:1900]
-        except Exception: text = str(raw)[:1900]
-        bot.send_message(chat_id, f"⚠️ Токен пока не выдан. Статус: <code>{sc}</code>\nОтвет сервера:\n<code>{text}</code>", parse_mode="HTML")
+        is_tma, wait_sec = _is_too_many_attempts(raw)
+        if sc == 400 and is_tma:
+            bot.send_message(chat_id,
+                f"Слишком много попыток входа. Подождите {wait_sec or 'несколько'} секунд и попробуйте ещё раз "
+                "через «🔁 Отправить ещё раз» или «✅ Я подтвердил вход».")
+        else:
+            try: text = json.dumps(raw, ensure_ascii=False, indent=2)[:1900]
+            except Exception: text = str(raw)[:1900]
+            bot.send_message(chat_id, f"⚠️ Токен пока не выдан. Статус: <code>{sc}</code>\nОтвет сервера:\n<code>{text}</code>", parse_mode="HTML")
 
     try: _open_token(bot, call)
     except Exception: pass
+
 
 def _jwt_resend(bot, call):
     chat_id = call.message.chat.id
@@ -1188,6 +1319,7 @@ def _jwt_resend(bot, call):
     except Exception: pass
     if not (api_key and phone and words):
         bot.send_message(chat_id, "Не хватает данных для повтора."); return
+
     jwt, raw, sc = _authenticate_fragment(api_key=api_key, phone_number=phone, version=wallet_ver, mnemonics=words)
     if jwt:
         _set_cfg(chat_id, fragment_jwt=jwt); bot.send_message(chat_id, "✅ Успешно: токен создан и привязан.")
@@ -1195,11 +1327,37 @@ def _jwt_resend(bot, call):
         if ver is not None or bal is not None or resp is not None:
             _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
         _fsm.pop(chat_id, None); _open_token(bot, call); return
-    try: pretty = json.dumps(raw, ensure_ascii=False, indent=2)
-    except Exception: pretty = str(raw)
-    bot.send_message(chat_id, "Ответ сервера:\n<code>{}</code>".format(pretty[:1900]), parse_mode="HTML")
+
+    is_tma, wait_sec = _is_too_many_attempts(raw)
+    if sc == 400 and is_tma:
+        bot.send_message(chat_id,
+            f"Слишком много попыток входа. Подождите {wait_sec or 'несколько'} секунд и попробуйте снова.")
+    else:
+        try: pretty = json.dumps(raw, ensure_ascii=False, indent=2)
+        except Exception: pretty = str(raw)
+        bot.send_message(chat_id, "Ответ сервера:\n<code>{}</code>".format(pretty[:1900]), parse_mode="HTML")
+
 
 _pending_orders: Dict[str, List[Dict[str, Any]]] = {}
+_prompted_orders: Dict[str, set] = {}
+
+def _mark_prompted(chat_id: Any, order_id: Optional[Any]) -> None:
+    if order_id is None:
+        return
+    _prompted_orders.setdefault(str(chat_id), set()).add(str(order_id))
+
+def _was_prompted(chat_id: Any, order_id: Optional[Any]) -> bool:
+    if order_id is None:
+        return False
+    return str(order_id) in _prompted_orders.get(str(chat_id), set())
+
+def _unmark_prompted(chat_id: Any, order_id: Optional[Any]) -> None:
+    if order_id is None:
+        return
+    s = _prompted_orders.get(str(chat_id))
+    if s:
+        s.discard(str(order_id))
+
 
 def _q(chat_id: Any) -> List[Dict[str, Any]]:
     return _pending_orders.setdefault(str(chat_id), [])
@@ -1209,11 +1367,28 @@ def _current(chat_id: Any) -> Optional[Dict[str, Any]]:
     return q[0] if q else None
 
 def _push(chat_id: Any, item: Dict[str, Any]) -> None:
-    _q(chat_id).append(item)
+    q = _q(chat_id)
+    oid = item.get("order_id")
+    if oid and any(str(x.get("order_id")) == str(oid) for x in q):
+        for x in q:
+            if str(x.get("order_id")) == str(oid):
+                for k, v in item.items():
+                    if v is not None:
+                        x[k] = v
+                x.setdefault("prompted", False)
+                break
+        return
+    item.setdefault("prompted", False)
+    q.append(item)
+
 
 def _pop_current(chat_id: Any) -> Optional[Dict[str, Any]]:
     q = _q(chat_id)
-    return q.pop(0) if q else None
+    item = q.pop(0) if q else None
+    if item and item.get("order_id"):
+        _unmark_prompted(chat_id, item.get("order_id"))
+    return item
+
 
 def _update_current(chat_id: Any, **updates) -> None:
     cur = _current(chat_id)
@@ -1235,20 +1410,24 @@ def new_order_handler(cardinal: Cardinal, event):
         chat_id = getattr(event, "chat_id", None) or getattr(getattr(event, "order", None), "chat_id", None)
         cfg = _get_cfg_for_orders(chat_id if chat_id is not None else "__orders__")
 
+        if not cfg.get("plugin_enabled", True):
+            return
+
         order = getattr(event, "order", None)
+        if order is not None and not _order_is_stars(order):
+            return
+
         title = getattr(order, "title", None) or getattr(order, "name", None) or ""
         qty = _extract_qty_from_title(title) or 50
 
-        order_id = (getattr(order, "id", None) or
-                    getattr(order, "order_id", None) or
-                    getattr(event, "order_id", None))
+        order_id = (
+            getattr(order, "id", None)
+            or getattr(order, "order_id", None)
+            or getattr(event, "order_id", None)
+        )
 
         _push(chat_id, {"qty": qty, "order_id": order_id, "stage": "await_username", "candidate": None})
 
-        if len(_q(chat_id)) > 1:
-            _log("info", f"QUEUE push chat={chat_id} size={len(_q(chat_id))}")
-            return
-        
         chat_text = getattr(order, "buyer_message", None) or getattr(event, "message", None) or ""
         username = _extract_username_from_text(chat_text)
         jwt = cfg.get("fragment_jwt")
@@ -1260,15 +1439,21 @@ def new_order_handler(cardinal: Cardinal, event):
             if resp.get("ok"):
                 _safe_send(cardinal, chat_id, f"✅ Готово: отправлено {qty}⭐ на @{username.lstrip('@')}.")
                 if order_id:
-                    _safe_send(cardinal, chat_id,
-                               "Пожалуйста, подтвердите заказ и, если не трудно, оставьте отзыв:\n"
-                               f"https://funpay.com/orders/{order_id}/")
+                    _safe_send(
+                        cardinal, chat_id,
+                        "Пожалуйста, подтвердите заказ и, если не трудно, оставьте отзыв:\n"
+                        f"https://funpay.com/orders/{order_id}/"
+                    )
+                _mark_prompted(chat_id, order_id)
                 _pop_current(chat_id)
                 if _has_queue(chat_id):
-                    nxt = _current(chat_id); qn = int(nxt.get("qty", 50))
-                    _safe_send(cardinal, chat_id,
-                               f"Следующий заказ: {qn}⭐.\n"
-                               "Напишите ваш Telegram-тег в формате @username одной строкой.")
+                    nxt = _current(chat_id)
+                    qn = int(nxt.get("qty", 50))
+                    _safe_send(
+                        cardinal, chat_id,
+                        f"Следующий заказ: {qn}⭐.\n"
+                        "Напишите ваш Telegram-тег в формате @username одной строкой."
+                    )
             else:
                 msg = _parse_fragment_error_text(resp.get("text", ""), status_code=resp.get("status", 0))
                 _safe_send(cardinal, chat_id, f"❌ {msg}")
@@ -1282,15 +1467,13 @@ def new_order_handler(cardinal: Cardinal, event):
                     _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
 
                 _maybe_auto_deactivate(cardinal, cfg, chat_id)
-            return
-        
-        _safe_send(cardinal, chat_id,
-                   "Спасибо за заказ! ✨\n"
-                   "Пожалуйста, отправьте ваш Telegram-тег ОДНОЙ строкой в формате @username.\n"
-                   "Пример: @username")
+
+        else:
+            _log("info", f"ORDER #{order_id}: queued, waiting for username/system message.")
 
     except Exception as e:
         logger.exception(f"new_order_handler error: {e}")
+
 
 def _do_confirm_send(cardinal: "Cardinal", chat_id):
     pend = _current(chat_id) or {}
@@ -1400,22 +1583,35 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
 
         cfg = _get_cfg_for_orders(chat_id)
 
+        if not cfg.get("plugin_enabled", True):
+            return
+
         if author == "funpay" and _funpay_is_system_paid_message(text):
             qty, oid = _funpay_extract_qty_and_order_id(text)
             if qty is None:
                 qty = 50
+
+            if not (isinstance(chat_id, int) or str(chat_id).isdigit()):
+                return
+
+            if _was_prompted(chat_id, oid):
+                return
 
             _push(chat_id, {"qty": qty, "order_id": oid, "stage": "await_username", "candidate": None})
             if len(_q(chat_id)) > 1:
                 _log("info", f"QUEUE push chat={chat_id} size={len(_q(chat_id))}")
                 return
 
-            _safe_send(
-                cardinal, chat_id,
-                f"Спасибо за покупку {qty}⭐!\n"
-                "Напишите ваш Telegram-тег ОДНОЙ строкой в формате @username.\n"
-                "Пример: @username"
-            )
+            pend = _current(chat_id)
+            if pend and not pend.get("prompted"):
+                _safe_send(
+                    cardinal, chat_id,
+                    f"Спасибо за покупку {qty}⭐!\n"
+                    "Напишите ваш Telegram-тег ОДНОЙ строкой в формате @username.\n"
+                    "Пример: @username"
+                )
+                _update_current(chat_id, prompted=True)
+                _mark_prompted(chat_id, oid)
             return
 
         if author in ["funpay", my_user] or not text:
@@ -1459,7 +1655,6 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
 
     except Exception as e:
         logger.exception(f"new_message_handler error: {e}")
-
 
 BIND_TO_PRE_INIT    = [init_cardinal]
 BIND_TO_NEW_MESSAGE = [new_message_handler]
