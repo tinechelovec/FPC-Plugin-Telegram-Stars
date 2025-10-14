@@ -64,7 +64,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.3.0"
+VERSION     = "1.4.0"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -160,6 +160,7 @@ def _get_cfg(chat_id: Any) -> dict:
     cfg.setdefault("manual_refund_enabled", False)
     cfg.setdefault("manual_refund_priority", True)
     cfg.setdefault("preorder_username", False)
+    cfg.setdefault("markup_percent", 0.0)
     cfg.setdefault("fragment_jwt", None)
     cfg.setdefault("wallet_version", None)
     cfg.setdefault("balance_ton", None)
@@ -203,6 +204,13 @@ def _safe_edit(bot, chat_id: Any, msg_id: int, text: str, kb=None):
             return
         raise
 
+def _safe_delete(bot, chat_id: Any, msg_id: Optional[int]):
+    try:
+        if msg_id:
+            bot.delete_message(chat_id, msg_id)
+    except Exception as e:
+        logger.debug(f"delete_message failed: {e}")
+
 def _about_text() -> str:
     return (
         "🧩 <b>Плагин:</b> FNP Stars\n"
@@ -230,46 +238,38 @@ HELP_TEXT = f"""
 4) Настройте порог баланса в TON (по желанию).  
 5) При необходимости подправьте тексты в «🧩 Сообщения».
 
-<b>Настройки (что делает каждый переключатель)</b>
-• <b>Плагин</b> — главный тумблер. Когда выключен, обработка заказов не выполняется.  
-• <b>Лоты</b> — массово включает/выключает все ваши звёздные лоты. Можно управлять каждым лотом отдельно в «⭐ Звёзды (лоты)» (ON/OFF, добавить/удалить, «Включить все»/«Выключить все»).  
-• <b>Автовозврат</b> — при неудачной покупке (ошибка продавца: баланс, авторизация, лимиты) плагин автоматически пытается вернуть средства по заказу.  
-• <b>Команда !бэк</b> — разрешает ручной возврат по запросу покупателя: <code>!бэк</code> или <code>!бэк #ORDERID</code> (если активных заказов несколько). Работает только пока заказ не финализирован (до удачной отправки звёзд).  
-• <b>Приоритет !бэк</b> — «ВЫШЕ» означает, что ручной возврат сработает даже если автовозврат выключен; «НИЖЕ» — команда недоступна, если автовозврат выключен.  
-• <b>Автодеактивация</b> — при падении баланса кошелька ниже порога TON автоматически выключает все лоты категории 2418 и помечает причину в настройках.  
-• <b>Ник из заказа</b> — если включено, плагин берёт @username прямо из заказа и ждёт системное сообщение FunPay «заказ оплачен», после чего делает покупку. Проверка существования ника в этот момент не выполняется (ускоряет процесс). Если Fragment вернёт «пользователь не найден», плагин запросит корректный ник.  
-• <b>Токен (JWT)</b> — управление авторизацией в Fragment API. Показывает состояние токена и текущий баланс TON.  
-• <b>Мин. баланс TON</b> — порог для автодеактивации лотов; изменяется числом с точкой или запятой.  
-• <b>🧩 Сообщения</b> — редактирование шаблонов ответов покупателю.
+<b>Переключатели</b>
+• <b>Плагин</b> — главный тумблер работы плагина.  
+• <b>Лоты</b> — массово включает/выключает все лоты (или только из списка звёздных, если он задан).  
+• <b>Автовозврат</b> — при ошибке продавца пытается вернуть средства автоматически.  
+• <b>Команда !бэк</b> — ручной возврат по запросу покупателя (<code>!бэк</code> или <code>!бэк #ORDERID</code>).  
+• <b>Приоритет !бэк</b> — выше/ниже автовозврата.  
+• <b>Автодеактивация</b> — при балансе ниже порога отключает лоты категории 2418.  
+• <b>Ник из заказа</b> — брать @username из заказа и покупать после «заказ оплачен».  
+• <b>Наценка</b> — массовое изменение цен на лоты звёзд.  
+• <b>Мин. баланс TON</b> — порог автодеактивации.  
+• <b>Токен (JWT)</b> — состояние авторизации и баланс TON.  
+• <b>🧩 Сообщения</b> — тексты ответов покупателю.
 
-<b>Токен (JWT)</b>
-1) Откройте <i>Настройки → Токен → Создать токен</i>.  
-2) Введите <b>API-ключ</b> из <code>fragment-api.com/dashboard</code>.  
-3) Укажите <b>Телефон</b> (без «+», только цифры).  
-4) Выберите <b>Версию кошелька</b> (W5 или V4R2).  
-5) Вставьте <b>24 слова</b> мнемофразы.  
-6) Подтвердите вход в официальном Telegram (если потребуется). После подтверждения токен привяжется, а баланс TON подтянется автоматически.  
-Также можно «Пересоздать» или «Удалить» токен.
+<b>Токен (JWT): как создать</b>
+1) Нажмите «🧩 Создать токен».  
+2) Введите <b>API-ключ</b> из <code>fragment-api.com/dashboard</code> и <b>телефон</b> (без «+»).  
+3) Выберите <b>версию кошелька</b> (обычно W5).  
+4) Вставьте <b>24 слова</b> мнемофразы.  
+5) Подтвердите вход в Telegram, дождитесь привязки. Баланс подтянется автоматически.
 
-<b>⭐ Звёзды (лоты)</b>
-— Добавляйте пары <code>кол-во → LOT_ID</code> и включайте нужные.  
-— Управляйте каждым лотом: ON/OFF, удалить. Есть «Включить все» и «Выключить все».  
-— Если список пуст, можно просто включать/выключать все лоты категории 2418 массово через переключатель «Лоты».
+<b>⭐ Лоты</b>
+• Добавляйте пары <code>кол-во → LOT_ID</code>, включайте/выключайте, удаляйте.  
+• Есть «Включить все»/«Выключить все», просмотр цены и быстрая смена цены.  
+• Если список пуст, тумблер «Лоты» управляет всей категорией 2418.
 
 <b>Как проходит продажа</b>
-1) <u>Если «Ник из заказа» ВКЛ</u>:  
-   • Плагин берёт ник из заказа и ждёт системное «оплачен».  
-   • После «оплачен» автоматически совершает покупку.  
-   • При ошибке «пользователь не найден» запросит корректный ник.  
-   • При ошибке продавца (баланс/авторизация/лимиты) — покажет причину и, если включён Автовозврат, попытается вернуть средства.  
-
-2) <u>Если «Ник из заказа» ВЫКЛ</u>:  
-   • Плагин просит покупателя прислать @username, показывает превью и ждёт подтверждение «+».  
-   • На «+» отправляет звёзды. При успехе — ссылка на заказ; при ошибке — причина и, при включённом Автовозврате, попытка вернуть средства.
+1) <u>Ник из заказа ВКЛ</u>: ник берётся из заказа → ждём «заказ оплачен» → покупка. При «user not found» запрашиваем верный ник.  
+2) <u>Ник из заказа ВЫКЛ</u>: плагин просит @username, показывает превью, ждёт «+», затем отправляет звёзды.
 
 <b>Возвраты</b>
-• <b>Автовозврат</b> — работает при ошибках продавца. Если выключен, плагин сообщит покупателю, что возврат оформит продавец вручную.  
-• <b>Ручной возврат (!бэк)</b> — покупатель может написать <code>!бэк</code>, а если активных заказов несколько — <code>!бэк #ORDERID</code>. Доступность команды зависит от настроек «Команда !бэк» и «Приоритет !бэк».
+• <b>Автовозврат</b> — при ошибке продавца (баланс/авторизация/лимиты/сеть).  
+• <b>Ручной</b> — покупатель пишет <code>!бэк</code> или <code>!бэк #ORDERID</code> (зависит от настроек и стадии заказа).
 
 <b>Подсказки</b>
 • Если баланс ниже порога — лоты будут отключены автоматически (причина отобразится в настройках).  
@@ -301,6 +301,7 @@ def _settings_text(chat_id: Any) -> str:
         f"• Автодеактивация: <b>{_state_on(cfg.get('auto_deactivate', True))}</b>\n"
         f"• Ручной возврат (!бэк): <b>{_state_on(cfg.get('manual_refund_enabled', False))}</b> (<i>{prio}</i>)\n"
         f"• Ник из заказа: <b>{_state_on(cfg.get('preorder_username', False))}</b> (<i>без проверки существования</i>)\n"
+        f"• Наценка на звёзды: <code>{cfg.get('markup_percent', 0.0)}%</code>\n"
         f"• Порог баланса (TON): <code>{cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)}</code>\n"
         f"• Токен (JWT): <b>{token_state}</b>\n"
         f"• Баланс: <code>{balance_txt}</code>\n"
@@ -346,15 +347,18 @@ def _toggle_preorder_username(bot, call):
 def _stars_text(chat_id: Any) -> str:
     cfg = _get_cfg(chat_id)
     items = cfg.get("star_lots") or []
+    header = f"<b>⚙️ Настройка лотов</b>\n\nТекущая наценка: <b>{cfg.get('markup_percent', 0.0)}%</b>\n\n"
     if not items:
         body = "Пока нет лотов со звёздами.\nНажмите «➕ Добавить лот»."
     else:
         rows = []
         for it in sorted(items, key=lambda x: (int(x.get('qty', 0)), int(x.get('lot_id', 0)))):
-            rows.append(f"• <b>{it.get('qty')}</b> ⭐ → LOT <code>{it.get('lot_id')}</code> — " +
-                        ("🟢 активен" if it.get('active') else "🔴 выключен"))
+            rows.append(
+                f"• <b>{it.get('qty')}</b> ⭐ → LOT <code>{it.get('lot_id')}</code> — " +
+                ("🟢 активен" if it.get('active') else "🔴 выключен")
+            )
         body = "\n".join(rows)
-    return "<b>⭐ Звёзды (лоты)</b>\n\n" + body
+    return header + body
 
 def _normalize_wallet_version(s: str) -> str:
     if not s:
@@ -622,7 +626,6 @@ def _is_too_many_attempts(raw_resp: Any) -> tuple[bool, Optional[int]]:
         return True, sec
     return False, None
 
-
 def _get_my_lots_by_category(cardinal: "Cardinal", category_id: int) -> Dict[int, Any]:
     lots: Dict[int, Any] = {}
     try:
@@ -728,6 +731,10 @@ def _parse_fragment_error_text(response_text: str, status_code: int = 0) -> str:
         data = json.loads(response_text)
     except Exception:
         data = None
+    
+    low_text = (response_text or "").lower()
+    if "seqno" in low_text and ("exit code -256" in low_text or 'get method "seqno"' in low_text):
+        return "Неверная версия кошелька или кошелёк не инициализирован. Пересоздайте токен, выбрав правильную версию (W5/V4R2), и выполните небольшую исходящую транзакцию."
 
     if status_code == 429:
         return "Слишком много запросов. Попробуйте ещё раз через минуту."
@@ -777,6 +784,9 @@ def _classify_send_failure(resp_text: str, status: int, username: str, jwt: Opti
 
     reason = _parse_fragment_error_text(resp_text, status)
     low = (reason or "").lower()
+
+    if "seqno" in (resp_text or "").lower():
+        return "seller", "Неверная версия кошелька у продавца или кошелёк не инициализирован."
 
     if any(t in low for t in ("username", "user not found", "not found", "invalid", "does not exist")):
         return "username", "Пользователь с таким @username не найден."
@@ -858,6 +868,13 @@ CBT_CHANGE_USERNAME = f"{UUID}:change_username"
 CBT_CANCEL_FLOW     = f"{UUID}:cancel_flow"
 CBT_TOGGLE_PREORDER = f"{UUID}:toggle_preorder_username"
 
+CBT_MARKUP         = f"{UUID}:markup"
+CBT_MARKUP_APPLY   = f"{UUID}:markup_apply"
+CBT_MARKUP_CHANGE  = f"{UUID}:markup_change"
+CBT_MINI_SETTINGS = f"{UUID}:mini"
+CBT_STAR_PRICE_P  = f"{UUID}:star_price:"
+CBT_MARKUP_RESET  = f"{UUID}:markup_reset"
+
 _fsm: dict[int, dict] = {}
 
 def _home_kb() -> InlineKeyboardMarkup:
@@ -877,34 +894,68 @@ def _help_kb() -> InlineKeyboardMarkup:
 
 def _settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
     cfg = _get_cfg(chat_id)
+
+    def onoff(v: bool) -> str:
+        return "🟢 Включено" if v else "🔴 Выключено"
+
+    def onoff_short(v: bool) -> str:
+        return "🟢 Включён" if v else "🔴 Выключен"
+
     kb = K()
-    kb.row(B(f"Плагин: {_state_on(cfg.get('plugin_enabled', True))}", callback_data=CBT_TOGGLE_PLUGIN))
+
+    kb.row(B(f"Плагин: {onoff(cfg.get('plugin_enabled', True))}", callback_data=CBT_TOGGLE_PLUGIN))
+
     state_txt, _ = _lots_state_summary(cfg)
     kb.row(B(f"Лоты: {state_txt}", callback_data=CBT_TOGGLE_LOTS))
+
     kb.row(
-        B(("🟢 Включить автовозврат" if not cfg.get("auto_refund", False) else "🟡 Выключить автовозврат"),
-          callback_data=CBT_TOGGLE_REFUND),
-        B(("🟢 Включить автодеактивацию" if not cfg.get("auto_deactivate", True) else "🟡 Выключить автодеактивацию"),
-          callback_data=CBT_TOGGLE_DEACT)
+        B(f"Автовозврат: {onoff_short(cfg.get('auto_refund', False))}", callback_data=CBT_TOGGLE_REFUND),
+        B(f"Автодеактивация: {onoff(cfg.get('auto_deactivate', True))}", callback_data=CBT_TOGGLE_DEACT)
     )
+
     kb.row(
-    B(("🟢 Включить !бэк" if not cfg.get("manual_refund_enabled", False) else "🟡 Выключить !бэк"),
-      callback_data=CBT_TOGGLE_MANUAL_REFUND),
-    B(("⬆️ Приоритет !бэк: ВЫШЕ" if cfg.get("manual_refund_priority", True) else "⬇️ Приоритет !бэк: НИЖЕ"),
-      callback_data=CBT_TOGGLE_BACK_PRIORITY)
+        B(f"Команда !бэк: {onoff(cfg.get('manual_refund_enabled', False))}", callback_data=CBT_TOGGLE_MANUAL_REFUND),
+        B(f"Ник из заказа: {onoff_short(cfg.get('preorder_username', False))}", callback_data=CBT_TOGGLE_PREORDER)
     )
-    kb.row(
-    B(("🟢 Ник из заказа: ВКЛ" if cfg.get("preorder_username", False) else "🟡 Ник из заказа: ВЫКЛ"),
-      callback_data=CBT_TOGGLE_PREORDER)
-    )
+
     kb.row(B("🔐 Токен", callback_data=CBT_TOKEN))
-    kb.row(B(f"🔋 Мин. баланс: {cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)} TON", callback_data=CBT_SET_MIN_BAL))
-    kb.row(B("⭐ Звёзды (лоты)", callback_data=CBT_STARS))
-    kb.row(B("🧩 Сообщения", callback_data=CBT_MESSAGES))
+
+    kb.row(B("⚙️ Настройка лотов", callback_data=CBT_STARS))
+
+    kb.row(B("🛠️ Мини-настройки", callback_data=CBT_MINI_SETTINGS))
+
     kb.row(B("🔄 Обновить", callback_data=CBT_REFRESH))
     kb.add(B("🏠 Домой", callback_data=CBT_HOME))
     kb.add(B("◀️ Назад", callback_data=CBT_HOME))
     return kb
+
+def _mini_settings_text(chat_id: Any) -> str:
+    cfg = _get_cfg(chat_id)
+    prio = "ВЫШЕ автовозврата" if cfg.get("manual_refund_priority", True) else "НИЖЕ автовозврата"
+    cur_min = cfg.get("min_balance_ton", FNP_MIN_BALANCE_TON)
+    return (
+        "<b>Мини-настройки</b>\n\n"
+        f"• Приоритет !бэк: <b>{prio}</b>\n"
+        f"• Мин. баланс TON: <code>{cur_min}</code>\n"
+        "• Сообщения: редактирование шаблонов ответов покупателю\n\n"
+        "Выберите действие ниже."
+    )
+
+def _mini_settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
+    cfg = _get_cfg(chat_id)
+    prio_label = "⬆️ Приоритет !бэк: ВЫШЕ" if cfg.get("manual_refund_priority", True) else "⬇️ Приоритет !бэк: НИЖЕ"
+    kb = K()
+    kb.row(B(prio_label, callback_data=CBT_TOGGLE_BACK_PRIORITY))
+    kb.row(B(f"🔋 Мин. баланс: {cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)} TON", callback_data=CBT_SET_MIN_BAL))
+    kb.row(B("🧩 Сообщения", callback_data=CBT_MESSAGES))
+    kb.add(B("◀️ Назад", callback_data=CBT_SETTINGS))
+    return kb
+
+def _open_mini_settings(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _mini_settings_text(chat_id), _mini_settings_kb(chat_id))
+    try: bot.answer_callback_query(call.id)
+    except Exception: pass
 
 def _token_kb() -> InlineKeyboardMarkup:
     kb = K()
@@ -921,12 +972,21 @@ def _stars_kb(chat_id: Any) -> InlineKeyboardMarkup:
     for it in (cfg.get("star_lots") or [])[:10]:
         lot_id = it.get("lot_id"); qty = it.get("qty")
         state = "🟢 ON" if it.get("active") else "🔴 OFF"
-        kb.row(B(f"{qty}⭐  LOT {lot_id}  {state}", callback_data=f"{CBT_STAR_TOGGLE_P}{lot_id}"),
-               B("🗑", callback_data=f"{CBT_STAR_DEL_P}{lot_id}"))
-    kb.row(B("➕ Добавить лот", callback_data=CBT_STAR_ADD), B("🔄 Обновить", callback_data=CBT_REFRESH))
-    kb.row(B("⚡ Включить все", callback_data=CBT_STAR_ACT_ALL), B("💤 Выключить все", callback_data=CBT_STAR_DEACT_ALL))
-    kb.add(B("🏠 Домой", callback_data=CBT_HOME))
-    kb.add(B("◀️ Назад", callback_data=CBT_BACK_PLUGINS))
+        kb.row(
+            B(f"{qty}⭐  LOT {lot_id}  {state}", callback_data=f"{CBT_STAR_TOGGLE_P}{lot_id}"),
+            B("💰 Цена", callback_data=f"{CBT_STAR_PRICE_P}{lot_id}"),
+            B("🗑", callback_data=f"{CBT_STAR_DEL_P}{lot_id}")
+        )
+    kb.row(
+        B("➕ Добавить лот", callback_data=CBT_STAR_ADD),
+        B("💹 Наценка", callback_data=CBT_MARKUP)
+    )
+    kb.row(B("♻️ Сбросить наценку", callback_data=CBT_MARKUP_RESET))
+    kb.row(B("🔄 Обновить", callback_data=CBT_REFRESH))
+    kb.row(
+        B("⚡ Включить все", callback_data=CBT_STAR_ACT_ALL),
+        B("💤 Выключить все", callback_data=CBT_STAR_DEACT_ALL)
+    )
     return kb
 
 _MSG_TITLES = {
@@ -1054,12 +1114,15 @@ def _kb_cancel_fsm() -> InlineKeyboardMarkup:
 
 def _fsm_cancel(cardinal: "Cardinal", call):
     chat_id = call.message.chat.id
-    _fsm.pop(chat_id, None)
+    st = _fsm.pop(chat_id, None)
+    pmid = (st or {}).get("prompt_msg_id")
+    _safe_delete(cardinal.telegram.bot, chat_id, pmid)
     try:
         cardinal.telegram.bot.answer_callback_query(call.id, "Отменено.")
     except Exception:
         pass
-    cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+    m = cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+    _safe_delete(cardinal.telegram.bot, chat_id, getattr(m, "message_id", None))
 
 def _looks_like_paid(text: str) -> bool:
     t = (text or "").lower()
@@ -1138,6 +1201,303 @@ def _lots_state_summary(cfg: dict) -> tuple[str, Optional[bool]]:
         return ("🟡 Частично", None)
     return ("🟢 Включены" if cfg.get("lots_active") else "🔴 Выключены", bool(cfg.get("lots_active")))
 
+def _format_currency(value: float, currency: Optional[str]) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    cur = getattr(currency, "name", currency)
+    cur = (str(cur) or "RUB").upper()
+    if cur in ("RUB", "RUR", "₽"):
+        v = round(v)
+        return f"{int(v)}₽"
+    return f"{v:.2f} {cur}"
+
+def _collect_markup_targets(cardinal: "Cardinal", cfg: dict, percent: float) -> List[dict]:
+    targets: List[dict] = []
+    star_lots = cfg.get("star_lots") or []
+    lot_ids: List[int] = []
+    qty_map: Dict[int, Optional[int]] = {}
+    if star_lots:
+        for it in star_lots:
+            try:
+                lot_id = int(it.get("lot_id"))
+                lot_ids.append(lot_id)
+                qty_map[lot_id] = int(it.get("qty")) if it.get("qty") else None
+            except Exception:
+                continue
+    else:
+        lots = _get_my_lots_by_category(cardinal, FNP_STARS_CATEGORY_ID)
+        lot_ids = [int(lid) for lid in lots.keys()]
+
+    seen = set()
+    for lot_id in lot_ids:
+        if lot_id in seen:
+            continue
+        seen.add(lot_id)
+        try:
+            fields = cardinal.account.get_lot_fields(int(lot_id))
+            if not fields:
+                continue
+            title = getattr(fields, "title", None) or getattr(fields, "name", None) or ""
+            old_price = None
+            for price_attr in ("price", "cost", "amount", "price_rub"):
+                if hasattr(fields, price_attr):
+                    try:
+                        old_price = float(getattr(fields, price_attr))
+                        break
+                    except Exception:
+                        pass
+            if old_price is None:
+                continue
+            currency = getattr(fields, "currency", None) or getattr(fields, "cur", None) or "RUB"
+            qty = qty_map.get(lot_id)
+            if qty is None:
+                q = _extract_qty_from_title(title)
+                qty = int(q) if q else None
+
+            new_price = round(old_price * (1.0 + percent / 100.0), 2)
+            if getattr(currency, "name", str(currency)).upper() in ("RUB", "RUR", "₽"):
+                new_price = float(int(round(new_price)))
+            targets.append({
+                "lot_id": lot_id,
+                "title": title,
+                "qty": qty,
+                "currency": currency,
+                "old_price": old_price,
+                "new_price": new_price,
+                "diff": round(new_price - old_price, 2)
+            })
+        except Exception as e:
+            logger.debug(f"_collect_markup_targets: lot {lot_id} skipped: {e}")
+            continue
+    return targets
+
+def _collect_reset_markup_targets(cardinal: "Cardinal", cfg: dict, percent: float) -> List[dict]:
+    if abs(float(percent or 0.0)) < 1e-12:
+        return []
+    rows: List[dict] = []
+
+    star_lots = cfg.get("star_lots") or []
+    if star_lots:
+        lot_ids = [int(it.get("lot_id")) for it in star_lots if it.get("lot_id")]
+    else:
+        lots = _get_my_lots_by_category(_CARDINAL_REF, FNP_STARS_CATEGORY_ID) if _CARDINAL_REF else {}
+        lot_ids = [int(lid) for lid in lots.keys()]
+    seen = set()
+    for lot_id in lot_ids:
+        if lot_id in seen: 
+            continue
+        seen.add(lot_id)
+        try:
+            fields = _CARDINAL_REF.account.get_lot_fields(lot_id) if _CARDINAL_REF else None
+            if not fields:
+                continue
+
+            cur_price = None
+            for price_attr in ("price", "cost", "amount", "price_rub"):
+                if hasattr(fields, price_attr):
+                    try:
+                        cur_price = float(getattr(fields, price_attr))
+                        break
+                    except Exception:
+                        pass
+            if cur_price is None:
+                continue
+            currency = getattr(fields, "currency", None) or getattr(fields, "cur", None) or "RUB"
+            title = getattr(fields, "title", None) or getattr(fields, "name", None) or ""
+            qty = _extract_qty_from_title(title)
+
+            factor = 1.0 + float(percent) / 100.0
+            new_price = cur_price / factor
+
+            curr_name = getattr(currency, "name", str(currency)).upper()
+            new_price = float(int(round(new_price))) if curr_name in ("RUB", "RUR", "₽") else round(new_price, 2)
+
+            rows.append({
+                "lot_id": lot_id,
+                "title": title,
+                "qty": qty,
+                "currency": currency,
+                "old_price": cur_price,
+                "new_price": new_price,
+                "diff": round(new_price - cur_price, 2)
+            })
+        except Exception:
+            continue
+    return rows
+
+def _cb_markup_reset(cardinal: "Cardinal", call):
+    chat_id = call.message.chat.id
+    cfg = _get_cfg(chat_id)
+    try: cardinal.telegram.bot.answer_callback_query(call.id)
+    except Exception: pass
+
+    p = float(cfg.get("markup_percent") or 0.0)
+    if abs(p) < 1e-12:
+        cardinal.telegram.bot.send_message(chat_id, "ℹ️ Наценка уже 0%. Нечего сбрасывать.")
+        return
+
+    if _CARDINAL_REF is None:
+        cardinal.telegram.bot.send_message(chat_id, "⚠️ Внутренняя ошибка: нет ссылки на Cardinal.")
+        return
+
+    rows = _collect_reset_markup_targets(cardinal, cfg, p)
+    if not rows:
+        cardinal.telegram.bot.send_message(chat_id, "Не нашёл лотов для отката наценки.")
+        return
+
+    rep = _apply_markup_prices(cardinal, rows)
+    okn = len(rep["ok"]); ern = len(rep["err"]); total = len(rows)
+
+    _set_cfg(chat_id, markup_percent=0.0)
+    msg = f"✅ Сброс наценки выполнен: обновлено {okn} из {total} лот(ов)."
+    if ern:
+        msg += f"\n⚠️ Ошибок: {ern}. См. логи."
+    cardinal.telegram.bot.send_message(chat_id, msg)
+
+def _markup_preview_text(percent: float, rows: List[dict]) -> str:
+    lines = [f"<b>Наценка: {percent}%</b>"]
+    if not rows:
+        lines.append("Лотов не найдено.")
+        return "\n".join(lines)
+
+    total_old = 0.0
+    total_new = 0.0
+    lines.append("")
+
+    for r in rows[:20]:
+        lot_id = r["lot_id"]
+        qty = r.get("qty")
+        cur = r.get("currency")
+        oldp = r["old_price"]; newp = r["new_price"]; diff = r["diff"]
+        total_old += float(oldp)
+        total_new += float(newp)
+        qty_part = f"{qty}⭐ — " if qty else ""
+        lines.append(
+            f"• LOT <code>{lot_id}</code> — {qty_part}"
+            f"{_format_currency(oldp, cur)} → <b>{_format_currency(newp, cur)}</b> "
+            f"(+{_format_currency(diff, cur)})"
+        )
+
+    more = len(rows) - 20
+    if more > 0:
+        lines.append(f"… и ещё {more} лот(ов)")
+
+    lines.append("")
+    lines.append(
+        f"Итого: { _format_currency(total_old, rows[0]['currency'] if rows else 'RUB') } → "
+        f"<b>{ _format_currency(total_new, rows[0]['currency'] if rows else 'RUB') }</b> "
+        f"(+{ _format_currency(total_new - total_old, rows[0]['currency'] if rows else 'RUB') })"
+    )
+    lines.append("")
+    lines.append("Подтвердите наценку или измените процент.")
+    return "\n".join(lines)
+
+def _kb_markup_preview() -> InlineKeyboardMarkup:
+    kb = K()
+    kb.row(B("✅ Подтвердить", callback_data=CBT_MARKUP_APPLY),
+           B("✏️ Изменить %", callback_data=CBT_MARKUP_CHANGE))
+    kb.add(B("❌ Отмена", callback_data=CBT_FSM_CANCEL))
+    return kb
+
+def _apply_markup_prices(cardinal: "Cardinal", rows: List[dict]) -> Dict[str, List[int]]:
+    rep = {"ok": [], "err": []}
+    for r in rows:
+        lot_id = int(r["lot_id"])
+        new_price = float(r["new_price"])
+        try:
+            fields = cardinal.account.get_lot_fields(lot_id)
+            if not fields:
+                rep["err"].append(lot_id); continue
+            set_ok = False
+            for price_attr in ("price", "cost", "amount", "price_rub"):
+                if hasattr(fields, price_attr):
+                    try:
+                        setattr(fields, price_attr, new_price)
+                        set_ok = True
+                        break
+                    except Exception:
+                        pass
+            if not set_ok:
+                rep["err"].append(lot_id); continue
+
+            cardinal.account.save_lot(fields)
+            rep["ok"].append(lot_id)
+        except Exception as e:
+            logger.warning(f"_apply_markup_prices {lot_id} failed: {e}")
+            rep["err"].append(lot_id)
+    return rep
+
+def _get_lot_price_currency(cardinal: "Cardinal", lot_id: int) -> tuple[Optional[float], str]:
+    try:
+        fields = cardinal.account.get_lot_fields(int(lot_id))
+        if not fields:
+            return None, "RUB"
+        price = None
+        for price_attr in ("price", "cost", "amount", "price_rub"):
+            if hasattr(fields, price_attr):
+                try:
+                    price = float(getattr(fields, price_attr))
+                    break
+                except Exception:
+                    pass
+        currency = getattr(fields, "currency", None) or getattr(fields, "cur", None) or "RUB"
+        return price, getattr(currency, "name", str(currency)) or "RUB"
+    except Exception:
+        return None, "RUB"
+
+def _start_markup(bot, call):
+    chat_id = call.message.chat.id
+    _fsm[chat_id] = {"step": "markup_percent"}
+    try: bot.answer_callback_query(call.id)
+    except Exception: pass
+    m = bot.send_message(
+        chat_id,
+        "Введите наценку в процентах (например, <b>15</b> или <b>12.5</b>). Можно отрицательное значение для скидки.\n(или /cancel)",
+        parse_mode="HTML",
+        reply_markup=_kb_cancel_fsm()
+    )
+    st = _fsm.get(chat_id) or {}
+    st["prompt_msg_id"] = getattr(m, "message_id", None)
+    _fsm[chat_id] = st
+
+def _cb_markup_change(cardinal: "Cardinal", call):
+    chat_id = call.message.chat.id
+    try: cardinal.telegram.bot.answer_callback_query(call.id, "Измените процент сообщением ниже.")
+    except Exception: pass
+    st = _fsm.get(chat_id) or {}
+    st["step"] = "markup_percent"
+    _fsm[chat_id] = st
+    m = cardinal.telegram.bot.send_message(chat_id, "Введите новый процент наценки (или /cancel):", reply_markup=_kb_cancel_fsm())
+    st["prompt_msg_id"] = getattr(m, "message_id", None)
+    _fsm[chat_id] = st
+
+def _cb_markup_apply(cardinal: "Cardinal", call):
+    chat_id = call.message.chat.id
+    try: cardinal.telegram.bot.answer_callback_query(call.id, "Применяю…")
+    except Exception: pass
+    st = _fsm.get(chat_id) or {}
+    rows = st.get("markup_rows")
+    percent = st.get("markup_percent")
+    if not rows or percent is None:
+        cardinal.telegram.bot.send_message(chat_id, "⚠️ Нет данных для применения. Запустите заново через «💹 Наценка лотов».")
+        return
+    rep = _apply_markup_prices(cardinal, rows)
+    okn = len(rep["ok"]); ern = len(rep["err"]); total = len(rows)
+
+    _set_cfg(chat_id, markup_percent=float(percent))
+    msg = f"✅ Готово: обновлено {okn} из {total} лот(ов)."
+    if ern:
+        msg += f"\n⚠️ Ошибок: {ern}. См. логи."
+    cardinal.telegram.bot.send_message(chat_id, msg)
+
+    _fsm.pop(chat_id, None)
+    try:
+        _open_settings(cardinal.telegram.bot, call)
+    except Exception:
+        pass
+
 _CARDINAL_REF: Optional["Cardinal"] = None
 
 def init_cardinal(cardinal: Cardinal):
@@ -1176,7 +1536,7 @@ def init_cardinal(cardinal: Cardinal):
     tg.msg_handler(
         lambda m: _handle_fsm(m, cardinal),
         func=lambda m: (m.chat.id in _fsm and _fsm[m.chat.id].get("step") in {
-            "jwt_api_key","jwt_phone","jwt_wallet_ver","jwt_seed","set_min_balance","star_add_qty","star_add_lotid","msg_edit_value"
+            "jwt_api_key","jwt_phone","jwt_wallet_ver","jwt_seed","set_min_balance","star_add_qty","star_add_lotid","msg_edit_value","markup_percent","set_jwt","star_price_value"
         })
     )
 
@@ -1228,6 +1588,13 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _toggle_manual_refund(bot, c), func=lambda c: c.data == CBT_TOGGLE_MANUAL_REFUND)
     tg.cbq_handler(lambda c: _toggle_back_priority(bot, c), func=lambda c: c.data == CBT_TOGGLE_BACK_PRIORITY)
     tg.cbq_handler(lambda c: _toggle_preorder_username(bot, c), func=lambda c: c.data == CBT_TOGGLE_PREORDER)
+
+    tg.cbq_handler(lambda c: _start_markup(bot, c), func=lambda c: c.data == CBT_MARKUP)
+    tg.cbq_handler(lambda c: _cb_markup_apply(cardinal, c), func=lambda c: c.data == CBT_MARKUP_APPLY)
+    tg.cbq_handler(lambda c: _cb_markup_change(cardinal, c), func=lambda c: c.data == CBT_MARKUP_CHANGE)
+    tg.cbq_handler(lambda c: _open_mini_settings(bot, c), func=lambda c: c.data == CBT_MINI_SETTINGS)
+    tg.cbq_handler(lambda c: _star_price_start(bot, c), func=lambda c: c.data.startswith(CBT_STAR_PRICE_P))
+    tg.cbq_handler(lambda c: _cb_markup_reset(cardinal, c), func=lambda c: c.data == CBT_MARKUP_RESET)
 
 def _open_home(bot, call):
     _safe_edit(bot, call.message.chat.id, call.message.id, _about_text(), _home_kb())
@@ -1444,6 +1811,33 @@ def _select_wallet_version(bot, call):
     except Exception: pass
     bot.send_message(chat_id, "Введите 24 слова мнемофразы одной строкой (или /cancel):")
 
+def _star_price_start(bot, call):
+    chat_id = call.message.chat.id
+    try:
+        lot_id = int(call.data.split(":")[-1])
+    except Exception:
+        try: bot.answer_callback_query(call.id, "Некорректный LOT_ID", show_alert=True)
+        except Exception: pass
+        return
+
+    price, cur = _get_lot_price_currency(_CARDINAL_REF, lot_id) if _CARDINAL_REF else (None, "RUB")
+    price_txt = f"{price:.2f}" if isinstance(price, (int, float)) else "—"
+
+    _fsm[chat_id] = {"step": "star_price_value", "lot_id": lot_id, "currency": cur}
+    try: bot.answer_callback_query(call.id)
+    except Exception: pass
+
+    m = bot.send_message(
+        chat_id,
+        f"LOT {lot_id}\nТекущая цена: <b>{price_txt} {cur}</b>\n\n"
+        "Введите <b>новую цену</b> (число). Пример: 149 или 149.99\n(или /cancel)",
+        parse_mode="HTML",
+        reply_markup=_kb_cancel_fsm()
+    )
+    st = _fsm.get(chat_id) or {}
+    st["prompt_msg_id"] = getattr(m, "message_id", None)
+    _fsm[chat_id] = st
+
 def _ask_set_jwt(bot, call):
     chat_id = call.message.chat.id
     _fsm[chat_id] = {"step": "set_jwt"}
@@ -1591,6 +1985,108 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
                 parse_mode="HTML"
             )
         return
+    
+    if state.get("step") == "markup_percent":
+        pmid = (_fsm.get(chat_id) or {}).get("prompt_msg_id")
+        if text.lower() in ("/cancel", "cancel", "отмена"):
+            _safe_delete(cardinal.telegram.bot, chat_id, pmid)
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+            _fsm.pop(chat_id, None)
+            m_cancel = cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(m_cancel, "message_id", None))
+            return
+
+        t = text.replace(",", ".").strip()
+        try:
+            percent = float(t)
+            if not (-90.0 <= percent <= 500.0):
+                raise ValueError
+        except Exception:
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+            cardinal.telegram.bot.send_message(chat_id, "⚠️ Введите число (проценты), например 10 или 12.5. Диапазон: от -90 до 500.")
+            return
+
+        _safe_delete(cardinal.telegram.bot, chat_id, pmid)
+        _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+
+        cfg = _get_cfg(chat_id)
+        if _CARDINAL_REF is None:
+            cardinal.telegram.bot.send_message(chat_id, "⚠️ Внутренняя ошибка: нет ссылки на Cardinal.")
+            return
+
+        rows = _collect_markup_targets(_CARDINAL_REF, cfg, percent)
+        preview = _markup_preview_text(percent, rows)
+
+        st = _fsm.get(chat_id) or {}
+        st["markup_percent"] = percent
+        st["markup_rows"] = rows
+        st["step"] = "markup_preview"
+        _fsm[chat_id] = st
+
+        cardinal.telegram.bot.send_message(chat_id, preview, parse_mode="HTML", reply_markup=_kb_markup_preview())
+        return
+    
+    if state.get("step") == "star_price_value":
+            pmid = (_fsm.get(chat_id) or {}).get("prompt_msg_id")
+            if text.lower() in ("/cancel", "cancel", "отмена"):
+                _safe_delete(cardinal.telegram.bot, chat_id, pmid)
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+                _fsm.pop(chat_id, None)
+                m_cancel = cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(m_cancel, "message_id", None))
+                return
+
+            lot_id = int(state.get("lot_id"))
+            cur = state.get("currency") or "RUB"
+
+            t = text.replace(",", ".").strip()
+            try:
+                new_price = float(t)
+                if new_price <= 0:
+                    raise ValueError
+            except Exception:
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+                cardinal.telegram.bot.send_message(chat_id, "⚠️ Введите положительное число (цена), например 149 или 149.99.")
+                return
+
+            old_price, cur_detected = _get_lot_price_currency(cardinal, lot_id)
+            cur = cur_detected or cur
+
+            try:
+                fields = cardinal.account.get_lot_fields(lot_id)
+                if not fields:
+                    raise RuntimeError("Лот недоступен.")
+                set_ok = False
+                for price_attr in ("price", "cost", "amount", "price_rub"):
+                    if hasattr(fields, price_attr):
+                        setattr(fields, price_attr, float(new_price))
+                        set_ok = True
+                        break
+                if not set_ok:
+                    raise RuntimeError("Не удалось изменить цену в полях лота.")
+                cardinal.account.save_lot(fields)
+
+                _safe_delete(cardinal.telegram.bot, chat_id, pmid)
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+                cardinal.telegram.bot.send_message(
+                    chat_id,
+                    f"✅ Цена обновлена для LOT {lot_id}: "
+                    f"{_format_currency(old_price, cur) if old_price is not None else ''} → "
+                    f"<b>{_format_currency(new_price, cur)}</b>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                _safe_delete(cardinal.telegram.bot, chat_id, pmid)
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+                cardinal.telegram.bot.send_message(chat_id, f"❌ Не удалось сохранить цену: {e}")
+            finally:
+                _fsm.pop(chat_id, None)
+
+                try:
+                    _open_stars(cardinal.telegram.bot, type("obj", (), {"message": type("m", (), {"chat": type("c", (), {"id": chat_id})(), "id": message.message_id})(), "id": ""}))
+                except Exception:
+                    pass
+            return
 
     if state.get("step") == "star_add_qty":
         if text.lower() in ("/cancel", "cancel", "отмена"):
@@ -2019,7 +2515,6 @@ def _cb_change_username(cardinal: "Cardinal", call):
     _update_current(chat_id, stage="await_username")
     cardinal.telegram.bot.send_message(chat_id, "Введите новый тег в формате @username:")
 
-
 def _cb_cancel_flow(cardinal: "Cardinal", call):
     chat_id = call.message.chat.id
     try:
@@ -2067,6 +2562,14 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         text = (event.message.text or "").strip()
 
         cfg = _get_cfg_for_orders(chat_id)
+
+        try:
+            user_mid = getattr(event.message, "message_id", None) or getattr(event.message, "id", None)
+        except Exception:
+            user_mid = None
+
+        if text and author not in {"funpay"} and author != my_user:
+            _safe_delete(cardinal.telegram.bot, chat_id, user_mid)
 
         if not cfg.get("plugin_enabled", True):
             return
