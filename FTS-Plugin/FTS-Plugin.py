@@ -29,6 +29,125 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("FTS-Plugin")
 
+HUMAN_LOGS   = bool(int(os.getenv("FTS_HUMAN_LOGS", "1")))
+HUMAN_DEDUP  = bool(int(os.getenv("FTS_HUMAN_DEDUP", "1")))
+
+class _Ansi:
+    R = "\033[31m"; Y = "\033[33m"; C = "\033[36m"; G = "\033[32m"
+    DIM = "\033[90m"; BOLD = "\033[1m"; RESET = "\033[0m"
+
+class _HumanLog:
+    import re as _re
+    SEEN_AUTOREPLY_BY_OID: set[str] = set()
+
+    RULES = [
+        (_re.compile(r"\[IGNORE\]\s*auto-reply skipped.*?(?:OID:([A-Z0-9\-]+))?", _re.I),
+         lambda m: ("Автоответ найден — пропустили сообщение.", m.group(1) or "")),
+        (_re.compile(r"\[IGNORE\]\s*gift/account-login system note", _re.I),
+         lambda m: ("Системное примечание с «подарком»/«заходом на аккаунт» — игнорируем.", "")),
+        (_re.compile(r"\[QUEUE\]\s*merged\s+(.+?)\s*->\s*([^\s|]+)", _re.I),
+         lambda m: (f"Объединили очереди: {m.group(1)} → {m.group(2)}", "")),
+        (_re.compile(r"ORDER\s+#([A-Z0-9\-]+):\s*queued,.*", _re.I),
+         lambda m: (f"Заказ #{m.group(1)} добавлен в очередь — ждём @username или системное «заказ оплачен».", m.group(1))),
+        (_re.compile(r"SEND start:\s*(\d+)\s*⭐\s*→\s*@?([A-Za-z0-9_]{5,32})", _re.I),
+         lambda m: (f"Начали отправку: {m.group(1)}⭐ на @{m.group(2)}", "")),
+        (_re.compile(r"SEND result:\s*ok=(True|False).*?status=(\d+)", _re.I),
+         lambda m: (f"Отправка завершена — {'успех' if m.group(1)=='True' else 'ошибка'}, HTTP {m.group(2)}.", "")),
+        (_re.compile(r"SEND exception:\s*(.+)", _re.I),
+         lambda m: (f"Ошибка при отправке: {m.group(1)}", "")),
+        (_re.compile(r"ORDER FAIL\s+#([A-Z0-9\-]+)\s+(\d+)\s*⭐\s*@([A-Za-z0-9_]{5,32}):\s*(.+?)\s*\|\s*status=(\d+)", _re.I),
+         lambda m: (f"Не удалось выполнить заказ #{m.group(1)}: {m.group(4)} (HTTP {m.group(5)}). "
+                    f"Кол-во: {m.group(2)}⭐, ник @{m.group(3)}.", m.group(1))),
+        (_re.compile(r"\[AUTODEACT\].*?Баланс\s+([0-9.]+)\s*<\s*([0-9.]+).*?категории\s+(\d+)", _re.I),
+         lambda m: (f"Лоты категории {m.group(3)} отключены: баланс {m.group(1)} TON ниже порога {m.group(2)} TON.", "")),
+        (_re.compile(r"MIN BALANCE set to\s*([0-9.]+)\s*TON", _re.I),
+         lambda m: (f"Порог баланса обновлён: {m.group(1)} TON.", "")),
+        (_re.compile(r"\[PREORDER\]\s*Захватили ник\s*@([A-Za-z0-9_]{5,32}).*?#([A-Z0-9\-]+)", _re.I),
+         lambda m: (f"Ник из заказа захвачен: @{m.group(1)} для #{m.group(2)} — ждём оплату.", m.group(2))),
+    ]
+
+    @classmethod
+    def _fmt_like_classic(cls, record, text: str, color_code: str) -> str:
+        ts = time.strftime("%d-%m-%Y %H:%M:%S", time.localtime(record.created))
+        lvl_letter = {
+            logging.INFO: "I",
+            logging.WARNING: "W",
+            logging.ERROR: "E",
+            logging.DEBUG: "D",
+            logging.CRITICAL: "C"
+        }.get(record.levelno, "I")
+        return (
+            f"{color_code}[{ts}]> "
+            f"{_Ansi.BOLD}{lvl_letter}{_Ansi.RESET}{color_code}: {LOG_TAG} {text}{_Ansi.RESET}"
+        )
+
+    @classmethod
+    def humanize(cls, record: logging.LogRecord) -> tuple[str, bool]:
+        raw = record.getMessage() or ""
+        oid_for_dedup = ""
+        text = raw
+
+        for pat, fn in cls.RULES:
+            m = pat.search(raw)
+            if m:
+                try:
+                    text, oid_for_dedup = fn(m)
+                except Exception:
+                    pass
+                break
+
+        text = text.replace("[FTS-Plugin]", "").strip()
+
+        color = _Ansi.C
+        if record.levelno >= logging.ERROR:   color = _Ansi.R
+        elif record.levelno == logging.WARNING: color = _Ansi.Y
+        elif record.levelno == logging.DEBUG: color = _Ansi.DIM
+
+        if HUMAN_DEDUP and text.startswith("Автоответ найден") and oid_for_dedup:
+            key = f"auto:{oid_for_dedup}"
+            if key in cls.SEEN_AUTOREPLY_BY_OID:
+                return ("", True)
+            cls.SEEN_AUTOREPLY_BY_OID.add(key)
+
+        return (cls._fmt_like_classic(record, text, color), False)
+
+class _HumanFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg, suppressed = _HumanLog.humanize(record)
+        if suppressed:
+            return False
+        record._humanized = msg
+        return True
+
+class _HumanFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        msg = getattr(record, "_humanized", None)
+        if msg is None:
+            msg, _ = _HumanLog.humanize(record)
+        return msg
+
+def _setup_logging():
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    if HUMAN_LOGS:
+        h = logging.StreamHandler()
+        h.setFormatter(_HumanFormatter())
+        logger.addHandler(h)
+        logger.addFilter(_HumanFilter())
+    else:
+        h = logging.StreamHandler()
+        h.setFormatter(_AnsiColorFormatter("%(asctime)s %(levelname)s " + LOG_TAG + " %(message)s"))
+        logger.addHandler(h)
+
+    raw_path = os.getenv("FTS_RAW_LOG_FILE")
+    if raw_path:
+        f = logging.FileHandler(raw_path, encoding="utf-8")
+        f.setFormatter(_AnsiColorFormatter("%(asctime)s %(levelname)s " + LOG_TAG + " %(message)s"))
+        logger.addHandler(f)
+
+_setup_logging()
+
 LOG_TAG = "[FTS-Plugin]"
 
 class _AnsiColorFormatter(logging.Formatter):
@@ -64,7 +183,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.4.0"
+VERSION     = "1.4.1"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -125,7 +244,7 @@ def _default_templates() -> dict:
         "purchase_created": "Спасибо за покупку {qty}⭐!\nНапишите ваш Telegram-тег одной строкой в формате @username.\nПример: @username",
         "username_received": "Принял тег: @{username}. Проверяю…",
         "username_invalid": "❌ Некорректный или несуществующий тег.\nОтправьте верный Telegram-тег в формате @username (5–32, латиница/цифры/подчёркивание), а затем подтвердите ответом «+».\nПример: @username",
-        "username_valid": "✅ Тег принят: @{username}. Количество: {qty}⭐.",
+        "username_valid": "✅ Тег принят: @{username}.",
         "sending": "Отправляю {qty}⭐ на @{username}…",
         "sent": "✅ Готово: отправлено {qty}⭐ на @{username}. {order_url}",
         "failed": "❌ Не удалось отправить звёзды: {reason}",
@@ -198,16 +317,33 @@ def _state_on(v: bool) -> str:
 
 def _safe_edit(bot, chat_id: Any, msg_id: int, text: str, kb=None):
     try:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        bot.edit_message_text(text, chat_id, msg_id,
+                              parse_mode="HTML", reply_markup=kb,
+                              disable_web_page_preview=True)
     except ApiTelegramException as e:
-        if "message is not modified" in str(e).lower():
+        low = str(e).lower()
+        if ("message is not modified" in low or
+            "message to edit not found" in low or
+            "chat not found" in low or
+            "bot was blocked" in low):
+            logger.debug(f"edit_message skipped: {e}")
             return
-        raise
+        logger.debug(f"edit_message failed: {e}")
+    except Exception as e:
+        logger.debug(f"edit_message failed: {e}")
 
 def _safe_delete(bot, chat_id: Any, msg_id: Optional[int]):
     try:
         if msg_id:
             bot.delete_message(chat_id, msg_id)
+    except ApiTelegramException as e:
+        low = str(e).lower()
+        if ("message to delete not found" in low or
+            "chat not found" in low or
+            "bot was blocked" in low):
+            logger.debug(f"delete_message skipped: {e}")
+            return
+        logger.debug(f"delete_message failed: {e}")
     except Exception as e:
         logger.debug(f"delete_message failed: {e}")
 
@@ -578,7 +714,7 @@ def _authenticate_fragment(api_key: str, phone_number: str, version: str, mnemon
     try:
         payload = {"api_key": api_key, "phone_number": phone_number, "version": version, "mnemonics": mnemonics}
         r = requests.post(FRAGMENT_AUTH_URL, json=payload,
-                          headers={"Content-Type": "application/json", "Accept": "application/json"}, timeout=40)
+                          headers={"Content-Type": "application/json", "Accept": "application/json"}, timeout=120)
         try: data = r.json()
         except Exception: data = {"raw": r.text}
         if r.status_code >= 400:
@@ -630,10 +766,40 @@ def _get_my_lots_by_category(cardinal: "Cardinal", category_id: int) -> Dict[int
     lots: Dict[int, Any] = {}
     try:
         cardinal.update_lots_and_categories()
-        if FunPayAPI is None:
-            raise RuntimeError("FunPayAPI module not available")
-        subcat = cardinal.account.get_subcategory(FunPayAPI.types.SubCategoryTypes.COMMON, int(category_id))
-        lots = cardinal.tg_profile.get_sorted_lots(2).get(subcat, {}) or {}
+
+        all_map = (cardinal.tg_profile.get_sorted_lots(2) or {})
+
+        for subcat, items in all_map.items():
+            try:
+                sid = int(
+                    getattr(subcat, "id", None)
+                    or getattr(subcat, "subcategory_id", None)
+                    or getattr(subcat, "category_id", None)
+                    or 0
+                )
+            except Exception:
+                sid = 0
+
+            if sid != int(category_id):
+                continue
+
+            if isinstance(items, dict):
+                for key, val in items.items():
+                    lid = getattr(key, "id", key)
+                    try:
+                        lid = int(lid)
+                    except Exception:
+                        continue
+                    lots[lid] = val
+            else:
+                seq = items if isinstance(items, (list, tuple, set)) else []
+                for val in seq:
+                    lid = getattr(val, "id", None)
+                    if lid is not None:
+                        try:
+                            lots[int(lid)] = val
+                        except Exception:
+                            pass
     except Exception as e:
         logger.warning(f"_get_my_lots_by_category failed: {e}")
     return lots
@@ -643,11 +809,23 @@ def _is_stars_lot(cardinal: "Cardinal", lot_id: int) -> bool:
         fields = cardinal.account.get_lot_fields(int(lot_id))
         if not fields:
             return False
+
         sub = getattr(fields, "subcategory", None) or getattr(fields, "subcat", None)
-        cid = (getattr(sub, "id", None) if sub else None)
+        cid = None
+
+        if sub is not None:
+            for attr in ("id", "subcategory_id", "category_id"):
+                if hasattr(sub, attr):
+                    cid = getattr(sub, attr)
+                    break
+
         if cid is None:
-            cid = getattr(fields, "subcategory_id", None) or getattr(fields, "category_id", None)
-        return int(cid) == int(FNP_STARS_CATEGORY_ID)
+            for attr in ("subcategory_id", "category_id"):
+                if hasattr(fields, attr):
+                    cid = getattr(fields, attr)
+                    break
+
+        return cid is not None and int(cid) == int(FNP_STARS_CATEGORY_ID)
     except Exception:
         return False
 
@@ -659,9 +837,11 @@ def _order_is_stars(order: Any) -> bool:
             or getattr(getattr(order, "subcategory", None), "id", None)
             or getattr(getattr(order, "category", None), "id", None)
         )
-        return cand is None or int(cand) == int(FNP_STARS_CATEGORY_ID)
+        if cand is None:
+            return False
+        return int(cand) == int(FNP_STARS_CATEGORY_ID)
     except Exception:
-        return True
+        return False
 
 def _activate_lot(cardinal: "Cardinal", lot_id: int) -> bool:
     try:
@@ -713,17 +893,30 @@ def _apply_star_lots_state(cardinal: "Cardinal", star_lots: List[dict], enabled:
     return report
 
 def _apply_category_state(cardinal: "Cardinal", category_id: int, enabled: bool) -> Dict[str, List[int]]:
-    category_id = int(FNP_STARS_CATEGORY_ID)
+    category_id = int(category_id or FNP_STARS_CATEGORY_ID)
     report = {"ok": [], "skip": [], "err": []}
+
     lots = _get_my_lots_by_category(cardinal, category_id)
-    for lot_id, _ in (lots or {}).items():
+    for key, _ in (lots or {}).items():
         try:
+            lot_id = int(getattr(key, "id", key))
             ok = _activate_lot(cardinal, lot_id) if enabled else _deactivate_lot(cardinal, lot_id)
-            (report["ok"] if ok else report["skip"]).append(int(lot_id))
+            (report["ok"] if ok else report["skip"]).append(lot_id)
         except Exception as e:
-            report["err"].append(int(lot_id))
-            logger.warning(f"apply_category_state {lot_id} failed: {e}")
+            try:
+                bad_id = int(getattr(key, "id", 0) or 0)
+            except Exception:
+                bad_id = 0
+            report["err"].append(bad_id)
+            logger.warning(f"apply_category_state {key} failed: {e}")
     return report
+
+def _event_chat_id(e) -> Any:
+    return (
+        getattr(getattr(e, "message", None), "chat_id", None)
+        or getattr(e, "chat_id", None)
+        or getattr(getattr(e, "order", None), "chat_id", None)
+    )
 
 def _parse_fragment_error_text(response_text: str, status_code: int = 0) -> str:
     fallback = "Ошибка обработки заказа."
@@ -1166,7 +1359,24 @@ def _funpay_is_system_paid_message(text: str) -> bool:
     if not text:
         return False
     t = text.lower()
-    return ("оплатил заказ" in t) and ("звёзд" in t or "звезд" in t)
+
+    is_paid = (
+        "оплатил заказ" in t
+        or "заказ оплачен" in t
+        or "paid the order" in t
+        or "order paid" in t
+    )
+
+    in_stars_category = (
+        "telegram, звёзды" in t
+        or "telegram, звезды" in t
+        or "telegram, stars" in t
+    )
+
+    is_gifts = _is_gift_like_text(t)
+    is_account = _mentions_account_login(t)
+
+    return is_paid and in_stars_category and not is_gifts and not is_account
 
 def _funpay_extract_qty_and_order_id(text: str) -> tuple[Optional[int], Optional[str]]:
     qty = None
@@ -1181,6 +1391,37 @@ def _funpay_extract_qty_and_order_id(text: str) -> tuple[Optional[int], Optional
     except Exception:
         pass
     return qty, oid
+
+def _is_gift_like_text(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(x in t for x in ("подарок", "подарком", "подарки", "подароч", "gift", "в подарок"))
+
+def _mentions_account_login(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    patterns = [
+        r"с\s*заходом\s*на\s*аккаунт",
+        r"заход\s*на\s*аккаунт",
+        r"вход\s*(?:в|на)?\s*аккаунт",
+        r"логин\s*в\s*аккаунт",
+        r"login\s*to\s*account",
+        r"sign\s*in\s*to\s*account",
+    ]
+    return any(_re.search(p, t) for p in patterns)
+
+def _deactivate_all_star_lots(cardinal: "Cardinal", cfg: dict, chat_id: Any, reason: str = "временная ошибка/невалидный заказ") -> None:
+    try:
+        if _CARDINAL_REF is not None:
+            _apply_category_state(_CARDINAL_REF, FNP_STARS_CATEGORY_ID, False)
+        items = cfg.get("star_lots") or []
+        for it in items:
+            it["active"] = False
+        _set_cfg(chat_id, lots_active=False, star_lots=items, last_auto_deact_reason=reason)
+    except Exception as e:
+        logger.warning(f"_deactivate_all_star_lots failed: {e}")
 
 def _preview_kb() -> InlineKeyboardMarkup:
     kb = K()
@@ -1236,6 +1477,9 @@ def _collect_markup_targets(cardinal: "Cardinal", cfg: dict, percent: float) -> 
             continue
         seen.add(lot_id)
         try:
+            if not _is_stars_lot(cardinal, lot_id):
+                continue
+
             fields = cardinal.account.get_lot_fields(int(lot_id))
             if not fields:
                 continue
@@ -1282,14 +1526,17 @@ def _collect_reset_markup_targets(cardinal: "Cardinal", cfg: dict, percent: floa
     if star_lots:
         lot_ids = [int(it.get("lot_id")) for it in star_lots if it.get("lot_id")]
     else:
-        lots = _get_my_lots_by_category(_CARDINAL_REF, FNP_STARS_CATEGORY_ID) if _CARDINAL_REF else {}
+        lots = _get_my_lots_by_category(cardinal, FNP_STARS_CATEGORY_ID) if cardinal else {}
         lot_ids = [int(lid) for lid in lots.keys()]
     seen = set()
     for lot_id in lot_ids:
-        if lot_id in seen: 
+        if lot_id in seen:
             continue
         seen.add(lot_id)
         try:
+            if _CARDINAL_REF and not _is_stars_lot(_CARDINAL_REF, lot_id):
+                continue
+
             fields = _CARDINAL_REF.account.get_lot_fields(lot_id) if _CARDINAL_REF else None
             if not fields:
                 continue
@@ -1407,6 +1654,10 @@ def _apply_markup_prices(cardinal: "Cardinal", rows: List[dict]) -> Dict[str, Li
         lot_id = int(r["lot_id"])
         new_price = float(r["new_price"])
         try:
+            if not _is_stars_lot(cardinal, lot_id):
+                rep["err"].append(lot_id)
+                continue
+
             fields = cardinal.account.get_lot_fields(lot_id)
             if not fields:
                 rep["err"].append(lot_id); continue
@@ -1820,6 +2071,11 @@ def _star_price_start(bot, call):
         except Exception: pass
         return
 
+    if _CARDINAL_REF is not None and not _is_stars_lot(_CARDINAL_REF, lot_id):
+        try: bot.answer_callback_query(call.id, f"LOT {lot_id} не из категории {FNP_STARS_CATEGORY_ID}", show_alert=True)
+        except Exception: pass
+        return
+
     price, cur = _get_lot_price_currency(_CARDINAL_REF, lot_id) if _CARDINAL_REF else (None, "RUB")
     price_txt = f"{price:.2f}" if isinstance(price, (int, float)) else "—"
 
@@ -1837,6 +2093,8 @@ def _star_price_start(bot, call):
     st = _fsm.get(chat_id) or {}
     st["prompt_msg_id"] = getattr(m, "message_id", None)
     _fsm[chat_id] = st
+
+CLEAN_USER_MSGS = bool(int(os.getenv("FTS_Plugin_CLEAN_USER_MSGS", "0")))
 
 def _ask_set_jwt(bot, call):
     chat_id = call.message.chat.id
@@ -2056,6 +2314,9 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
                 fields = cardinal.account.get_lot_fields(lot_id)
                 if not fields:
                     raise RuntimeError("Лот недоступен.")
+                if not _is_stars_lot(cardinal, lot_id):
+                    raise RuntimeError(f"Лот не из категории {FNP_STARS_CATEGORY_ID}.")
+
                 set_ok = False
                 for price_attr in ("price", "cost", "amount", "price_rub"):
                     if hasattr(fields, price_attr):
@@ -2108,6 +2369,15 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
             if lot_id <= 0: raise ValueError
         except Exception:
             cardinal.telegram.bot.send_message(chat_id, "⚠️ Введите положительное целое (LOT_ID), либо /cancel."); return
+
+        if _CARDINAL_REF is not None and not _is_stars_lot(_CARDINAL_REF, lot_id):
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                f"❌ LOT {lot_id} не относится к категории {FNP_STARS_CATEGORY_ID}. Добавление отклонено."
+            )
+            return
+
         qty = int(state.get("new_qty"))
         cfg = _get_cfg(chat_id); items = cfg.get("star_lots") or []
         updated = False
@@ -2118,7 +2388,8 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
             items.append({"qty": qty, "lot_id": lot_id, "active": True})
         _set_cfg(chat_id, star_lots=items); _fsm.pop(chat_id, None)
         if _CARDINAL_REF is not None: _activate_lot(_CARDINAL_REF, lot_id)
-        cardinal.telegram.bot.send_message(chat_id, f"✅ Добавлено: {qty} ⭐ (LOT {lot_id}). Управляйте в «⭐ Звёзды»."); return
+        cardinal.telegram.bot.send_message(chat_id, f"✅ Добавлено: {qty} ⭐ (LOT {lot_id}). Управляйте в «⭐ Звёзды»."); 
+        return
 
     if state.get("step") == "set_min_balance":
         if text.lower() in ("/cancel", "cancel", "отмена"):
@@ -2214,6 +2485,21 @@ _prompted_orders: Dict[str, set] = {}
 _prompted_oids: set[str] = set()
 _preorders: Dict[str, Dict[str, Any]] = {}
 
+def _adopt_foreign_queue_for(chat_id: Any) -> bool:
+    key = str(chat_id)
+    if key in _pending_orders and _pending_orders[key]:
+        return False
+
+    for other_key, items in list(_pending_orders.items()):
+        if other_key == key:
+            continue
+        if items and any(_allowed_stages(x) for x in items):
+            _pending_orders[key] = items
+            del _pending_orders[other_key]
+            logger.warning(f"[QUEUE] merged {other_key} -> {key}")
+            return True
+    return False
+
 def _mark_prompted(chat_id: Any, order_id: Optional[Any]) -> None:
     if order_id is None:
         return
@@ -2294,16 +2580,30 @@ def _update_current(chat_id: Any, **updates) -> None:
 def _has_queue(chat_id: Any) -> bool:
     return bool(_q(chat_id))
 
-
 def _safe_send(c: "Cardinal", chat_id, text: str):
     try:
         c.send_message(chat_id, text)
     except Exception as e:
         logger.warning(f"send_message failed: {e}")
 
+def _is_auto_reply(msg) -> bool:
+    try:
+        if getattr(msg, "is_autoreply", False):
+            return True
+
+        badge = (getattr(msg, "badge", None) or getattr(msg, "badge_text", None) or "")
+        if isinstance(badge, str) and "автоответ" in badge.lower():
+            return True
+
+        if getattr(msg, "by_bot", False) or getattr(msg, "by_vertex", False):
+            return True
+    except Exception:
+        pass
+    return False
+
 def new_order_handler(cardinal: Cardinal, event):
     try:
-        chat_id = getattr(event, "chat_id", None) or getattr(getattr(event, "order", None), "chat_id", None)
+        chat_id = _event_chat_id(event)
         cfg = _get_cfg_for_orders(chat_id if chat_id is not None else "__orders__")
 
         if not cfg.get("plugin_enabled", True):
@@ -2314,7 +2614,7 @@ def new_order_handler(cardinal: Cardinal, event):
             return
 
         title = getattr(order, "title", None) or getattr(order, "name", None) or ""
-        qty = _extract_qty_from_title(title) or 50
+        qty = _extract_qty_from_title(title)
 
         order_id = (
             getattr(order, "id", None)
@@ -2322,7 +2622,32 @@ def new_order_handler(cardinal: Cardinal, event):
             or getattr(event, "order_id", None)
         )
 
-        _push(chat_id, {"qty": qty, "order_id": order_id, "stage": "await_username", "candidate": None})
+        text_blob = " ".join(str(x) for x in [
+            title,
+            getattr(order, "description", None),
+            getattr(order, "buyer_message", None),
+        ] if x)
+
+        if _is_gift_like_text(text_blob) or _mentions_account_login(text_blob):
+            _log("info", f"[IGNORE] gift/account-login order ignored (#{order_id})")
+            return
+
+        if qty is not None and qty < 50:
+            try:
+                _safe_send(
+                    cardinal,
+                    chat_id,
+                    "Извините, временно появилась ошибка при обработке заказа. "
+                    "Заказы с количеством звёзд меньше 50⭐ обрабатываются вручную. "
+                    "Мы временно отключили лоты и свяжемся с вами."
+                )
+            except Exception:
+                pass
+            cfg_local = _get_cfg_for_orders(chat_id if chat_id is not None else "__orders__")
+            _deactivate_all_star_lots(cardinal, cfg_local, chat_id, reason="невалидный заказ (<50⭐)")
+            return
+
+        _push(chat_id, {"qty": (qty if qty is not None else 50), "order_id": order_id, "stage": "await_username", "candidate": None})
 
         username = None
         for candidate in [getattr(order, "buyer_message", None), getattr(event, "message", None)]:
@@ -2341,23 +2666,24 @@ def new_order_handler(cardinal: Cardinal, event):
         except Exception:
             pass
 
-            if username:
-                _log("info", f"[PREORDER] Ник найден в альтернативном поле: @{username}")
         jwt = cfg.get("fragment_jwt")
         use_pre = bool(cfg.get("preorder_username", False))
 
-        if jwt and username and qty >= 50:
-            if use_pre:
-                _update_current(chat_id,
-                                stage="await_paid",
-                                candidate=username.lstrip("@"),
-                                prompted=False,
-                                finalized=False)
-                if order_id:
-                    _preorders[str(order_id)] = {"username": username.lstrip("@"), "qty": qty}
-                    _log("info", f"[PREORDER] Захватили ник @{username.lstrip('@')} для #{order_id}, ждём системное сообщение FunPay.")
-                    return
+        if use_pre and username and order_id:
+            _update_current(
+                chat_id,
+                stage="await_paid",
+                candidate=username.lstrip("@"),
+                prompted=False,
+                finalized=False
+            )
+            _preorders[str(order_id)] = {"username": username.lstrip("@"), "qty": qty}
+            _log("info", f"[PREORDER] Захватили ник @{username.lstrip('@')} для #{order_id}, ждём системное сообщение FunPay.")
+            return
 
+        if jwt and (qty is not None and qty >= 50):
+
+            if use_pre and username and not order_id:
                 _safe_send(cardinal, chat_id, f"Ник из заказа: @{username.lstrip('@')}. Отправляю {qty}⭐…")
                 resp = _order_stars(jwt, username=username.lstrip("@"), quantity=qty, show_sender=False)
 
@@ -2378,6 +2704,7 @@ def new_order_handler(cardinal: Cardinal, event):
                         return
                     else:
                         _update_current(chat_id, finalized=True)
+                        _mark_prompted(chat_id, order_id)
                         _safe_send(cardinal, chat_id, _tpl(chat_id, "failed", reason=human))
                         _log("error", f"ORDER FAIL #{order_id} {qty}⭐ @{username}: {human} | status={resp.get('status')}")
                         if cfg.get("auto_refund", False) and order_id:
@@ -2387,41 +2714,25 @@ def new_order_handler(cardinal: Cardinal, event):
                         else:
                             _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
                         _maybe_auto_deactivate(cardinal, cfg, chat_id)
+                return
 
+            cand = (username or "").lstrip("@")
+            _update_current(
+                chat_id,
+                stage=("await_confirm" if cand else "await_username"),
+                candidate=cand,
+                prompted=True,
+                finalized=False
+            )
+            if cand:
+                _safe_send(cardinal, chat_id, _tpl(chat_id, "username_valid", qty=(qty or 50), username=cand))
+                _safe_send(cardinal, chat_id, 'Если всё верно — ответьте "+". Чтобы изменить — пришлите другой @username.')
             else:
-                _safe_send(cardinal, chat_id, _tpl(chat_id, "sending", qty=qty, username=username.lstrip("@")))
-                resp = _order_stars(jwt, username=username.lstrip("@"), quantity=qty, show_sender=False)
+                _safe_send(cardinal, chat_id, _tpl(chat_id, "purchase_created", qty=(qty or 50)))
+            _mark_prompted(chat_id, order_id)
+            return
 
-                if resp.get("ok"):
-                    _safe_send(cardinal, chat_id, f"✅ Готово: отправлено {qty}⭐ на @{username.lstrip('@')}.")
-                    order_url = f"https://funpay.com/orders/{order_id}/" if order_id else ""
-                    _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=qty, username=username.lstrip("@"), order_url=order_url))
-
-                    _mark_prompted(chat_id, order_id)
-                    _pop_current(chat_id)
-                    if _has_queue(chat_id):
-                        nxt = _current(chat_id)
-                        qn = int(nxt.get("qty", 50))
-                        _safe_send(cardinal, chat_id, f"Следующий заказ: {qn}⭐.\nНапишите ваш Telegram-тег в формате @username одной строкой.")
-                else:
-                    kind, human = _classify_send_failure(resp.get("text",""), resp.get("status",0), username.lstrip("@"), jwt)
-                    if kind == "username":
-                        _update_current(chat_id, stage="await_username", finalized=False, candidate=None)
-                        _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid"))
-                        return
-                    else:
-                        _update_current(chat_id, finalized=True)
-                        _safe_send(cardinal, chat_id, _tpl(chat_id, "failed", reason=human))
-                        _log("error", f"ORDER FAIL #{order_id} {qty}⭐ @{username}: {human} | status={resp.get('status')}")
-                        if cfg.get("auto_refund", False) and order_id:
-                            _safe_send(cardinal, chat_id, "🔁 Пытаюсь оформить возврат…")
-                            ok_ref = _auto_refund_order(cardinal, order_id, chat_id, reason=human)
-                            _log("info" if ok_ref else "error", f"REFUND #{order_id} -> {'OK' if ok_ref else 'FAIL'}")
-                        else:
-                            _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
-                        _maybe_auto_deactivate(cardinal, cfg, chat_id)
-        else:
-            _log("info", f"ORDER #{order_id}: queued, waiting for username/system message.")
+        _log("info", f"ORDER #{order_id}: queued, waiting for username/system message.")
 
     except Exception as e:
         logger.exception(f"new_order_handler error: {e}")
@@ -2486,6 +2797,7 @@ def _do_confirm_send(cardinal: "Cardinal", chat_id):
             _update_current(chat_id, finalized=True)
 
             oid = pend.get("order_id")
+            _mark_prompted(chat_id, oid)
             if cfg.get("auto_refund", False) and oid:
                 _safe_send(cardinal, chat_id, "🔁 Пытаюсь оформить возврат…")
                 ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
@@ -2558,8 +2870,29 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         my_user = (getattr(cardinal.account, "username", None) or "").lower()
         author  = (getattr(event.message, "author", "") or "").lower()
 
-        chat_id = event.message.chat_id
+        chat_id = _event_chat_id(event)
         text = (event.message.text or "").strip()
+        _adopt_foreign_queue_for(chat_id)
+
+        if _is_auto_reply(event.message):
+            try:
+                chat_id = _event_chat_id(event)
+            except Exception:
+                chat_id = None
+            cur = _current(chat_id) or {}
+            oid = cur.get("order_id")
+            suffix = []
+            if chat_id is not None:
+                suffix.append(f"CID:{chat_id}")
+            if oid:
+                suffix.append(f"OID:{oid}")
+            extra = (" (" + " ".join(suffix) + ")") if suffix else ""
+            _log("info", f"[IGNORE] auto-reply skipped{extra}")
+            return
+
+        if author == "funpay" and (_is_gift_like_text(text) or _mentions_account_login(text)):
+            _log("info", "[IGNORE] gift/account-login system note")
+            return
 
         cfg = _get_cfg_for_orders(chat_id)
 
@@ -2568,8 +2901,11 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         except Exception:
             user_mid = None
 
-        if text and author not in {"funpay"} and author != my_user:
-            _safe_delete(cardinal.telegram.bot, chat_id, user_mid)
+        if CLEAN_USER_MSGS:
+            stage = (_current(chat_id) or {}).get("stage")
+            waiting_input = stage in {"await_username", "await_confirm"}
+            if text and author not in {"funpay"} and not waiting_input:
+                _safe_delete(cardinal.telegram.bot, chat_id, user_mid)
 
         if not cfg.get("plugin_enabled", True):
             return
@@ -2586,8 +2922,20 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
 
         if author == "funpay" and _funpay_is_system_paid_message(text):
             qty, oid = _funpay_extract_qty_and_order_id(text)
-            if qty is None:
-                qty = 50
+            if qty is not None and qty < 50:
+                return
+
+            known_here = any(str(x.get("order_id")) == str(oid) for x in _q(chat_id))
+            known_any  = known_here or (
+                oid and any(str(x.get("order_id")) == str(oid) for q in _pending_orders.values() for x in q)
+            ) or (oid and str(oid) in _preorders)
+
+            if not known_any:
+                _ensure_pending(chat_id, oid, qty)
+                if _should_prompt_once(chat_id, oid, qty or 0):
+                    _safe_send(cardinal, chat_id, _tpl(chat_id, "purchase_created", qty=(qty or 50)))
+                    _mark_prompted(chat_id, oid)
+                return
 
             pending = None
             for x in _q(chat_id):
@@ -2648,12 +2996,14 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
                         _log("info" if ok_ref else "error", f"REFUND #{oid} -> {'OK' if ok_ref else 'FAIL'}")
                     else:
                         _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
+                    _mark_prompted(chat_id, oid)
                     _maybe_auto_deactivate(cardinal, cfg, chat_id)
                     return
+
             if not _was_prompted(chat_id, oid):
                 _ensure_pending(chat_id, oid, qty)
-                if _should_prompt_once(chat_id, oid, qty):
-                    _safe_send(cardinal, chat_id, _tpl(chat_id, "purchase_created", qty=qty))
+                if _should_prompt_once(chat_id, oid, qty or 0):
+                    _safe_send(cardinal, chat_id, _tpl(chat_id, "purchase_created", qty=(qty or 50)))
                     _mark_prompted(chat_id, oid)
                     _update_current(chat_id, prompted=True, stage="await_username")
                 return
@@ -2662,7 +3012,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         if not text:
             return
 
-        if author == my_user:
+        if author == my_user and (_current(chat_id) or {}).get("stage") not in {"await_username", "await_confirm"}:
             return
 
         if author == "funpay":
@@ -2711,6 +3061,8 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             return
 
         pend = _current(chat_id)
+        if not _has_queue(chat_id):
+            logger.warning(f"[QUEUE] no head for chat_id={chat_id}; queues={list(_pending_orders.keys())[:5]}")
         if not pend:
             return
 
@@ -2720,10 +3072,21 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             return
 
         username = _extract_username_from_text(text)
-        if username:
-            _safe_send(cardinal, chat_id, _tpl(chat_id, "username_received", username=username.lstrip("@")))
-        else:
+        if not username:
             _update_current(chat_id, stage="await_username")
+            _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid"))
+            return
+
+        uname = username.lstrip("@")
+
+        if not _validate_username(uname):
+            _update_current(chat_id, stage="await_username")
+            _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid"))
+            return
+
+        jwt_local = cfg.get("fragment_jwt")
+        if jwt_local and not _check_username_exists(uname, jwt_local):
+            _update_current(chat_id, stage="await_username", candidate=None)
             _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid"))
             return
 
@@ -2734,12 +3097,13 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             if len(enabled_qty) == 1:
                 qty = enabled_qty[0]
 
-        _update_current(chat_id, qty=int(qty), candidate=username, stage="await_confirm")
+        _update_current(chat_id, qty=int(qty), candidate=uname, stage="await_confirm")
+        _safe_send(cardinal, chat_id, _tpl(chat_id, "username_valid", qty=qty, username=uname))
         _safe_send(
             cardinal, chat_id,
             "Проверьте данные:\n"
             f"- Количество: {qty}⭐\n"
-            f"- Ник: @{username.lstrip('@')}\n\n"
+            f"- Ник: @{uname}\n\n"
             'Если всё верно — ответьте "+".\n'
             "Чтобы изменить — пришлите другой тег в формате @username."
         )
