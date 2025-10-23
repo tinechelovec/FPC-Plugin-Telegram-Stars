@@ -6,6 +6,7 @@ import logging
 import requests
 import re as _re
 import time
+import random
 
 from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
@@ -31,6 +32,10 @@ logger = logging.getLogger("FTS-Plugin")
 
 HUMAN_LOGS   = bool(int(os.getenv("FTS_HUMAN_LOGS", "1")))
 HUMAN_DEDUP  = bool(int(os.getenv("FTS_HUMAN_DEDUP", "1")))
+
+_USERNAME_CHECK_GAP = float(os.getenv("FTS_USERNAME_CHECK_GAP", "0.8"))
+_USERNAME_CHECK_JITTER = float(os.getenv("FTS_USERNAME_CHECK_JITTER", "0.4"))
+_last_username_check_ts: Dict[str, float] = {}
 
 class _Ansi:
     R = "\033[31m"; Y = "\033[33m"; C = "\033[36m"; G = "\033[32m"
@@ -183,7 +188,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.4.1"
+VERSION     = "1.4.2"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -212,6 +217,14 @@ os.makedirs(PLUGIN_FOLDER, exist_ok=True)
 if not os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump({}, f, indent=4, ensure_ascii=False)
+
+LOG_FILE_LOCAL = os.path.join(PLUGIN_FOLDER, "lot.txt")
+try:
+    _fh_local = logging.FileHandler(LOG_FILE_LOCAL, encoding="utf-8")
+    _fh_local.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [FTS-Plugin] %(message)s"))
+    logger.addHandler(_fh_local)
+except Exception as e:
+    logger.debug(f"Local file logging init failed: {e}")
 
 def _load_settings() -> dict:
     try:
@@ -359,58 +372,70 @@ HELP_TEXT = f"""
 <b>Инструкция и помощь</b>
 
 <b>Что это?</b>
-Панель управления продажей звёзд (Telegram Stars) для FunPay: токен Fragment, баланс, лоты, автопокупка и возвраты.
+Панель управления продажей звёзд (Telegram Stars) для FunPay: токен Fragment, баланс, лоты, массовая наценка/сброс, автовозвраты и очередь заказов.
 
 <b>Важно</b>
-Категория FunPay для звёзд фиксирована: <code>2418</code>.
+Категория FunPay для звёзд фиксирована: <code>2418</code>. Минимальное количество к покупке — <b>50⭐</b>.
 
 <b>Дисклеймер</b>
-Автор НЕ ПРОДАЁТ этот плагин. Любые платные перепродажи — инициатива третьих лиц. Исходники на GitHub (ссылка внизу).
+Автор НЕ ПРОДАЁТ этот плагин. Любые платные перепродажи — инициатива третьих лиц. Исходники на GitHub (кнопка внизу).
 
 <b>Быстрый старт</b>
-1) Привяжите токен Fragment (см. ниже «Токен (JWT)»).  
-2) Создайте и добавьте лоты звёзд (раздел «⭐ Звёзды (лоты)»).  
+1) Привяжите токен Fragment (раздел «🔐 Токен»): создать или импортировать готовый JWT.  
+2) Добавьте лоты звёзд (раздел «⭐ Звёзды (лоты)») и при необходимости отредактируйте цены.  
 3) Включите «Лоты» в настройках.  
-4) Настройте порог баланса в TON (по желанию).  
-5) При необходимости подправьте тексты в «🧩 Сообщения».
+4) При желании задайте порог баланса TON для автодеактивации.  
+5) Подкорректируйте тексты в «🧩 Сообщения».
+
+<b>Навигация</b>
+• <b>⚙️ Настройки</b> — все тумблеры и сервисные действия.  
+• <b>🔐 Токен</b> — создание/импорт/удаление JWT, просмотр баланса.  
+• <b>⭐ Звёзды (лоты)</b> — управление лотами, массовая наценка/сброс, быстрое редактирование цены.  
+• <b>🛠️ Мини-настройки</b> — приоритет ручного возврата, порог TON, редактирование сообщений.  
+• <b>📜 Логи</b> — отправка файла логов <code>lot.txt</code> в чат.
 
 <b>Переключатели</b>
-• <b>Плагин</b> — главный тумблер работы плагина.  
-• <b>Лоты</b> — массово включает/выключает все лоты (или только из списка звёздных, если он задан).  
-• <b>Автовозврат</b> — при ошибке продавца пытается вернуть средства автоматически.  
-• <b>Команда !бэк</b> — ручной возврат по запросу покупателя (<code>!бэк</code> или <code>!бэк #ORDERID</code>).  
-• <b>Приоритет !бэк</b> — выше/ниже автовозврата.  
+• <b>Плагин</b> — главный тумблер.  
+• <b>Лоты</b> — массово включает/выключает лоты категории 2418 (или только перечисленные в списке звёздных).  
+• <b>Автовозврат</b> — при ошибке продавца оформляет возврат автоматически.  
+• <b>Команда !бэк</b> — разрешить ручной возврат покупателем (<code>!бэк</code> или <code>!бэк #ORDERID</code>).  
+• <b>Приоритет !бэк</b> — выше/ниже автовозврата. Если приоритет ниже и автовозврат выключен — команда будет недоступна.  
 • <b>Автодеактивация</b> — при балансе ниже порога отключает лоты категории 2418.  
-• <b>Ник из заказа</b> — брать @username из заказа и покупать после «заказ оплачен».  
-• <b>Наценка</b> — массовое изменение цен на лоты звёзд.  
-• <b>Мин. баланс TON</b> — порог автодеактивации.  
-• <b>Токен (JWT)</b> — состояние авторизации и баланс TON.  
-• <b>🧩 Сообщения</b> — тексты ответов покупателю.
+• <b>Ник из заказа</b> — брать @username из заказа и автоматически отправлять после «заказ оплачен».
 
-<b>Токен (JWT): как создать</b>
-1) Нажмите «🧩 Создать токен».  
-2) Введите <b>API-ключ</b> из <code>fragment-api.com/dashboard</code> и <b>телефон</b> (без «+»).  
-3) Выберите <b>версию кошелька</b> (обычно W5).  
-4) Вставьте <b>24 слова</b> мнемофразы.  
-5) Подтвердите вход в Telegram, дождитесь привязки. Баланс подтянется автоматически.
+<b>🔐 Токен (JWT)</b>
+• <u>Создать</u>: API-ключ (dashboard <code>fragment-api.com</code>) → телефон (без «+») → версия кошелька (<b>W5</b> или <b>V4R2</b>) → 24 слова мнемофразы.  
+• <u>Импорт</u>: вставьте JWT одной строкой или пришлите .txt/.json — токен извлечётся из ключей <code>token/jwt/access/authorization</code>.  
+• После привязки баланс TON подтягивается в «Настройках». При ошибках показана человеко-понятная причина (в т.ч. «слишком много попыток»).
 
 <b>⭐ Лоты</b>
-• Добавляйте пары <code>кол-во → LOT_ID</code>, включайте/выключайте, удаляйте.  
-• Есть «Включить все»/«Выключить все», просмотр цены и быстрая смена цены.  
-• Если список пуст, тумблер «Лоты» управляет всей категорией 2418.
+• Добавление пар <code>кол-во → LOT_ID</code>, точечное вкл/выкл, удаление.  
+• <b>💰 Цена</b> — быстрое изменение цены конкретного лота.  
+• <b>💹 Наценка</b> — массовое изменение цен с предварительным превью итогов и «+Δ».  
+• <b>♻️ Сбросить наценку</b> — откат применённого процента.  
+• <b>⚡ Включить все / 💤 Выключить все</b> — массовое состояние лотов.  
+• Валюта RUB округляется до целых.
 
 <b>Как проходит продажа</b>
-1) <u>Ник из заказа ВКЛ</u>: ник берётся из заказа → ждём «заказ оплачен» → покупка. При «user not found» запрашиваем верный ник.  
-2) <u>Ник из заказа ВЫКЛ</u>: плагин просит @username, показывает превью, ждёт «+», затем отправляет звёзды.
+1) <u>«Ник из заказа» ВКЛ</u>: ник берётся из заказа → ждём системное «заказ оплачен» → плагин отправляет ⭐. При «user not found» будет запрос на корректный ник.  
+2) <u>«Ник из заказа» ВЫКЛ</u>: плагин просит @username → показывает превью → ждёт подтверждение.  
+• Подтверждение: ответьте <b>«+»</b> (для конкретного заказа при нескольких активных: <b>«+ #ORDERID»</b>).  
+• Минимум к отправке — 50⭐.
 
 <b>Возвраты</b>
 • <b>Автовозврат</b> — при ошибке продавца (баланс/авторизация/лимиты/сеть).  
-• <b>Ручной</b> — покупатель пишет <code>!бэк</code> или <code>!бэк #ORDERID</code> (зависит от настроек и стадии заказа).
+• <b>Ручной</b> — покупатель пишет <code>!бэк</code> или <code>!бэк #ORDERID</code> (зависит от настроек и стадии заказа).  
+• Если заказ некорректен (например, <50⭐), лоты могут быть временно отключены с указанием причины в «Настройках».
+
+<b>🧩 Сообщения</b> (шаблоны ответов)
+Доступные плейсхолдеры: <code>qty</code>, <code>username</code>, <code>order_id</code>, <code>order_url</code>, <code>reason</code>.  
+Изменяйте тексты для этапов: «После покупки», «Ник получен», «Ник неверный», «Отправка», «Успех», «Ошибка».
 
 <b>Подсказки</b>
-• Если баланс ниже порога — лоты будут отключены автоматически (причина отобразится в настройках).  
-• Ники проверяются на формат (5–32, латиница/цифры/подчёркивание).  
-• Минимальное количество к покупке — 50⭐.
+• Порог TON управляет автодеактивацией; причина отключения показывается в «Настройках».  
+• Проверка @username — по формату (5–32) и существованию в Fragment (с троттлингом запросов).  
+• Системные заметки «подарок/заход на аккаунт» игнорируются.  
+• В «📜 Логи» можно получить файл <code>lot.txt</code> для диагностики.
 
 <b>Ссылки</b>
 Кнопки «Создатель», «Группа», «Канал», «GitHub» — внизу этого окна.
@@ -513,11 +538,24 @@ def _normalize_wallet_version(s: str) -> str:
 def _extract_qty_from_title(title: str) -> Optional[int]:
     if not title:
         return None
-    nums = [int(x) for x in _re.findall(r"\d+", title)]
-    for n in nums:
-        if n >= 50:
-            return n
-    return None
+
+    m = _re.search(r"(\d{2,7})\s*(?:зв[её]зд\w*|stars?|⭐️|⭐)", title, _re.I)
+    if m:
+        try:
+            v = int(m.group(1))
+            return v if v >= 50 else None
+        except Exception:
+            pass
+
+    nums = []
+    for x in _re.findall(r"\d{2,7}", title):
+        try:
+            n = int(x)
+            if n >= 50:
+                nums.append(n)
+        except Exception:
+            pass
+    return max(nums) if nums else None
 
 def _extract_username_from_text(text: str) -> Optional[str]:
     if not text:
@@ -605,6 +643,16 @@ def _check_username_exists(username: str, jwt: Optional[str]) -> bool:
         except Exception as e:
             logger.debug(f"_check_username_exists {url} failed: {e}")
     return False
+
+def _check_username_exists_throttled(username: str, jwt: Optional[str], chat_id: Any = None) -> bool:
+    key = str(chat_id) if chat_id is not None else "__global__"
+    now = time.time()
+    last = _last_username_check_ts.get(key, 0.0)
+    wait = (last + _USERNAME_CHECK_GAP) - now
+    if wait > 0:
+        time.sleep(min(wait + random.random() * _USERNAME_CHECK_JITTER, _USERNAME_CHECK_GAP + _USERNAME_CHECK_JITTER))
+    _last_username_check_ts[key] = time.time()
+    return _check_username_exists(username, jwt)
 
 def _extract_wallet_info(data: dict) -> tuple[Optional[str], Optional[float]]:
     if not isinstance(data, dict):
@@ -761,6 +809,43 @@ def _is_too_many_attempts(raw_resp: Any) -> tuple[bool, Optional[int]]:
         sec = int(m.group(1)) if m else None
         return True, sec
     return False, None
+
+def _human_auth_error(raw_resp: Any, status: int) -> str:
+    try:
+        is_tma, wait_sec = _is_too_many_attempts(raw_resp)
+        if is_tma:
+            return f"Слишком много попыток входа. Подождите {wait_sec or 'несколько'} секунд и повторите."
+
+        msgs = []
+        if isinstance(raw_resp, dict):
+            keys = ("non_field_errors", "errors", "detail", "message", "error", "phone_number", "mnemonics", "api_key")
+            for k in keys:
+                v = raw_resp.get(k)
+                if isinstance(v, list):
+                    msgs.extend([str(x) for x in v if x])
+                elif isinstance(v, (str, int, float)) and str(v).strip():
+                    msgs.append(str(v))
+
+            for subkey in ("data", "result", "payload"):
+                sub = raw_resp.get(subkey)
+                if isinstance(sub, dict):
+                    for k in keys:
+                        v = sub.get(k)
+                        if isinstance(v, list):
+                            msgs.extend([str(x) for x in v if x])
+                        elif isinstance(v, (str, int, float)) and str(v).strip():
+                            msgs.append(str(v))
+
+        elif isinstance(raw_resp, list):
+            msgs.extend([str(x) for x in raw_resp if x])
+
+        msg = " | ".join(m.strip() for m in msgs if m and str(m).strip())
+        if not msg:
+            msg = f"Сервер вернул статус {status}. Проверьте API-ключ, телефон и мнемофразу."
+
+        return (msg[:500] + "…") if len(msg) > 500 else msg
+    except Exception:
+        return f"Не удалось создать токен (HTTP {status}). Проверьте данные и повторите."
 
 def _get_my_lots_by_category(cardinal: "Cardinal", category_id: int) -> Dict[int, Any]:
     lots: Dict[int, Any] = {}
@@ -984,7 +1069,7 @@ def _classify_send_failure(resp_text: str, status: int, username: str, jwt: Opti
     if any(t in low for t in ("username", "user not found", "not found", "invalid", "does not exist")):
         return "username", "Пользователь с таким @username не найден."
 
-    if status == 400 and username and not _check_username_exists(username, jwt):
+    if status == 400 and username and not _check_username_exists_throttled(username, jwt):
         return "username", "Пользователь с таким @username не найден."
 
     if any(t in low for t in ("balance", "not enough")):
@@ -1067,6 +1152,7 @@ CBT_MARKUP_CHANGE  = f"{UUID}:markup_change"
 CBT_MINI_SETTINGS = f"{UUID}:mini"
 CBT_STAR_PRICE_P  = f"{UUID}:star_price:"
 CBT_MARKUP_RESET  = f"{UUID}:markup_reset"
+CBT_LOGS = f"{UUID}:logs"
 
 _fsm: dict[int, dict] = {}
 
@@ -1112,11 +1198,9 @@ def _settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
     )
 
     kb.row(B("🔐 Токен", callback_data=CBT_TOKEN))
-
     kb.row(B("⚙️ Настройка лотов", callback_data=CBT_STARS))
-
     kb.row(B("🛠️ Мини-настройки", callback_data=CBT_MINI_SETTINGS))
-
+    kb.row(B("📜 Логи", callback_data=CBT_LOGS))
     kb.row(B("🔄 Обновить", callback_data=CBT_REFRESH))
     kb.add(B("🏠 Домой", callback_data=CBT_HOME))
     kb.add(B("◀️ Назад", callback_data=CBT_HOME))
@@ -1152,7 +1236,8 @@ def _open_mini_settings(bot, call):
 
 def _token_kb() -> InlineKeyboardMarkup:
     kb = K()
-    kb.add(B("🧩 Создать токен", callback_data=CBT_CREATE_JWT))
+    kb.add(B("🧩 Создать токен", callback_data=CBT_CREATE_JWT),
+            B("📥 Импорт токена", callback_data=CBT_SET_JWT))
     kb.row(B("♻️ Пересоздать токен", callback_data=CBT_CREATE_JWT),
            B("🗑 Удалить токен", callback_data=CBT_DEL_JWT))
     kb.add(B("🏠 Домой", callback_data=CBT_HOME))
@@ -1180,6 +1265,7 @@ def _stars_kb(chat_id: Any) -> InlineKeyboardMarkup:
         B("⚡ Включить все", callback_data=CBT_STAR_ACT_ALL),
         B("💤 Выключить все", callback_data=CBT_STAR_DEACT_ALL)
     )
+    kb.add(B("◀️ Назад", callback_data=CBT_SETTINGS))
     return kb
 
 _MSG_TITLES = {
@@ -1788,7 +1874,9 @@ def init_cardinal(cardinal: Cardinal):
         lambda m: _handle_fsm(m, cardinal),
         func=lambda m: (m.chat.id in _fsm and _fsm[m.chat.id].get("step") in {
             "jwt_api_key","jwt_phone","jwt_wallet_ver","jwt_seed","set_min_balance","star_add_qty","star_add_lotid","msg_edit_value","markup_percent","set_jwt","star_price_value"
-        })
+        }
+        ),
+        content_types=['text', 'document']
     )
 
     tg.cbq_handler(
@@ -1799,6 +1887,11 @@ def init_cardinal(cardinal: Cardinal):
             or c.data == f"{UUID}:0"
             or c.data == CBT_HOME
         )
+    )
+    tg.msg_handler(
+    lambda m: _handle_fsm(m, cardinal),
+    func=lambda m: (m.chat.id in _fsm and _fsm[m.chat.id].get("step") == "set_jwt"),
+    content_types=['document']
     )
 
     tg.cbq_handler(lambda c: _open_settings(bot, c), func=lambda c: c.data == CBT_SETTINGS)
@@ -1821,6 +1914,7 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _jwt_confirmed(bot, c),   func=lambda c: c.data == CBT_JWT_CONFIRMED)
     tg.cbq_handler(lambda c: _jwt_resend(bot, c),      func=lambda c: c.data == CBT_JWT_RESEND)
     tg.cbq_handler(lambda c: _del_jwt(bot, c),     func=lambda c: c.data == CBT_DEL_JWT)
+    tg.cbq_handler(lambda c: _ask_set_jwt(bot, c), func=lambda c: c.data == CBT_SET_JWT)
 
     tg.cbq_handler(lambda c: _star_add(bot, c),         func=lambda c: c.data == CBT_STAR_ADD)
     tg.cbq_handler(lambda c: _star_act_all(bot, c),     func=lambda c: c.data == CBT_STAR_ACT_ALL)
@@ -1846,6 +1940,7 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _open_mini_settings(bot, c), func=lambda c: c.data == CBT_MINI_SETTINGS)
     tg.cbq_handler(lambda c: _star_price_start(bot, c), func=lambda c: c.data.startswith(CBT_STAR_PRICE_P))
     tg.cbq_handler(lambda c: _cb_markup_reset(cardinal, c), func=lambda c: c.data == CBT_MARKUP_RESET)
+    tg.cbq_handler(lambda c: _send_logs(bot, c), func=lambda c: c.data == CBT_LOGS)
 
 def _open_home(bot, call):
     _safe_edit(bot, call.message.chat.id, call.message.id, _about_text(), _home_kb())
@@ -1891,6 +1986,28 @@ def _open_stars(bot, call):
     _safe_edit(bot, chat_id, call.message.id, _stars_text(chat_id), _stars_kb(chat_id))
     try: bot.answer_callback_query(call.id)
     except Exception: pass
+
+def _send_logs(bot, call):
+    chat_id = call.message.chat.id
+    path = os.getenv("FTS_RAW_LOG_FILE") or os.path.join(PLUGIN_FOLDER, "lot.txt")
+    try:
+
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as _:
+                pass
+
+        with open(path, "rb") as f:
+            bot.send_document(chat_id, ("lot.txt", f.read()), caption="Логи FTS-Plugin")
+
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            bot.answer_callback_query(call.id, f"Не удалось отправить лог: {e}", show_alert=True)
+        except Exception:
+            pass
 
 CBT_VER_PREFIX    = f"{UUID}:ver:"
 
@@ -2101,7 +2218,12 @@ def _ask_set_jwt(bot, call):
     _fsm[chat_id] = {"step": "set_jwt"}
     try: bot.answer_callback_query(call.id)
     except Exception: pass
-    bot.send_message(chat_id, "Вставьте готовый JWT-токен одной строкой (или /cancel):", reply_markup=_kb_cancel_fsm())
+    bot.send_message(
+        chat_id,
+        "Вставьте готовый JWT одной строкой ИЛИ пришлите файлом (.txt / .json). "
+        "В JSON токен может лежать в ключах token/jwt/access/authorization. (или /cancel)",
+        reply_markup=_kb_cancel_fsm()
+    )
 
 def _del_jwt(bot, call):
     chat_id = call.message.chat.id
@@ -2116,6 +2238,44 @@ def _start_create_jwt(bot, call):
     try: bot.answer_callback_query(call.id)
     except Exception: pass
     bot.send_message(chat_id, "Введите API-ключ Fragment (или /cancel). Его можно взять в dashboard: https://fragment-api.com/dashboard", reply_markup=_kb_cancel_fsm())
+
+def _clean_jwt_text(s: str) -> str:
+    try:
+        s = (s or "").strip().strip('"').strip("'")
+        s = _re.sub(r'^(?:JWT|Bearer)\s+', '', s, flags=_re.I)
+        s = _re.sub(r'\s+', '', s)
+        return s
+    except Exception:
+        return s or ""
+
+def _is_jwt_like(s: str) -> bool:
+    if not s or s.count(".") < 2:
+        return False
+    return bool(_re.fullmatch(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", s))
+
+def _find_jwt_in_json(obj: Any) -> Optional[str]:
+    CAND_KEYS = {"token","jwt","access","authorization","Authorization","auth","detail"}
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in CAND_KEYS and isinstance(v, str):
+                    cand = _clean_jwt_text(v)
+                    if _is_jwt_like(cand) or len(cand) > 16:
+                        return cand
+            for subk in ("data","result","payload"):
+                if subk in obj:
+                    v = _find_jwt_in_json(obj[subk])
+                    if v: return v
+            for v in obj.values():
+                vv = _find_jwt_in_json(v)
+                if vv: return vv
+        elif isinstance(obj, list):
+            for v in obj:
+                vv = _find_jwt_in_json(v)
+                if vv: return vv
+    except Exception:
+        pass
+    return None
 
 def _handle_fsm(message: Message, cardinal: Cardinal):
     chat_id = message.chat.id
@@ -2204,46 +2364,44 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
 
         jwt, raw, sc = _authenticate_fragment(api_key=api_key, phone_number=phone, version=wallet_ver, mnemonics=words)
         if jwt:
-            _set_cfg(chat_id, fragment_jwt=jwt)
-            cardinal.telegram.bot.send_message(chat_id, "✅ Успешно: токен создан и привязан.")
-            ver, bal, resp = _check_fragment_wallet(jwt)
-            if ver is not None or bal is not None or resp is not None:
-                _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
-            _fsm.pop(chat_id, None)
-            return
+                _set_cfg(chat_id, fragment_jwt=jwt)
+                cardinal.telegram.bot.send_message(chat_id, "✅ Успешно: токен создан и привязан.")
+                ver, bal, resp = _check_fragment_wallet(jwt)
+                if ver is not None or bal is not None or resp is not None:
+                    _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
+                _fsm.pop(chat_id, None)
+                return
+        
+        human = _human_auth_error(raw, sc)
+        cardinal.telegram.bot.send_message(chat_id, f"❌ Не удалось создать токен. {human}")
 
         is_tma, wait_sec = _is_too_many_attempts(raw)
         if sc == 400 and is_tma:
-            cardinal.telegram.bot.send_message(chat_id, f"Подождите {wait_sec or 'несколько'} секунд и подтвердите вход в Telegram.")
+                jwt, raw, sc = _authenticate_fragment(api_key=api_key, phone_number=phone, version=wallet_ver, mnemonics=words)
+                if jwt:
+                    _set_cfg(chat_id, fragment_jwt=jwt)
+                    cardinal.telegram.bot.send_message(chat_id, "✅ Успешно: токен создан и привязан.")
+                    ver, bal, resp = _check_fragment_wallet(jwt)
+                    if ver is not None or bal is not None or resp is not None:
+                        _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
+                    _fsm.pop(chat_id, None)
+                    return
+                human2 = _human_auth_error(raw, sc)
+                cardinal.telegram.bot.send_message(chat_id, f"❌ Повтор не удался. {human2}")
+                return
         else:
-            cardinal.telegram.bot.send_message(chat_id, "Подтвердите вход в Telegram и снова запустите «🧩 Создать токен», когда будете готовы.")
-            return
+            human = _human_auth_error(raw, sc)
+            if sc == 400:
+                cardinal.telegram.bot.send_message(chat_id, f"❌ Не удалось выдать токен. {human}")
+            else:
+                cardinal.telegram.bot.send_message(chat_id, f"❌ Не удалось выдать токен (HTTP {sc}). {human}")
 
-        jwt, raw, sc = _authenticate_fragment(api_key=api_key, phone_number=phone, version=wallet_ver, mnemonics=words)
-        if jwt:
-            _set_cfg(chat_id, fragment_jwt=jwt)
-            cardinal.telegram.bot.send_message(chat_id, "✅ Успешно: токен создан и привязан.")
-            ver, bal, resp = _check_fragment_wallet(jwt)
-            if ver is not None or bal is not None or resp is not None:
-                _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
-            _fsm.pop(chat_id, None)
-            return
+            try:
+                text = json.dumps(raw, ensure_ascii=False, indent=2)[:1900]
+            except Exception:
+                text = str(raw)[:1900]
+            cardinal.telegram.bot.send_message(chat_id, f"Ответ сервера:\n<code>{text}</code>", parse_mode="HTML")
 
-        is_tma, wait_sec = _is_too_many_attempts(raw)
-        if sc == 400 and is_tma:
-            cardinal.telegram.bot.send_message(
-                chat_id,
-                f"Подождите {wait_sec or 'несколько'} секунд, затем подтвредите вход и подождите ответа в плагине. ",
-                parse_mode="HTML"
-            )
-        else:
-            cardinal.telegram.bot.send_message(
-                chat_id,
-                f"Пока токен не выдан (статус {sc}). Подтвердите вход в Telegram и нажмите «Я подтвердил вход».",
-                parse_mode="HTML"
-            )
-        return
-    
     if state.get("step") == "markup_percent":
         pmid = (_fsm.get(chat_id) or {}).get("prompt_msg_id")
         if text.lower() in ("/cancel", "cancel", "отмена"):
@@ -2408,19 +2566,81 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
         return
 
     if state.get("step") == "set_jwt":
-        if text.lower() in ("/cancel", "cancel", "отмена"):
-            _fsm.pop(chat_id, None); cardinal.telegram.bot.send_message(chat_id, "❌ Отменено."); return
-        jwt = text.strip()
-        if len(jwt) < 16:
-            cardinal.telegram.bot.send_message(chat_id, "⚠️ Похоже на некорректный токен. Пришлите строку JWT или /cancel.")
+            if (message.text or "").strip().lower() in ("/cancel", "cancel", "отмена"):
+                _fsm.pop(chat_id, None)
+                cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+                return
+
+            jwt_val = None
+            file_bytes = None
+            filename = None
+            mime = None
+
+            if getattr(message, "document", None):
+                try:
+                    filename = (message.document.file_name or "").lower()
+                    mime = (message.document.mime_type or "").lower()
+                    if message.document.file_size and message.document.file_size > 2_000_000:
+                        cardinal.telegram.bot.send_message(chat_id, "⚠️ Файл слишком большой (>2MB). Пришлите меньший или вставьте токен текстом.")
+                        return
+                    f_info = cardinal.telegram.bot.get_file(message.document.file_id)
+                    file_bytes = cardinal.telegram.bot.download_file(f_info.file_path)
+                except Exception as e:
+                    cardinal.telegram.bot.send_message(chat_id, f"⚠️ Не удалось прочитать файл: {e}")
+                    return
+
+            if file_bytes is not None:
+                try:
+                    text_data = file_bytes.decode("utf-8-sig", errors="ignore")
+                except Exception:
+                    text_data = file_bytes.decode("utf-8", errors="ignore")
+                content = (text_data or "").strip()
+
+                is_json = (filename or "").endswith(".json") or (mime or "").endswith("json") or content[:1] in "{["
+                if is_json:
+                    try:
+                        obj = json.loads(content)
+                        jwt_val = _find_jwt_in_json(obj)
+                    except Exception:
+                        jwt_val = None
+
+                if not jwt_val:
+                    cleaned = _clean_jwt_text(content)
+                    parts = _re.findall(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", cleaned)
+                    jwt_val = parts[0] if parts else cleaned
+
+            else:
+                part = _clean_jwt_text((message.text or ""))
+                acc = _clean_jwt_text((state.get("jwt_acc") or "") + part)
+
+                if not _is_jwt_like(acc) and len(acc) < 16:
+                    state["jwt_acc"] = acc
+                    _fsm[chat_id] = state
+                    cardinal.telegram.bot.send_message(chat_id, "Принял часть токена. Пришлите оставшиеся части (или /cancel).")
+                    return
+
+                jwt_val = acc
+
+            jwt_val = _clean_jwt_text(jwt_val or "")
+            if not jwt_val or len(jwt_val) < 16:
+                cardinal.telegram.bot.send_message(chat_id, "⚠️ Похоже на некорректный токен. Пришлите валидный JWT текстом или файлом .txt/.json, либо /cancel.")
+                return
+
+            _set_cfg(chat_id, fragment_jwt=jwt_val)
+            ver, bal, resp = _check_fragment_wallet(jwt_val)
+            _set_cfg(
+                chat_id,
+                wallet_version=ver,
+                balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None),
+                last_wallet_raw=resp
+            )
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(chat_id, "✅ Токен сохранён.")
+            _open_token(
+                cardinal.telegram.bot,
+                type("obj", (), {"message": type("m", (), {"chat": type("c", (), {"id": chat_id})(), "id": message.message_id})(), "id": ""})
+            )
             return
-        _set_cfg(chat_id, fragment_jwt=jwt)
-        ver, bal, resp = _check_fragment_wallet(jwt)
-        _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
-        _fsm.pop(chat_id, None)
-        cardinal.telegram.bot.send_message(chat_id, "✅ Токен сохранён.")
-        _open_token(cardinal.telegram.bot, type("obj", (), {"message": type("m", (), {"chat": type("c", (), {"id": chat_id})(), "id": message.message_id})(), "id": ""}))
-        return
 
 def _jwt_confirmed(bot, call):
     chat_id = call.message.chat.id
@@ -2447,12 +2667,16 @@ def _jwt_confirmed(bot, call):
                 f"Слишком много попыток входа. Подождите {wait_sec or 'несколько'} секунд и попробуйте ещё раз "
                 "через «🔁 Отправить ещё раз» или «✅ Я подтвердил вход».")
         else:
-            try: text = json.dumps(raw, ensure_ascii=False, indent=2)[:1900]
-            except Exception: text = str(raw)[:1900]
-            bot.send_message(chat_id, f"⚠️ Токен пока не выдан. Статус: <code>{sc}</code>\nОтвет сервера:\n<code>{text}</code>", parse_mode="HTML")
-
-    try: _open_token(bot, call)
-    except Exception: pass
+            human = _human_auth_error(raw, sc)
+            if sc == 400:
+                bot.send_message(chat_id, f"❌ Не удалось выдать токен. {human}")
+            else:
+                bot.send_message(chat_id, f"❌ Не удалось выдать токен (HTTP {sc}). {human}")
+            try:
+                text = json.dumps(raw, ensure_ascii=False, indent=2)[:1900]
+            except Exception:
+                text = str(raw)[:1900]
+            bot.send_message(chat_id, f"Ответ сервера:\n<code>{text}</code>", parse_mode="HTML")
 
 def _jwt_resend(bot, call):
     chat_id = call.message.chat.id
@@ -2476,14 +2700,47 @@ def _jwt_resend(bot, call):
         bot.send_message(chat_id,
             f"Слишком много попыток входа. Подождите {wait_sec or 'несколько'} секунд и попробуйте снова.")
     else:
-        try: pretty = json.dumps(raw, ensure_ascii=False, indent=2)
-        except Exception: pretty = str(raw)
-        bot.send_message(chat_id, "Ответ сервера:\n<code>{}</code>".format(pretty[:1900]), parse_mode="HTML")
+        human = _human_auth_error(raw, sc)
+        bot.send_message(chat_id, f"❌ Не удалось выдать токен (HTTP {sc}). {human}")
+        try:
+            pretty = json.dumps(raw, ensure_ascii=False, indent=2)
+        except Exception:
+            pretty = str(raw)
+        bot.send_message(chat_id, "Подробности:\n<code>{}</code>".format(pretty[:1900]), parse_mode="HTML")
 
 _pending_orders: Dict[str, List[Dict[str, Any]]] = {}
 _prompted_orders: Dict[str, set] = {}
 _prompted_oids: set[str] = set()
 _preorders: Dict[str, Dict[str, Any]] = {}
+_done_oids: set[str] = set()
+
+def _mark_done(chat_id: Any, oid: Optional[str]):
+    if not oid:
+        return
+    _done_oids.add(str(oid))
+    _preorders.pop(str(oid), None)
+    q = _q(chat_id)
+    for it in list(q):
+        if str(it.get("order_id")) == str(oid):
+            it["finalized"] = True
+            try:
+                q.remove(it)
+            except ValueError:
+                pass
+            break
+
+def _set_order_qty(chat_id: Any, order_id: Optional[str], qty: Optional[int]) -> None:
+    if not order_id or not qty or qty < 50:
+        return
+    try:
+        for it in _q(chat_id):
+            if str(it.get("order_id")) == str(order_id):
+                it["qty"] = int(qty)
+                break
+        if str(order_id) in _preorders:
+            _preorders[str(order_id)]["qty"] = int(qty)
+    except Exception:
+        pass
 
 def _adopt_foreign_queue_for(chat_id: Any) -> bool:
     key = str(chat_id)
@@ -2686,6 +2943,8 @@ def new_order_handler(cardinal: Cardinal, event):
             if use_pre and username and not order_id:
                 _safe_send(cardinal, chat_id, f"Ник из заказа: @{username.lstrip('@')}. Отправляю {qty}⭐…")
                 resp = _order_stars(jwt, username=username.lstrip("@"), quantity=qty, show_sender=False)
+                _mark_done(chat_id, order_id)
+                _preorders.pop(str(order_id), None)
 
                 if resp.get("ok"):
                     _safe_send(cardinal, chat_id, f"✅ Готово: отправлено {qty}⭐ на @{username.lstrip('@')}.")
@@ -2764,7 +3023,7 @@ def _do_confirm_send(cardinal: "Cardinal", chat_id):
         _log("warn", f"SEND aborted: qty {qty} < 50")
         return
 
-    if not _check_username_exists(username, jwt):
+    if not _check_username_exists_throttled(username, jwt, chat_id):
         _safe_send(cardinal, chat_id, f'❌ Ник "{username}" не найден. Пришлите верный тег в формате @username.')
         _log("warn", f"USERNAME not found (confirm): @{username}")
         return
@@ -2776,6 +3035,9 @@ def _do_confirm_send(cardinal: "Cardinal", chat_id):
         oid = pend.get("order_id")
         order_url = f"https://funpay.com/orders/{oid}/" if oid else ""
         _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=qty, username=username.lstrip('@'), order_url=order_url))
+        _mark_done(chat_id, pend.get("order_id"))
+        if oid:
+            _preorders.pop(str(oid), None)
 
         _log("info", f"SEND OK {qty}⭐ -> @{username}")
         _update_current(chat_id, finalized=True)
@@ -2850,6 +3112,100 @@ def _allowed_stages(item: dict) -> bool:
         and not item.get("finalized")
     )
 
+def _pending_by_oid(chat_id: Any, oid: Optional[str]) -> Optional[dict]:
+    if not oid:
+        return None
+    for x in _q(chat_id):
+        if str(x.get("order_id")) == str(oid) and _allowed_stages(x):
+            return x
+    return None
+
+def _apply_username_for_item(cardinal: "Cardinal", chat_id: Any, item: dict, uname: str):
+    cfg = _get_cfg_for_orders(chat_id)
+    jwt = cfg.get("fragment_jwt")
+
+    if not _validate_username(uname):
+        _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid", order_id=item.get("order_id")))
+        item.update(stage="await_username", candidate=None)
+        return
+
+    if jwt and not _check_username_exists(uname, jwt):
+        _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid", order_id=item.get("order_id")))
+        item.update(stage="await_username", candidate=None)
+        return
+
+    qty = int(item.get("qty") or 50)
+    item.update(candidate=uname, stage="await_confirm", confirmed=False)
+
+    _safe_send(cardinal, chat_id, _tpl(chat_id, "username_valid", qty=qty, username=uname, order_id=item.get("order_id")))
+    _safe_send(
+        cardinal, chat_id,
+        "Проверьте данные по заказу #{oid}:\n- Количество: {qty}⭐\n- Ник: @{uname}\n\n"
+        "Если всё верно — ответьте \"+ #{}\".\nЧтобы изменить — пришлите другой тег формата @username с #OID."
+        .format(item.get("order_id"))
+        .replace("{oid}", str(item.get("order_id") or "—"))
+        .replace("{qty}", str(qty))
+        .replace("{uname}", uname)
+    )
+
+def _do_confirm_send_for_oid(cardinal: "Cardinal", chat_id: Any, oid: str):
+    head = _current(chat_id)
+    if head and str(head.get("order_id")) == str(oid):
+        _do_confirm_send(cardinal, chat_id)
+        return
+
+    item = _pending_by_oid(chat_id, oid)
+    if not item:
+        _safe_send(cardinal, chat_id, f"Не нашёл активный заказ #{oid} для подтверждения.")
+        return
+
+    cfg = _get_cfg_for_orders(chat_id)
+    jwt = cfg.get("fragment_jwt")
+    qty = int(item.get("qty") or 50)
+    username = (item.get("candidate") or "").strip()
+
+    if not jwt:
+        _safe_send(cardinal, chat_id, "⚠️ Токен Fragment не привязан. Покупка невозможна.")
+        return
+    if not username or not _validate_username(username):
+        _safe_send(cardinal, chat_id, f"❌ Для #{oid} не указан корректный @username.")
+        item.update(stage="await_username")
+        return
+    if qty < 50:
+        _safe_send(cardinal, chat_id, f"Минимум 50⭐. Заказ #{oid}.")
+        return
+
+    _safe_send(cardinal, chat_id, _tpl(chat_id, "sending", qty=qty, username=username))
+    resp = _order_stars(jwt, username=username, quantity=qty, show_sender=False)
+
+    if resp and resp.get("ok"):
+        order_url = f"https://funpay.com/orders/{oid}/"
+        _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=qty, username=username, order_url=order_url))
+        item.update(finalized=True)
+        try:
+            _q(chat_id).remove(item)
+        except ValueError:
+            pass
+
+        _mark_done(chat_id, oid)
+        _preorders.pop(str(oid), None)
+
+    else:
+        kind, human = _classify_send_failure((resp or {}).get("text",""), (resp or {}).get("status",0), username.lstrip("@"), jwt)
+        if kind == "username":
+            item.update(stage="await_username", finalized=False, candidate=None)
+            _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid", order_id=oid))
+        else:
+            _safe_send(cardinal, chat_id, _tpl(chat_id, "failed", reason=human))
+            item.update(finalized=True)
+            if cfg.get("auto_refund", False) and oid:
+                _safe_send(cardinal, chat_id, "🔁 Пытаюсь оформить возврат…")
+                ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
+                _log("info" if ok_ref else "error", f"REFUND #{oid} -> {'OK' if ok_ref else 'FAIL'}")
+            else:
+                _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
+            _maybe_auto_deactivate(cardinal, cfg, chat_id)
+
 def _find_order_for_back(chat_id: Any, order_id: Optional[str]) -> Optional[dict]:
     q = _q(chat_id)
     candidates = [x for x in q if _allowed_stages(x)]
@@ -2922,6 +3278,9 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
 
         if author == "funpay" and _funpay_is_system_paid_message(text):
             qty, oid = _funpay_extract_qty_and_order_id(text)
+            if oid and str(oid) in _done_oids:
+                return
+            _set_order_qty(chat_id, oid, qty)
             if qty is not None and qty < 50:
                 return
 
@@ -2951,7 +3310,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
 
             if pending and str(pending.get("stage")) == "await_paid" and pending.get("candidate") and jwt:
                 uname = str(pending["candidate"]).lstrip("@")
-                real_qty = int(pending.get("qty") or real_qty)
+                real_qty = int(pending.get("qty") or qty or 50)
 
             elif oid and _preorders.get(str(oid)) and jwt:
                 pr = _preorders[str(oid)]
@@ -2968,6 +3327,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
                 if resp.get("ok"):
                     order_url = f"https://funpay.com/orders/{oid}/" if oid else ""
                     _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=real_qty, username=uname, order_url=order_url))
+                    _mark_done(chat_id, oid)
 
                     if oid:
                         _preorders.pop(str(oid), None)
@@ -3029,7 +3389,16 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             if not cfg.get("manual_refund_priority", True) and not cfg.get("auto_refund", False):
                 _safe_send(cardinal, chat_id, "Команда !бэк недоступна: приоритет ниже автовозврата, а автовозврат отключён.")
                 return
-
+            
+            m_plus_oid = _re.match(r'^\s*(?:\+|ok|да)\s*(?:#([A-Za-z0-9]{6,}))?\s*$', text, _re.I)
+            if m_plus_oid:
+                oid_in_msg = m_plus_oid.group(1)
+                if oid_in_msg:
+                    _do_confirm_send_for_oid(cardinal, chat_id, oid_in_msg)
+                else:
+                    _do_confirm_send(cardinal, chat_id)
+                return
+            
             oid_arg = m_back.group(1)
             allowed_oids = _list_pending_oids(chat_id)
 
@@ -3085,7 +3454,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             return
 
         jwt_local = cfg.get("fragment_jwt")
-        if jwt_local and not _check_username_exists(uname, jwt_local):
+        if jwt_local and not _check_username_exists_throttled(uname, jwt_local, chat_id):
             _update_current(chat_id, stage="await_username", candidate=None)
             _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid"))
             return
