@@ -11,6 +11,7 @@ import random
 from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 from telebot.apihelper import ApiTelegramException
+from collections import defaultdict
 
 try:
     from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
@@ -188,7 +189,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.4.2"
+VERSION     = "1.5.0"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -362,7 +363,7 @@ def _safe_delete(bot, chat_id: Any, msg_id: Optional[int]):
 
 def _about_text() -> str:
     return (
-        "🧩 <b>Плагин:</b> FNP Stars\n"
+        "🧩 <b>Плагин:</b> FTS Plugin\n"
         f"📦 <b>Версия:</b> <code>{VERSION}</code>\n"
         f"👤 <b>Автор:</b> <a href=\"{CREATOR_URL}\">{CREDITS}</a>\n\n"
         "Выберите раздел ниже."
@@ -425,7 +426,7 @@ HELP_TEXT = f"""
 <b>Возвраты</b>
 • <b>Автовозврат</b> — при ошибке продавца (баланс/авторизация/лимиты/сеть).  
 • <b>Ручной</b> — покупатель пишет <code>!бэк</code> или <code>!бэк #ORDERID</code> (зависит от настроек и стадии заказа).  
-• Если заказ некорректен (например, <50⭐), лоты могут быть временно отключены с указанием причины в «Настройках».
+• Если заказ некорректен (например, меньше 50⭐), лоты могут быть временно отключены с указанием причины в «Настройках».
 
 <b>🧩 Сообщения</b> (шаблоны ответов)
 Доступные плейсхолдеры: <code>qty</code>, <code>username</code>, <code>order_id</code>, <code>order_url</code>, <code>reason</code>.  
@@ -560,22 +561,36 @@ def _extract_qty_from_title(title: str) -> Optional[int]:
 def _extract_username_from_text(text: str) -> Optional[str]:
     if not text:
         return None
-    m = _re.search(r"@?([A-Za-z0-9_]{5,})", text)
+    s = str(text)
+
+    m = _re.search(r'(?i)(?:по|by)\s*username\s*[,:\-]?\s*@?([A-Za-z0-9_]{4,32})', s)
     if m:
         return m.group(1)
-    return None
+
+    m = _re.search(r'(?i)\b(?:ник|username)\s*[:=]\s*@?([A-Za-z0-9_]{4,32})', s)
+    if m:
+        return m.group(1)
+
+    s2 = _re.sub(r'(?i)покупатель\s+[A-Za-z0-9_]{4,32}\s+оплатил(?:\s+заказ)?[^.\n]*\.?', ' ', s)
+
+    m = _re.search(r'@([A-Za-z0-9_]{4,32})', s2)
+    if m:
+        return m.group(1)
+
+    m = _re.search(r'(?<![A-Za-z0-9_])([A-Za-z0-9_]{4,32})(?![A-Za-z0-9_])', s2)
+    return m.group(1) if m else None
 
 def _extract_explicit_handle(text: str) -> Optional[str]:
     if not text:
         return None
-    m = _re.search(r"@([A-Za-z0-9_]{5,32})", text)
+    m = _re.search(r'@([A-Za-z0-9_]{4,32})', text)
     return m.group(1) if m else None
 
 def _extract_username_from_any(x, depth: int = 0) -> Optional[str]:
     if depth > 2 or x is None:
         return None
     if isinstance(x, str):
-        return _extract_explicit_handle(x)
+        return _extract_username_from_text(x)
     if isinstance(x, dict):
         for v in x.values():
             u = _extract_username_from_any(v, depth + 1)
@@ -1153,6 +1168,8 @@ CBT_MINI_SETTINGS = f"{UUID}:mini"
 CBT_STAR_PRICE_P  = f"{UUID}:star_price:"
 CBT_MARKUP_RESET  = f"{UUID}:markup_reset"
 CBT_LOGS = f"{UUID}:logs"
+CBT_STATS          = f"{UUID}:stats"
+CBT_STATS_RANGE_P  = f"{UUID}:stats_range:"
 
 _fsm: dict[int, dict] = {}
 
@@ -1201,6 +1218,7 @@ def _settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
     kb.row(B("⚙️ Настройка лотов", callback_data=CBT_STARS))
     kb.row(B("🛠️ Мини-настройки", callback_data=CBT_MINI_SETTINGS))
     kb.row(B("📜 Логи", callback_data=CBT_LOGS))
+    kb.row(B("📊 Статистика", callback_data=CBT_STATS))
     kb.row(B("🔄 Обновить", callback_data=CBT_REFRESH))
     kb.add(B("🏠 Домой", callback_data=CBT_HOME))
     kb.add(B("◀️ Назад", callback_data=CBT_HOME))
@@ -1439,7 +1457,7 @@ def _validate_username(u: str) -> bool:
     if not u:
         return False
     u = u.strip().lstrip('@')
-    return bool(_re.fullmatch(r"[A-Za-z0-9_]{5,32}", u))
+    return bool(_re.fullmatch(r"[A-Za-z0-9_]{4,32}", u))
 
 def _funpay_is_system_paid_message(text: str) -> bool:
     if not text:
@@ -1941,6 +1959,9 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _star_price_start(bot, c), func=lambda c: c.data.startswith(CBT_STAR_PRICE_P))
     tg.cbq_handler(lambda c: _cb_markup_reset(cardinal, c), func=lambda c: c.data == CBT_MARKUP_RESET)
     tg.cbq_handler(lambda c: _send_logs(bot, c), func=lambda c: c.data == CBT_LOGS)
+    tg.cbq_handler(lambda c: _open_stats(bot, c), func=lambda c: c.data == CBT_STATS)
+    tg.cbq_handler(lambda c: _open_stats(bot, c, c.data.split(":")[-1]),
+                   func=lambda c: c.data.startswith(CBT_STATS_RANGE_P))
 
 def _open_home(bot, call):
     _safe_edit(bot, call.message.chat.id, call.message.id, _about_text(), _home_kb())
@@ -1971,9 +1992,32 @@ def _open_settings(bot, call):
     except Exception: pass
 
 def _open_help(bot, call):
-    _safe_edit(bot, call.message.chat.id, call.message.id, HELP_TEXT, _help_kb())
-    try: bot.answer_callback_query(call.id)
-    except Exception: pass
+    chat_id = call.message.chat.id
+    try:
+        bot.edit_message_text(
+            HELP_TEXT,
+            chat_id,
+            call.message.id,
+            parse_mode="HTML",
+            reply_markup=_help_kb(),
+            disable_web_page_preview=True
+        )
+    except ApiTelegramException as e:
+        low = str(e).lower()
+        if "message is not modified" in low:
+            try: bot.answer_callback_query(call.id)
+            except Exception: pass
+            return
+        _safe_delete(bot, chat_id, call.message.id)
+        _send_html_chunks(bot, chat_id, HELP_TEXT, _help_kb())
+    except Exception:
+        _safe_delete(bot, chat_id, call.message.id)
+        _send_html_chunks(bot, chat_id, HELP_TEXT, _help_kb())
+
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
 
 def _open_token(bot, call):
     chat_id = call.message.chat.id
@@ -2010,6 +2054,160 @@ def _send_logs(bot, call):
             pass
 
 CBT_VER_PREFIX    = f"{UUID}:ver:"
+
+def _stats_kb(selected: str) -> InlineKeyboardMarkup:
+    ranges = [("24ч","24h"), ("7д","7d"), ("30д","30d"), ("Всё","all")]
+    kb = K()
+    row = []
+    for label, key in ranges:
+        mark = "• " if key == selected else ""
+        row.append(B(f"{mark}{label}", callback_data=f"{CBT_STATS_RANGE_P}{key}"))
+    kb.row(*row)
+    kb.add(B("◀️ Назад", callback_data=CBT_SETTINGS))
+    return kb
+
+def _log_path() -> str:
+    return os.getenv("FTS_RAW_LOG_FILE") or LOG_FILE_LOCAL
+
+def _read_log_tail(max_bytes: int = 1_500_000) -> list[str]:
+    path = _log_path()
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            sz = f.tell()
+            f.seek(max(0, sz - max_bytes), os.SEEK_SET)
+            return f.read().decode("utf-8", errors="ignore").splitlines()
+    except Exception as e:
+        logger.debug(f"stats read log failed: {e}")
+        return []
+
+def _parse_line_ts(line: str) -> Optional[float]:
+    try:
+        s = line[:19]
+        tt = time.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return time.mktime(tt)
+    except Exception:
+        return None
+
+def _stats_collect(lines: list[str], since_ts: Optional[float]) -> dict:
+    stats = {
+        "ok": 0, "fail": 0, "qty_ok": 0,
+        "per_user": defaultdict(lambda: {"qty": 0, "cnt": 0}),
+        "per_day": defaultdict(int),
+        "refunds_ok": 0, "refunds_fail": 0,
+        "auto_deact": 0, "preorder": 0, "queue_merge": 0, "ignore": 0,
+        "last_ok": None, "last_fail": None, "min_balance_set": []
+    }
+
+    for ln in lines:
+        ts = _parse_line_ts(ln)
+        if since_ts and ts and ts < since_ts:
+            continue
+        low = ln.lower()
+
+        if "[ignore]" in low:            stats["ignore"] += 1
+        if "[queue] merged" in low:       stats["queue_merge"] += 1
+        if "[autodeact]" in low:          stats["auto_deact"] += 1
+        if "[preorder]" in low:           stats["preorder"] += 1
+        if "min balance set to" in low:
+            m = _re.search(r"min balance set to\s*([0-9.]+)\s*ton", ln, _re.I)
+            if m:
+                try: stats["min_balance_set"].append(float(m.group(1)))
+                except Exception: pass
+
+        m = _re.search(r"SEND OK\s+(\d+)\s*⭐.*?@([A-Za-z0-9_]{4,32})", ln)
+        if m:
+            q = int(m.group(1)); u = m.group(2).lower()
+            stats["ok"] += 1
+            stats["qty_ok"] += q
+            stats["per_user"][u]["qty"] += q
+            stats["per_user"][u]["cnt"] += 1
+            if ts: stats["last_ok"] = ts
+            day = time.strftime("%Y-%m-%d", time.localtime(ts or time.time()))
+            stats["per_day"][day] += q
+            continue
+
+        m = _re.search(r"SEND FAIL\s+(\d+)\s*⭐.*?@([A-Za-z0-9_]{4,32})", ln)
+        if m:
+            stats["fail"] += 1
+            if ts: stats["last_fail"] = ts
+            continue
+
+        m = _re.search(r"SEND result:\s*ok=(True|False)", ln)
+        if m:
+            if m.group(1) == "True":
+                stats["ok"] += 1
+                if ts: stats["last_ok"] = ts
+            else:
+                stats["fail"] += 1
+                if ts: stats["last_fail"] = ts
+
+        m = _re.search(r"REFUND\s+#?([A-Za-z0-9\-]+)\s*->\s*(OK|FAIL)", ln)
+        if m:
+            if m.group(2) == "OK": stats["refunds_ok"] += 1
+            else:                   stats["refunds_fail"] += 1
+
+    stats["per_user"] = dict(stats["per_user"])
+    stats["per_day"]  = dict(stats["per_day"])
+    return stats
+
+def _fmt_human_ts(ts: Optional[float]) -> str:
+    if not ts: return "—"
+    return time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(ts))
+
+def _stats_text(chat_id: Any, range_key: str) -> str:
+    now = time.time()
+    ranges = {
+        "24h": (now - 24*3600, "за 24 часа"),
+        "7d":  (now - 7*24*3600, "за 7 дней"),
+        "30d": (now - 30*24*3600, "за 30 дней"),
+        "all": (None, "за всё время"),
+    }
+    since_ts, label = ranges.get(range_key, ranges["7d"])
+    lines = _read_log_tail()
+    s = _stats_collect(lines, since_ts)
+
+    total = s["ok"] + s["fail"]
+    conv  = (s["ok"] / total * 100.0) if total else 0.0
+    avg   = (s["qty_ok"] / s["ok"]) if s["ok"] else 0.0
+
+    top = sorted(s["per_user"].items(), key=lambda kv: kv[1]["qty"], reverse=True)[:5]
+    top_lines = []
+    for i, (u, v) in enumerate(top, 1):
+        top_lines.append(f"{i}) @{u} — {int(v['qty'])}⭐ ({v['cnt']} заказ.)")
+
+    days = sorted(s["per_day"].items())[-10:]
+    day_lines = [f"{d}: {int(q)}⭐" for d, q in days] if days else ["—"]
+
+    cfg = _get_cfg(chat_id)
+    cur_thr = cfg.get("min_balance_ton", FNP_MIN_BALANCE_TON)
+    bal_txt = cfg.get("balance_ton")
+    bal_txt = (f"{bal_txt} TON" if bal_txt is not None else "—")
+
+    return (
+        f"<b>📊 Статистика ({label})</b>\n\n"
+        f"<b>Заказы</b>\n"
+        f"• Успешно: <b>{s['ok']}</b> (всего {int(s['qty_ok'])}⭐)\n"
+        f"• Средний успешный заказ: <b>{avg:.0f}⭐</b>\n"
+        f"• Последний успех: <code>{_fmt_human_ts(s['last_ok'])}</code>\n"
+        f"• Последняя ошибка: <code>{_fmt_human_ts(s['last_fail'])}</code>\n\n"
+
+        f"<b>Возвраты</b>\n"
+        f"• Оформлено: <b>{s['refunds_ok']}</b>\n"
+
+        f"<b>Топ покупателей</b>\n" +
+        (("\n".join(top_lines)) if top_lines else "—") + "\n\n" +
+        f"<b>Активность по дням</b>\n" +
+        ("\n".join(day_lines))
+    )
+
+def _open_stats(bot, call, range_key: Optional[str] = None):
+    chat_id = call.message.chat.id
+    rk = range_key or "7d"
+    text = _stats_text(chat_id, rk)
+    _safe_edit(bot, chat_id, call.message.id, text, _stats_kb(rk))
+    try: bot.answer_callback_query(call.id)
+    except Exception: pass
 
 def _star_add(bot, call):
     chat_id = call.message.chat.id
@@ -2220,7 +2418,7 @@ def _ask_set_jwt(bot, call):
     except Exception: pass
     bot.send_message(
         chat_id,
-        "Вставьте готовый JWT одной строкой ИЛИ пришлите файлом (.txt / .json). "
+        "Пришлите файлом (.txt / .json). "
         "В JSON токен может лежать в ключах token/jwt/access/authorization. (или /cancel)",
         reply_markup=_kb_cancel_fsm()
     )
@@ -2837,6 +3035,33 @@ def _update_current(chat_id: Any, **updates) -> None:
 def _has_queue(chat_id: Any) -> bool:
     return bool(_q(chat_id))
 
+def _send_html_chunks(bot, chat_id, text, kb=None):
+    from telebot.apihelper import ApiTelegramException
+    MAX = 3800
+    s = text or ""
+    chunks = []
+    while s:
+        part = s[:MAX]
+        if len(s) > MAX:
+            cut = max(part.rfind("\n"), part.rfind(". "))
+            if cut >= 0 and cut > MAX // 4:
+                part = part[:cut+1]
+        chunks.append(part)
+        s = s[len(part):]
+
+    for i, part in enumerate(chunks):
+        rm = kb if i == len(chunks) - 1 else None
+        try:
+            bot.send_message(
+                chat_id, part, parse_mode="HTML",
+                reply_markup=rm, disable_web_page_preview=True
+            )
+        except ApiTelegramException:
+            bot.send_message(
+                chat_id, part,
+                reply_markup=rm, disable_web_page_preview=True
+            )
+
 def _safe_send(c: "Cardinal", chat_id, text: str):
     try:
         c.send_message(chat_id, text)
@@ -2907,7 +3132,12 @@ def new_order_handler(cardinal: Cardinal, event):
         _push(chat_id, {"qty": (qty if qty is not None else 50), "order_id": order_id, "stage": "await_username", "candidate": None})
 
         username = None
-        for candidate in [getattr(order, "buyer_message", None), getattr(event, "message", None)]:
+        for candidate in [
+            getattr(order, "title", None),
+            getattr(order, "description", None),
+            getattr(order, "buyer_message", None),
+            getattr(event, "message", None),
+        ]:
             u = _extract_username_from_text(candidate)
             if u:
                 username = u
@@ -3278,6 +3508,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
 
         if author == "funpay" and _funpay_is_system_paid_message(text):
             qty, oid = _funpay_extract_qty_and_order_id(text)
+            hint_uname = _extract_username_from_text(text)
             if oid and str(oid) in _done_oids:
                 return
             _set_order_qty(chat_id, oid, qty)
@@ -3318,6 +3549,9 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
                 real_qty = int(pr.get("qty") or real_qty)
 
             if uname and jwt:
+                if hint_uname:
+                    uname = hint_uname.lstrip("@")
+
                 _update_current(chat_id, prompted=True)
                 _mark_prompted(chat_id, oid)
 
