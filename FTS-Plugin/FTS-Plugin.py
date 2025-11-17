@@ -189,7 +189,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.5.0"
+VERSION     = "1.5.1"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -406,7 +406,7 @@ HELP_TEXT = f"""
 
 <b>🔐 Токен (JWT)</b>
 • <u>Создать</u>: API-ключ (dashboard <code>fragment-api.com</code>) → телефон (без «+») → версия кошелька (<b>W5</b> или <b>V4R2</b>) → 24 слова мнемофразы.  
-• <u>Импорт</u>: вставьте JWT одной строкой или пришлите .txt/.json — токен извлечётся из ключей <code>token/jwt/access/authorization</code>.  
+• <u>Импорт</u>: пришлите .txt/.json — токен извлечётся из ключей <code>token/jwt/access/authorization</code>.  
 • После привязки баланс TON подтягивается в «Настройках». При ошибках показана человеко-понятная причина (в т.ч. «слишком много попыток»).
 
 <b>⭐ Лоты</b>
@@ -571,14 +571,24 @@ def _extract_username_from_text(text: str) -> Optional[str]:
     if m:
         return m.group(1)
 
-    s2 = _re.sub(r'(?i)покупатель\s+[A-Za-z0-9_]{4,32}\s+оплатил(?:\s+заказ)?[^.\n]*\.?', ' ', s)
+    s2 = _re.sub(
+        r'(?i)покупатель\s+[A-Za-z0-9_]{4,32}\s+оплатил(?:\s+заказ)?[^.\n]*\.?',
+        ' ',
+        s
+    )
 
     m = _re.search(r'@([A-Za-z0-9_]{4,32})', s2)
     if m:
         return m.group(1)
 
     m = _re.search(r'(?<![A-Za-z0-9_])([A-Za-z0-9_]{4,32})(?![A-Za-z0-9_])', s2)
-    return m.group(1) if m else None
+    if m:
+        candidate = m.group(1)
+        if candidate.lower() == "username":
+            return None
+        return candidate
+
+    return None
 
 def _extract_explicit_handle(text: str) -> Optional[str]:
     if not text:
@@ -589,20 +599,53 @@ def _extract_explicit_handle(text: str) -> Optional[str]:
 def _extract_username_from_any(x, depth: int = 0) -> Optional[str]:
     if depth > 2 or x is None:
         return None
+
     if isinstance(x, str):
-        return _extract_username_from_text(x)
+        s = str(x)
+
+        m = _re.search(r'@([A-Za-z0-9_]{4,32})', s)
+        if m:
+            return m.group(1)
+
+        m = _re.search(
+            r'(?i)(?:по|by)\s*username\s*[,:\-]?\s*@?([A-Za-z0-9_]{4,32})',
+            s
+        )
+        if m:
+            return m.group(1)
+
+        m = _re.search(
+            r'(?i)\b(?:ник|username)\s*[:=]\s*@?([A-Za-z0-9_]{4,32})',
+            s
+        )
+        if m:
+            return m.group(1)
+
+        return None
+
     if isinstance(x, dict):
+        for k, v in x.items():
+            if not isinstance(v, str):
+                continue
+            key_l = str(k).lower()
+            if any(t in key_l for t in ("telegram", "tg", "ник", "handle", "stars", "звезд", "звезда")):
+                cand = _extract_username_from_any(v, depth + 1)
+                if cand:
+                    return cand
+
         for v in x.values():
             u = _extract_username_from_any(v, depth + 1)
             if u:
                 return u
         return None
+
     if isinstance(x, (list, tuple, set)):
         for v in x:
             u = _extract_username_from_any(v, depth + 1)
             if u:
                 return u
         return None
+
     try:
         for name in dir(x):
             if name.startswith("_"):
@@ -617,6 +660,7 @@ def _extract_username_from_any(x, depth: int = 0) -> Optional[str]:
                     return u
     except Exception:
         pass
+
     return None
 
 def _check_username_exists(username: str, jwt: Optional[str]) -> bool:
@@ -2912,20 +2956,31 @@ _prompted_oids: set[str] = set()
 _preorders: Dict[str, Dict[str, Any]] = {}
 _done_oids: set[str] = set()
 
+def _remove_order_everywhere(oid: Optional[str]) -> None:
+    if not oid:
+        return
+    s = str(oid)
+    for key, q in list(_pending_orders.items()):
+        for it in list(q):
+            if str(it.get("order_id")) == s:
+                it["finalized"] = True
+                try:
+                    q.remove(it)
+                except ValueError:
+                    pass
+        if not q:
+            try:
+                del _pending_orders[key]
+            except Exception:
+                pass
+
 def _mark_done(chat_id: Any, oid: Optional[str]):
     if not oid:
         return
-    _done_oids.add(str(oid))
-    _preorders.pop(str(oid), None)
-    q = _q(chat_id)
-    for it in list(q):
-        if str(it.get("order_id")) == str(oid):
-            it["finalized"] = True
-            try:
-                q.remove(it)
-            except ValueError:
-                pass
-            break
+    s = str(oid)
+    _done_oids.add(s)
+    _preorders.pop(s, None)
+    _remove_order_everywhere(s)
 
 def _set_order_qty(chat_id: Any, order_id: Optional[str], qty: Optional[int]) -> None:
     if not order_id or not qty or qty < 50:
@@ -2948,11 +3003,28 @@ def _adopt_foreign_queue_for(chat_id: Any) -> bool:
     for other_key, items in list(_pending_orders.items()):
         if other_key == key:
             continue
-        if items and any(_allowed_stages(x) for x in items):
+
+        for it in list(items):
+            oid = it.get("order_id")
+            if oid and str(oid) in _done_oids:
+                try:
+                    items.remove(it)
+                except ValueError:
+                    pass
+
+        if not items:
+            try:
+                del _pending_orders[other_key]
+            except Exception:
+                pass
+            continue
+
+        if any(_allowed_stages(x) for x in items):
             _pending_orders[key] = items
             del _pending_orders[other_key]
             logger.warning(f"[QUEUE] merged {other_key} -> {key}")
             return True
+
     return False
 
 def _mark_prompted(chat_id: Any, order_id: Optional[Any]) -> None:
@@ -2988,8 +3060,12 @@ def _current(chat_id: Any) -> Optional[Dict[str, Any]]:
     return q[0] if q else None
 
 def _push(chat_id: Any, item: Dict[str, Any]) -> None:
-    q = _q(chat_id)
     oid = item.get("order_id")
+    if oid and str(oid) in _done_oids:
+        logger.debug(f"[QUEUE] skip push for done order #{oid}")
+        return
+
+    q = _q(chat_id)
     if oid and any(str(x.get("order_id")) == str(oid) for x in q):
         for x in q:
             if str(x.get("order_id")) == str(oid):
@@ -2999,6 +3075,7 @@ def _push(chat_id: Any, item: Dict[str, Any]) -> None:
                 x.setdefault("prompted", False)
                 break
         return
+
     item.setdefault("prompted", False)
     q.append(item)
 
@@ -3103,6 +3180,8 @@ def new_order_handler(cardinal: Cardinal, event):
             or getattr(order, "order_id", None)
             or getattr(event, "order_id", None)
         )
+        if order_id and str(order_id) in _done_oids:
+            return
 
         text_blob = " ".join(str(x) for x in [
             title,
@@ -3227,7 +3306,15 @@ def new_order_handler(cardinal: Cardinal, event):
         logger.exception(f"new_order_handler error: {e}")
 
 def _do_confirm_send(cardinal: "Cardinal", chat_id):
-    pend = _current(chat_id) or {}
+    pend = _current(chat_id)
+    if pend and pend.get("order_id") and str(pend["order_id"]) in _done_oids:
+        _pop_current(chat_id, keep_prompted=False)
+        return
+    oid = pend.get("order_id")
+    if oid and str(oid) in _done_oids:
+        _pop_current(chat_id, keep_prompted=False)
+        _safe_send(cardinal, chat_id, "Заказ уже выполнен — новый ник будет принят только после следующего заказа.")
+        return
     qty = int(pend.get("qty", 50))
     username = (pend.get("candidate") or "").strip()
     cfg = _get_cfg_for_orders(chat_id)
@@ -3359,7 +3446,7 @@ def _apply_username_for_item(cardinal: "Cardinal", chat_id: Any, item: dict, una
         item.update(stage="await_username", candidate=None)
         return
 
-    if jwt and not _check_username_exists(uname, jwt):
+    if jwt and not _check_username_exists_throttled(uname, jwt, chat_id):
         _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid", order_id=item.get("order_id")))
         item.update(stage="await_username", candidate=None)
         return
@@ -3367,11 +3454,25 @@ def _apply_username_for_item(cardinal: "Cardinal", chat_id: Any, item: dict, una
     qty = int(item.get("qty") or 50)
     item.update(candidate=uname, stage="await_confirm", confirmed=False)
 
-    _safe_send(cardinal, chat_id, _tpl(chat_id, "username_valid", qty=qty, username=uname, order_id=item.get("order_id")))
     _safe_send(
-        cardinal, chat_id,
-        "Проверьте данные по заказу #{oid}:\n- Количество: {qty}⭐\n- Ник: @{uname}\n\n"
-        "Если всё верно — ответьте \"+ #{}\".\nЧтобы изменить — пришлите другой тег формата @username с #OID."
+        cardinal,
+        chat_id,
+        _tpl(
+            chat_id,
+            "username_valid",
+            qty=qty,
+            username=uname,
+            order_id=item.get("order_id"),
+        ),
+    )
+    _safe_send(
+        cardinal,
+        chat_id,
+        "Проверьте данные по заказу #{oid}:\n"
+        "- Количество: {qty}⭐\n"
+        "- Ник: @{uname}\n\n"
+        "Если всё верно — ответьте \"+ #{}\".\n"
+        "Чтобы изменить — пришлите другой тег формата @username с #OID."
         .format(item.get("order_id"))
         .replace("{oid}", str(item.get("order_id") or "—"))
         .replace("{qty}", str(qty))
@@ -3379,6 +3480,10 @@ def _apply_username_for_item(cardinal: "Cardinal", chat_id: Any, item: dict, una
     )
 
 def _do_confirm_send_for_oid(cardinal: "Cardinal", chat_id: Any, oid: str):
+    if str(oid) in _done_oids:
+        _safe_send(cardinal, chat_id, f"Заказ #{oid} уже выполнен.")
+        _remove_order_everywhere(oid)
+        return
     head = _current(chat_id)
     if head and str(head.get("order_id")) == str(oid):
         _do_confirm_send(cardinal, chat_id)
@@ -3508,7 +3613,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
 
         if author == "funpay" and _funpay_is_system_paid_message(text):
             qty, oid = _funpay_extract_qty_and_order_id(text)
-            hint_uname = _extract_username_from_text(text)
+            hint_uname = _extract_explicit_handle(text)
             if oid and str(oid) in _done_oids:
                 return
             _set_order_qty(chat_id, oid, qty)
@@ -3548,10 +3653,10 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
                 uname = str(pr.get("username", "")).lstrip("@")
                 real_qty = int(pr.get("qty") or real_qty)
 
-            if uname and jwt:
-                if hint_uname:
-                    uname = hint_uname.lstrip("@")
+            if not uname and hint_uname:
+                uname = hint_uname.lstrip("@")
 
+            if uname and jwt:
                 _update_current(chat_id, prompted=True)
                 _mark_prompted(chat_id, oid)
 
@@ -3614,27 +3719,18 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             if not u or u.lower() == my_user.lstrip("@"):
                 return
 
-        m_back = _re.match(r'^\s*!(?:бэк|бек|back)\b(?:\s*#?([A-Za-z0-9]{6,}))?\s*$', text, _re.I)
-        if m_back:
-            if not cfg.get("manual_refund_enabled", False):
-                _safe_send(cardinal, chat_id, "Команда возврата выключена у продавца.")
-                return
+            m_back = _re.match(r'^\s*!(?:бэк|бек|back)\b(?:\s*#?([A-Za-z0-9]{6,}))?\s*$', text, _re.I)
+            if m_back:
+                if not cfg.get("manual_refund_enabled", False):
+                    _safe_send(cardinal, chat_id, "Команда возврата выключена у продавца.")
+                    return
 
-            if not cfg.get("manual_refund_priority", True) and not cfg.get("auto_refund", False):
-                _safe_send(cardinal, chat_id, "Команда !бэк недоступна: приоритет ниже автовозврата, а автовозврат отключён.")
-                return
-            
-            m_plus_oid = _re.match(r'^\s*(?:\+|ok|да)\s*(?:#([A-Za-z0-9]{6,}))?\s*$', text, _re.I)
-            if m_plus_oid:
-                oid_in_msg = m_plus_oid.group(1)
-                if oid_in_msg:
-                    _do_confirm_send_for_oid(cardinal, chat_id, oid_in_msg)
-                else:
-                    _do_confirm_send(cardinal, chat_id)
-                return
-            
-            oid_arg = m_back.group(1)
-            allowed_oids = _list_pending_oids(chat_id)
+                if not cfg.get("manual_refund_priority", True) and not cfg.get("auto_refund", False):
+                    _safe_send(cardinal, chat_id, "Команда !бэк недоступна: приоритет ниже автовозврата, а автовозврат отключён.")
+                    return
+
+                oid_arg = m_back.group(1)
+                allowed_oids = _list_pending_oids(chat_id)
 
             if not allowed_oids:
                 return
@@ -3669,9 +3765,22 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         if not pend:
             return
 
-        if str(pend.get("stage")) == "await_confirm" and text.lower() in {"+", "++", "да", "ок", "ok"}:
-            _update_current(chat_id, confirmed=True)
-            _do_confirm_send(cardinal, chat_id)
+        nick_items = [
+            x for x in _q(chat_id)
+            if str(x.get("stage")) in {"await_username", "await_confirm"} and not x.get("finalized")
+        ]
+        nick_oids = [str(x.get("order_id")) for x in nick_items if x.get("order_id")]
+        many_nick_orders = len(nick_oids) > 1
+
+        m_plus_oid = _re.match(r'^\s*(?:\+{1,2}|ok|да)\s*(?:#([A-Za-z0-9]{6,}))?\s*$', text, _re.I)
+        if m_plus_oid:
+            oid_in_msg = m_plus_oid.group(1)
+            if oid_in_msg:
+                _do_confirm_send_for_oid(cardinal, chat_id, oid_in_msg)
+            else:
+                if str(pend.get("stage")) == "await_confirm":
+                    _update_current(chat_id, confirmed=True)
+                    _do_confirm_send(cardinal, chat_id)
             return
 
         username = _extract_username_from_text(text)
@@ -3681,6 +3790,31 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             return
 
         uname = username.lstrip("@")
+
+        m_username_oid = _re.search(r"#([A-Za-z0-9]{6,})", text)
+        if m_username_oid:
+            target_oid = m_username_oid.group(1)
+            item = _pending_by_oid(chat_id, target_oid)
+            if not item:
+                _safe_send(cardinal, chat_id, f"Не нашёл активный заказ #{target_oid} для ника @{uname}.")
+                return
+
+            _apply_username_for_item(cardinal, chat_id, item, uname)
+            return
+
+        if many_nick_orders:
+            pretty = ", ".join(f"#{o}" for o in nick_oids)
+            _safe_send(
+                cardinal,
+                chat_id,
+                "Сейчас активно несколько заказов, для которых нужен ник: {orders}\n"
+                "Чтобы указать ник, напишите его вместе с номером заказа, например: @{u} #{sample}".format(
+                    orders=pretty,
+                    u=uname,
+                    sample=nick_oids[0],
+                ),
+            )
+            return
 
         if not _validate_username(uname):
             _update_current(chat_id, stage="await_username")
