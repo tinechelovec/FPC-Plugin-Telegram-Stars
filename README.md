@@ -12,6 +12,8 @@
 1. Скачать данный плагин
 2. Зайти в TG бота Cardinal
 3. Во вкладке "Плагины" загрузить данный плагин
+
+Более подробная [Инструкция](https://teletype.in/@tinechelovec/FTS-Plugin)
    
 По всем багам, вопросам и предложениям пишите в [Issues](https://github.com/tinechelovec/FPC-Plugin-Telegram-Stars/issues) или в [Telegram](https://t.me/tinechelovec)
 
