@@ -8,7 +8,9 @@ import re as _re
 import time
 import random
 import shutil
+import threading
 
+from concurrent.futures import ThreadPoolExecutor
 from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 from telebot.apihelper import ApiTelegramException
@@ -32,6 +34,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("FTS-Plugin")
 
+LOG_TAG = "[FTS-Plugin]"
+
+class _AnsiColorFormatter(logging.Formatter):
+    COLORS = {
+        logging.DEBUG:   "\033[90m",
+        logging.INFO:    "\033[36m",
+        logging.WARNING: "\033[33m",
+        logging.ERROR:   "\033[31m",
+        logging.CRITICAL:"\033[41m",
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        base = super().format(record)
+        color = self.COLORS.get(record.levelno, "")
+        reset = self.RESET if color else ""
+        return f"{color}{base}{reset}"
+
 HUMAN_LOGS   = bool(int(os.getenv("FTS_HUMAN_LOGS", "1")))
 HUMAN_DEDUP  = bool(int(os.getenv("FTS_HUMAN_DEDUP", "1")))
 
@@ -41,6 +61,7 @@ _last_username_check_ts: Dict[str, float] = {}
 LITESERVER_RETRY_DEFAULT = bool(int(os.getenv("FTS_Plugin_RETRY_LITESERVER", "1")))
 LITESERVER_RETRY_SLEEP_MIN = float(os.getenv("FTS_Plugin_RETRY_LITESERVER_SLEEP_MIN", "0.8"))
 LITESERVER_RETRY_SLEEP_MAX = float(os.getenv("FTS_Plugin_RETRY_LITESERVER_SLEEP_MAX", "1.8"))
+QUEUE_TIMEOUT_DEFAULT = int(os.getenv("FTS_QUEUE_TIMEOUT_SEC", "300"))
 
 class _Ansi:
     R = "\033[31m"; Y = "\033[33m"; C = "\033[36m"; G = "\033[32m"
@@ -158,29 +179,51 @@ def _setup_logging():
 
 _setup_logging()
 
-LOG_TAG = "[FTS-Plugin]"
-
-class _AnsiColorFormatter(logging.Formatter):
-    COLORS = {
-        logging.DEBUG:   "\033[90m",
-        logging.INFO:    "\033[36m",
-        logging.WARNING: "\033[33m",
-        logging.ERROR:   "\033[31m",
-        logging.CRITICAL:"\033[41m",
-    }
-    RESET = "\033[0m"
-
-    def format(self, record):
-        base = super().format(record)
-        color = self.COLORS.get(record.levelno, "")
-        reset = self.RESET if color else ""
-        return f"{color}{base}{reset}"
-
 if not logger.handlers:
     _h = logging.StreamHandler()
     _h.setFormatter(_AnsiColorFormatter("%(asctime)s %(levelname)s " + LOG_TAG + " %(message)s"))
     logger.addHandler(_h)
 logger.setLevel(logging.INFO)
+
+_STATE_LOCK = threading.RLock()
+_SEND_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("FTS_SEND_WORKERS", "1")),
+    thread_name_prefix="FTS-SEND"
+)
+_ACTIVE_JOBS: dict[str, Any] = {}
+_ACTIVE_JOBS_LOCK = threading.Lock()
+
+def _schedule_job(key: str, fn, *args, **kwargs) -> bool:
+    with _ACTIVE_JOBS_LOCK:
+        old = _ACTIVE_JOBS.get(key)
+        if old is not None and not old.done():
+            return False
+
+        fut = _SEND_EXECUTOR.submit(fn, *args, **kwargs)
+        _ACTIVE_JOBS[key] = fut
+
+        def _cleanup(_f):
+            with _ACTIVE_JOBS_LOCK:
+                cur = _ACTIVE_JOBS.get(key)
+                if cur is _f:
+                    _ACTIVE_JOBS.pop(key, None)
+
+        fut.add_done_callback(_cleanup)
+        return True
+
+def _schedule_confirm_send(cardinal: "Cardinal", chat_id: Any, oid: Optional[str] = None) -> None:
+    job_key = f"send:{chat_id}:{oid or 'cur'}"
+
+    def _run():
+        try:
+            if oid:
+                _do_confirm_send_for_oid(cardinal, chat_id, oid)
+            else:
+                _do_confirm_send(cardinal, chat_id)
+        except Exception as e:
+            logger.exception(f"background send failed: {e}")
+
+    _schedule_job(job_key, _run)
 
 def _log(level: str, msg: str):
     if level == "info":
@@ -193,17 +236,17 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.6.0"
+VERSION     = "1.6.1"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
 SETTINGS_PAGE = False
 
-CREATOR_URL = os.getenv("FNP_CREATOR_URL", "https://t.me/tinechelovec")
-GROUP_URL   = os.getenv("FNP_GROUP_URL",   "https://t.me/dev_thc_chat")
-CHANNEL_URL = os.getenv("FNP_CHANNEL_URL", "https://t.me/by_thc")
-GITHUB_URL  = os.getenv("FNP_GITHUB_URL",  "https://github.com/tinechelovec/FPC-Plugin-Telegram-Stars")
-INSTRUCTION_URL = os.getenv("FNP_INSTRUCTION_URL", "https://teletype.in/@tinechelovec/FTS-Plugin")
+CREATOR_URL = "https://t.me/tinechelovec"
+GROUP_URL = "https://t.me/dev_thc_chat"
+CHANNEL_URL = "https://t.me/by_thc"
+GITHUB_URL = "https://github.com/tinechelovec/FPC-Plugin-Telegram-Stars"
+INSTRUCTION_URL = "https://teletype.in/@tinechelovec/FTS-Plugin"
 
 FRAGMENT_BASE          = os.getenv("FRAGMENT_BASE", "https://api.fragment-api.com/v1")
 FRAGMENT_AUTH_URL      = os.getenv("FRAGMENT_AUTH_URL", f"{FRAGMENT_BASE}/auth/authenticate/")
@@ -337,6 +380,16 @@ def _get_cfg(chat_id: Any) -> dict:
     cfg["auto_send_without_plus"] = _cfg_bool(cfg, "auto_send_without_plus", False)
     cfg.setdefault("skip_username_check", False)
     cfg["skip_username_check"] = _cfg_bool(cfg, "skip_username_check", False)
+    cfg.setdefault("queue_mode", 1)
+    cfg.setdefault("queue_timeout_sec", QUEUE_TIMEOUT_DEFAULT)
+    try:
+        cfg["queue_mode"] = int(cfg.get("queue_mode") or 1)
+    except Exception:
+        cfg["queue_mode"] = 1
+    try:
+        cfg["queue_timeout_sec"] = int(float(cfg.get("queue_timeout_sec") or QUEUE_TIMEOUT_DEFAULT))
+    except Exception:
+        cfg["queue_timeout_sec"] = QUEUE_TIMEOUT_DEFAULT
     data[key] = cfg
     _save_settings(data)
     return cfg
@@ -403,13 +456,15 @@ def _safe_delete(bot, chat_id: Any, msg_id: Optional[int]):
         logger.debug(f"delete_message failed: {e}")
 
 def _about_text() -> str:
+    if not _meta_guard():
+        return _tamper_text()
+
     return (
         "🧩 <b>Плагин:</b> FTS Plugin\n"
         f"📦 <b>Версия:</b> <code>{VERSION}</code>\n"
         f"👤 <b>Автор:</b> <a href=\"{CREATOR_URL}\">{CREDITS}</a>\n\n"
         "Выберите раздел ниже."
     )
-
 
 def _settings_text(chat_id: Any) -> str:
     cfg = _get_cfg(chat_id)
@@ -530,14 +585,16 @@ def _extract_qty_from_title(title: str) -> Optional[int]:
 _sending_chats: set[str] = set()
 
 def _is_sending(chat_id: Any) -> bool:
-    return str(chat_id) in _sending_chats
+    with _STATE_LOCK:
+        return str(chat_id) in _sending_chats
 
 def _set_sending(chat_id: Any, v: bool):
     k = str(chat_id)
-    if v:
-        _sending_chats.add(k)
-    else:
-        _sending_chats.discard(k)
+    with _STATE_LOCK:
+        if v:
+            _sending_chats.add(k)
+        else:
+            _sending_chats.discard(k)
 
 def _extract_username_from_text(text: str) -> Optional[str]:
     if not text:
@@ -557,6 +614,37 @@ def _extract_username_from_text(text: str) -> Optional[str]:
     m = _re.search(r'@([A-Za-z0-9_]{5,32})', s2)
     if m:
         return m.group(1)
+
+    return None
+
+def _extract_username_from_order_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    s = str(text)
+
+    u = _extract_username_from_text(s)
+    if u:
+        return u
+
+    m = _re.search(r'(?i)(?:https?://)?t\.me/(?:@)?([A-Za-z0-9_]{5,32})', s)
+    if m:
+        return m.group(1)
+
+    m = _re.search(r'(?i)\b(?:tg|тг|telegram|телеграм|телега)\b\s*[,:\-=]?\s*@?([A-Za-z0-9_]{5,32})', s)
+    if m:
+        return m.group(1)
+
+    m = _re.search(r'(?i)\b(?:для|to)\b\s*@?([A-Za-z0-9_]{5,32})\b', s)
+    if m:
+        cand = m.group(1)
+        if _validate_username(cand) and _re.search(r"[A-Za-z]", cand):
+            return cand
+
+    m = _re.fullmatch(r'\s*@?([A-Za-z0-9_]{5,32})\s*[.!?,;:]*\s*', s)
+    if m:
+        cand = m.group(1)
+        if _re.search(r"[A-Za-z]", cand):
+            return cand
 
     return None
 
@@ -884,6 +972,85 @@ def _authenticate_fragment(api_key: str, phone_number: str, version: str, mnemon
     except Exception as e:
         logger.warning(f"Authenticate failed: {e}")
         return None, {"error": str(e)}, 0
+    
+def _queue_mode(chat_id: Any) -> int:
+    try:
+        cfg = _get_cfg_for_orders(chat_id)
+        return int(cfg.get("queue_mode") or 1)
+    except Exception:
+        return 1
+
+def _queue_timeout_sec(chat_id: Any) -> int:
+    try:
+        cfg = _get_cfg_for_orders(chat_id)
+        v = cfg.get("queue_timeout_sec", int(os.getenv("FTS_QUEUE_TIMEOUT_SEC", "300")))
+        return max(30, int(float(v)))
+    except Exception:
+        return int(os.getenv("FTS_QUEUE_TIMEOUT_SEC", "300"))
+
+def _queue_mode_label(mode: int, timeout_sec: int) -> str:
+    if mode == 1:
+        return "СТРОГАЯ"
+    if mode == 2:
+        return "ПРОПУСК ГОТОВЫХ"
+    if mode == 3:
+        return f"ТАЙМАУТ→В КОНЕЦ ({timeout_sec//60}М)"
+    return "СТРОГАЯ"
+
+def _maybe_rotate_queue_head(cardinal: "Cardinal", any_chat_id: Any) -> bool:
+    try:
+        if _queue_mode(any_chat_id) != 3:
+            return False
+
+        q = _q(any_chat_id)
+        if not q:
+            return False
+
+        head = q[0]
+        if head.get("finalized") or not _allowed_stages(head):
+            return False
+
+        stage = str(head.get("stage"))
+        if stage not in {"await_username", "await_confirm"}:
+            return False
+
+        ts = head.get("turn_ts")
+        if not ts:
+            if head.get("prompted") or _was_prompted(head.get("chat_id"), head.get("order_id")):
+                head["turn_ts"] = time.time()
+            return False
+
+        if (time.time() - float(ts)) < float(_queue_timeout_sec(any_chat_id)):
+            return False
+
+        moved = q.pop(0)
+        oid = moved.get("order_id")
+        cid = moved.get("chat_id")
+
+        moved["turn_ts"] = None
+        moved["prompted"] = False
+        moved["preconfirmed"] = False
+        moved["auto_attempted_for"] = None
+        moved["queue_notified"] = False
+
+        if oid:
+            _unmark_prompted(cid, oid, everywhere=True)
+
+        q.append(moved)
+
+        try:
+            if cid is not None:
+                _safe_send(cardinal, cid, "⏳ Вы не ответили — перенёс заказ в конец очереди. Напишите @username/«+», когда будете готовы.")
+        except Exception:
+            pass
+
+        logger.info(f"[QUEUE] timeout move to end: OID={oid} CID={cid}")
+        _notify_next_turn(cardinal, any_chat_id)
+        return True
+
+    except Exception as e:
+        logger.debug(f"_maybe_rotate_queue_head failed: {e}")
+        return False
     
 def _is_too_many_attempts(raw_resp: Any) -> tuple[bool, Optional[int]]:
     text = ""
@@ -1262,6 +1429,7 @@ CBT_PLUGINS_LIST_OPEN = f"{getattr(CBT, 'PLUGINS_LIST', '44')}:0"
 CBT_TOGGLE_LITESERVER_RETRY = f"{UUID}:toggle_liteserver_retry"
 CBT_TOGGLE_USERNAME_CHECK   = f"{UUID}:toggle_username_check"
 CBT_TOGGLE_AUTOSEND_PLUS = f"{UUID}:toggle_autosend_plus"
+CBT_TOGGLE_QUEUE_MODE = f"{UUID}:toggle_queue_mode"
 
 _fsm: dict[int, dict] = {}
 
@@ -1320,9 +1488,13 @@ def _mini_settings_text(chat_id: Any) -> str:
     check_state = "🔴 выключена (проверим при отправке)" if cfg.get("skip_username_check", False) else "🟢 включена"
     autosend = cfg.get("auto_send_without_plus", False)
     plus_state = "🟢 не нужно (автоотправка)" if autosend else "🟡 нужно (как раньше)"
+    mode = _queue_mode(chat_id)
+    timeout = _queue_timeout_sec(chat_id)
+    qtxt = _queue_mode_label(mode, timeout)
     return (
         "<b>Мини-настройки</b>\n\n"
         f"• Приоритет !бэк: <b>{prio}</b>\n"
+        f"• Очередь: <b>{qtxt}</b>\n"
         f"• Мин. баланс TON: <code>{cur_min}</code>\n"
         f"• Повтор при LiteServer: <b>{retry_state}</b>\n"
         f"• Проверка @username при вводе: <b>{check_state}</b>\n"
@@ -1335,6 +1507,10 @@ def _mini_settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
     cfg = _get_cfg(chat_id)
     prio_label = "⬆️ Приоритет !бэк: ВЫШЕ" if cfg.get("manual_refund_priority", True) else "⬇️ Приоритет !бэк: НИЖЕ"
     kb = K()
+    mode = _queue_mode(chat_id)
+    timeout = _queue_timeout_sec(chat_id)
+    queue_label = f"🧾 Очередь: {_queue_mode_label(mode, timeout)}"
+    kb.row(B(queue_label, callback_data=CBT_TOGGLE_QUEUE_MODE))
     kb.row(B(prio_label, callback_data=CBT_TOGGLE_BACK_PRIORITY))
     kb.row(B(f"🔋 Мин. баланс: {cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)} TON", callback_data=CBT_SET_MIN_BAL))
     retry_label = "🔁 LiteServer-ретрай: ВКЛ" if cfg.get("retry_liteserver", LITESERVER_RETRY_DEFAULT) else "🔁 LiteServer-ретрай: ВЫКЛ"
@@ -1976,23 +2152,40 @@ def init_cardinal(cardinal: Cardinal):
 
     logger.info("🚀 Плагин по продаже звёзд запущен.")
 
-    tg.msg_handler(lambda m: bot.send_message(
-        m.chat.id, _about_text(), parse_mode="HTML",
-        reply_markup=_home_kb(), disable_web_page_preview=True
-    ), commands=["fnp"])
+    threading.Thread(
+        target=_queue_watchdog,
+        args=(cardinal,),
+        daemon=True,
+        name="FTS-QUEUE-WATCHDOG"
+    ).start()
 
-    tg.msg_handler(lambda m: bot.send_message(
-        m.chat.id, _about_text(), parse_mode="HTML",
-        reply_markup=_home_kb(), disable_web_page_preview=True
-    ), commands=["stars_thc"])
+    def _send_home(m):
+        return bot.send_message(
+            m.chat.id,
+            _about_text(),
+            parse_mode="HTML",
+            reply_markup=_home_kb(),
+            disable_web_page_preview=True
+        )
+
+    tg.msg_handler(_send_home, commands=["fnp", "stars_thc"])
+
+    fsm_steps = {
+        "jwt_api_key", "jwt_phone", "jwt_wallet_ver", "jwt_seed",
+        "set_min_balance",
+        "star_add_qty", "star_add_lotid",
+        "msg_edit_value",
+        "markup_percent",
+        "set_jwt",
+        "star_price_value",
+    }
 
     tg.msg_handler(
         lambda m: _handle_fsm(m, cardinal),
-        func=lambda m: (m.chat.id in _fsm and _fsm[m.chat.id].get("step") in {
-            "jwt_api_key","jwt_phone","jwt_wallet_ver","jwt_seed","set_min_balance","star_add_qty","star_add_lotid","msg_edit_value","markup_percent","set_jwt","star_price_value"
-        }
+        func=lambda m: (
+            m.chat.id in _fsm and _fsm[m.chat.id].get("step") in fsm_steps
         ),
-        content_types=['text', 'document']
+        content_types=["text", "document"]
     )
 
     tg.cbq_handler(
@@ -2003,11 +2196,6 @@ def init_cardinal(cardinal: Cardinal):
             or c.data == f"{UUID}:0"
             or c.data == CBT_HOME
         )
-    )
-    tg.msg_handler(
-    lambda m: _handle_fsm(m, cardinal),
-    func=lambda m: (m.chat.id in _fsm and _fsm[m.chat.id].get("step") == "set_jwt"),
-    content_types=['document']
     )
 
     tg.cbq_handler(lambda c: _open_settings(bot, c), func=lambda c: c.data == CBT_SETTINGS)
@@ -2023,13 +2211,14 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _toggle_deact(bot, c),  func=lambda c: c.data == CBT_TOGGLE_DEACT)
     tg.cbq_handler(lambda c: _refresh(bot, c),       func=lambda c: c.data == CBT_REFRESH)
     tg.cbq_handler(lambda c: _ask_set_min_balance(bot, c), func=lambda c: c.data == CBT_SET_MIN_BAL)
+
     tg.msg_handler(lambda m: _cancel_cmd(cardinal, m.chat.id), commands=["cancel"])
 
     tg.cbq_handler(lambda c: _start_create_jwt(bot, c), func=lambda c: c.data == CBT_CREATE_JWT)
     tg.cbq_handler(lambda c: _jwt_confirmed(bot, c),   func=lambda c: c.data == CBT_JWT_CONFIRMED)
     tg.cbq_handler(lambda c: _jwt_resend(bot, c),      func=lambda c: c.data == CBT_JWT_RESEND)
-    tg.cbq_handler(lambda c: _del_jwt(bot, c),     func=lambda c: c.data == CBT_DEL_JWT)
-    tg.cbq_handler(lambda c: _ask_set_jwt(bot, c), func=lambda c: c.data == CBT_SET_JWT)
+    tg.cbq_handler(lambda c: _del_jwt(bot, c),         func=lambda c: c.data == CBT_DEL_JWT)
+    tg.cbq_handler(lambda c: _ask_set_jwt(bot, c),     func=lambda c: c.data == CBT_SET_JWT)
 
     tg.cbq_handler(lambda c: _star_add(bot, c),         func=lambda c: c.data == CBT_STAR_ADD)
     tg.cbq_handler(lambda c: _star_act_all(bot, c),     func=lambda c: c.data == CBT_STAR_ACT_ALL)
@@ -2040,31 +2229,38 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _cb_confirm_send(cardinal, c),    func=lambda c: c.data == CBT_CONFIRM_SEND)
     tg.cbq_handler(lambda c: _cb_change_username(cardinal, c), func=lambda c: c.data == CBT_CHANGE_USERNAME)
     tg.cbq_handler(lambda c: _cb_cancel_flow(cardinal, c),     func=lambda c: c.data == CBT_CANCEL_FLOW)
-    tg.cbq_handler(lambda c: _go_main_menu(cardinal, c),     func=lambda c: c.data == CBT_BACK_PLUGINS)
+    tg.cbq_handler(lambda c: _go_main_menu(cardinal, c),       func=lambda c: c.data == CBT_BACK_PLUGINS)
 
-    tg.cbq_handler(lambda c: _open_messages(bot, c), func=lambda c: c.data == CBT_MESSAGES)
-    tg.cbq_handler(lambda c: _msg_edit_start(bot, c), func=lambda c: c.data.startswith(CBT_MSG_EDIT_P))
-    tg.cbq_handler(lambda c: _msg_reset(bot, c), func=lambda c: c.data.startswith(CBT_MSG_RESET_P))
-    tg.cbq_handler(lambda c: _toggle_manual_refund(bot, c), func=lambda c: c.data == CBT_TOGGLE_MANUAL_REFUND)
-    tg.cbq_handler(lambda c: _toggle_back_priority(bot, c), func=lambda c: c.data == CBT_TOGGLE_BACK_PRIORITY)
-    tg.cbq_handler(lambda c: _toggle_preorder_username(bot, c), func=lambda c: c.data == CBT_TOGGLE_PREORDER)
+    tg.cbq_handler(lambda c: _open_messages(bot, c),           func=lambda c: c.data == CBT_MESSAGES)
+    tg.cbq_handler(lambda c: _msg_edit_start(bot, c),          func=lambda c: c.data.startswith(CBT_MSG_EDIT_P))
+    tg.cbq_handler(lambda c: _msg_reset(bot, c),               func=lambda c: c.data.startswith(CBT_MSG_RESET_P))
+    tg.cbq_handler(lambda c: _toggle_manual_refund(bot, c),    func=lambda c: c.data == CBT_TOGGLE_MANUAL_REFUND)
+    tg.cbq_handler(lambda c: _toggle_back_priority(bot, c),    func=lambda c: c.data == CBT_TOGGLE_BACK_PRIORITY)
+    tg.cbq_handler(lambda c: _toggle_preorder_username(bot, c),func=lambda c: c.data == CBT_TOGGLE_PREORDER)
 
-    tg.cbq_handler(lambda c: _start_markup(bot, c), func=lambda c: c.data == CBT_MARKUP)
-    tg.cbq_handler(lambda c: _cb_markup_apply(cardinal, c), func=lambda c: c.data == CBT_MARKUP_APPLY)
-    tg.cbq_handler(lambda c: _cb_markup_change(cardinal, c), func=lambda c: c.data == CBT_MARKUP_CHANGE)
-    tg.cbq_handler(lambda c: _open_mini_settings(bot, c), func=lambda c: c.data == CBT_MINI_SETTINGS)
-    tg.cbq_handler(lambda c: _star_price_start(bot, c), func=lambda c: c.data.startswith(CBT_STAR_PRICE_P))
-    tg.cbq_handler(lambda c: _cb_markup_reset(cardinal, c), func=lambda c: c.data == CBT_MARKUP_RESET)
-    tg.cbq_handler(lambda c: _send_logs(bot, c), func=lambda c: c.data == CBT_LOGS)
-    tg.cbq_handler(lambda c: _open_stats(bot, c), func=lambda c: c.data == CBT_STATS)
-    tg.cbq_handler(lambda c: _open_stats(bot, c, c.data.split(":")[-1]), func=lambda c: c.data.startswith(CBT_STATS_RANGE_P))
-    tg.cbq_handler(lambda c: _open_delete_confirm(bot, c), func=lambda c: c.data == CBT_DELETE_ASK)
-    tg.cbq_handler(lambda c: _cb_delete_yes(cardinal, c), func=lambda c: c.data == CBT_DELETE_YES)
-    tg.cbq_handler(lambda c: _cb_delete_no(bot, c), func=lambda c: c.data == CBT_DELETE_NO)
+    tg.cbq_handler(lambda c: _start_markup(bot, c),            func=lambda c: c.data == CBT_MARKUP)
+    tg.cbq_handler(lambda c: _cb_markup_apply(cardinal, c),    func=lambda c: c.data == CBT_MARKUP_APPLY)
+    tg.cbq_handler(lambda c: _cb_markup_change(cardinal, c),   func=lambda c: c.data == CBT_MARKUP_CHANGE)
+    tg.cbq_handler(lambda c: _open_mini_settings(bot, c),      func=lambda c: c.data == CBT_MINI_SETTINGS)
+    tg.cbq_handler(lambda c: _star_price_start(bot, c),        func=lambda c: c.data.startswith(CBT_STAR_PRICE_P))
+    tg.cbq_handler(lambda c: _cb_markup_reset(cardinal, c),    func=lambda c: c.data == CBT_MARKUP_RESET)
+
+    tg.cbq_handler(lambda c: _send_logs(bot, c),               func=lambda c: c.data == CBT_LOGS)
+    tg.cbq_handler(lambda c: _open_stats(bot, c),              func=lambda c: c.data == CBT_STATS)
+    tg.cbq_handler(
+        lambda c: _open_stats(bot, c, c.data.split(":")[-1]),
+        func=lambda c: c.data.startswith(CBT_STATS_RANGE_P)
+    )
+
+    tg.cbq_handler(lambda c: _open_delete_confirm(bot, c),     func=lambda c: c.data == CBT_DELETE_ASK)
+    tg.cbq_handler(lambda c: _cb_delete_yes(cardinal, c),      func=lambda c: c.data == CBT_DELETE_YES)
+    tg.cbq_handler(lambda c: _cb_delete_no(bot, c),            func=lambda c: c.data == CBT_DELETE_NO)
+
     tg.cbq_handler(lambda c: _toggle_liteserver_retry(bot, c), func=lambda c: c.data == CBT_TOGGLE_LITESERVER_RETRY)
-    tg.cbq_handler(lambda c: _toggle_liteserver_retry(bot, c), func=lambda c: c.data == CBT_TOGGLE_LITESERVER_RETRY)
-    tg.cbq_handler(lambda c: _toggle_username_check(bot, c),  func=lambda c: c.data == CBT_TOGGLE_USERNAME_CHECK)
-    tg.cbq_handler(lambda c: _toggle_autosend_plus(bot, c), func=lambda c: c.data == CBT_TOGGLE_AUTOSEND_PLUS)
+    tg.cbq_handler(lambda c: _toggle_username_check(bot, c),   func=lambda c: c.data == CBT_TOGGLE_USERNAME_CHECK)
+    tg.cbq_handler(lambda c: _toggle_autosend_plus(bot, c),    func=lambda c: c.data == CBT_TOGGLE_AUTOSEND_PLUS)
+    tg.cbq_handler(lambda c: _toggle_queue_mode(bot, c),       func=lambda c: c.data == CBT_TOGGLE_QUEUE_MODE)
+
 
 def _open_home(bot, call):
     _safe_edit(bot, call.message.chat.id, call.message.id, _about_text(), _home_kb())
@@ -2463,6 +2659,23 @@ def _toggle_autosend_plus(bot, call):
         )
     except Exception:
         pass
+    _open_mini_settings(bot, call)
+
+def _toggle_queue_mode(bot, call):
+    chat_id = call.message.chat.id
+    cfg = _get_cfg(chat_id)
+    cur = int(cfg.get("queue_mode") or 1)
+    nxt = 1 if cur >= 3 else cur + 1
+
+    _set_cfg(chat_id, queue_mode=nxt)
+    if not cfg.get("queue_timeout_sec"):
+        _set_cfg(chat_id, queue_timeout_sec=int(os.getenv("FTS_QUEUE_TIMEOUT_SEC", "300")))
+
+    try:
+        bot.answer_callback_query(call.id, f"Очередь: {_queue_mode_label(nxt, _queue_timeout_sec(chat_id))}")
+    except Exception:
+        pass
+
     _open_mini_settings(bot, call)
 
 def _toggle_username_check(bot, call):
@@ -3150,6 +3363,18 @@ def _mark_done(chat_id: Any, oid: Optional[str]):
     _preorders.pop(s, None)
     _remove_order_everywhere(s)
 
+_blocked_oids: set[str] = set()
+_failed_orders: dict[str, dict] = {}
+
+def _finalize_order(oid: str, chat_id: Any, *, ok: bool, reason: str = ""):
+    oid = str(oid)
+    if ok:
+        _done_oids.add(oid)
+    else:
+        _blocked_oids.add(oid)
+        _failed_orders[oid] = {"chat_id": chat_id, "reason": reason, "ts": time.time()}
+    _remove_order_everywhere(oid)
+
 def _set_order_qty(chat_id: Any, order_id: Optional[str], qty: Optional[int]) -> None:
     if not order_id or not qty or qty < 50:
         return
@@ -3230,8 +3455,8 @@ def _current(chat_id: Any) -> Optional[Dict[str, Any]]:
 
 def _push(chat_id: Any, item: Dict[str, Any]) -> None:
     oid = item.get("order_id")
-    if oid and str(oid) in _done_oids:
-        logger.debug(f"[QUEUE] skip push for done order #{oid}")
+    if oid and (str(oid) in _done_oids or str(oid) in _blocked_oids):
+        logger.debug(f"[QUEUE] skip push for done/blocked order #{oid}")
         return
 
     q = _q(chat_id)
@@ -3249,12 +3474,42 @@ def _push(chat_id: Any, item: Dict[str, Any]) -> None:
     q.append(item)
 
 def _ensure_pending(chat_id: Any, order_id: Optional[str], qty: Optional[int]) -> Dict[str, Any]:
+    if order_id and (str(order_id) in _done_oids or str(order_id) in _blocked_oids):
+        return {
+            "qty": int(qty or 50),
+            "order_id": order_id,
+            "chat_id": chat_id,
+            "stage": "finalized",
+            "candidate": None,
+            "finalized": True,
+            "confirmed": True,
+            "prompted": False,
+            "preconfirmed": False,
+            "auto_attempted_for": None,
+            "queue_notified": False,
+            "turn_ts": None,
+        }
+
     q = _q(chat_id)
-    if order_id is not None:
+
+    if order_id:
         for x in q:
             if str(x.get("order_id")) == str(order_id):
+                if qty and int(qty) >= 50:
+                    x["qty"] = int(qty)
+                x.setdefault("chat_id", chat_id)
+                x.setdefault("stage", "await_username")
+                x.setdefault("candidate", None)
+                x.setdefault("finalized", False)
+                x.setdefault("confirmed", False)
+                x.setdefault("prompted", False)
+                x.setdefault("preconfirmed", False)
+                x.setdefault("auto_attempted_for", None)
+                x.setdefault("queue_notified", False)
+                x.setdefault("turn_ts", None)
                 return x
-    item = {
+
+    item: Dict[str, Any] = {
         "qty": int(qty or 50),
         "order_id": order_id,
         "chat_id": chat_id,
@@ -3265,9 +3520,19 @@ def _ensure_pending(chat_id: Any, order_id: Optional[str], qty: Optional[int]) -
         "prompted": False,
         "preconfirmed": False,
         "auto_attempted_for": None,
+        "queue_notified": False,
+        "turn_ts": None,
     }
+
     _push(chat_id, item)
+
+    if order_id:
+        for x in q:
+            if str(x.get("order_id")) == str(order_id):
+                return x
+
     return item
+
 
 def _find_item_by_chat(chat_id: Any) -> Optional[Dict[str, Any]]:
     cid = str(chat_id)
@@ -3305,6 +3570,7 @@ def _notify_next_turn(cardinal: "Cardinal", chat_id: Any = None) -> None:
     nxt = _current(chat_id if (chat_id is not None) else "__any__")
     if not nxt:
         return
+    nxt["turn_ts"] = time.time()
     cid = nxt.get("chat_id")
     if not cid:
         return
@@ -3331,7 +3597,7 @@ def _notify_next_turn(cardinal: "Cardinal", chat_id: Any = None) -> None:
             f"Начинаю отправку…"
         )
 
-        _do_confirm_send(cardinal, cid)
+        _schedule_confirm_send(cardinal, cid)
         return
 
     nxt.update(
@@ -3388,7 +3654,7 @@ def _prompt_current_order_if_needed(cardinal: "Cardinal", chat_id: Any) -> None:
         if _auto_send_without_plus(chat_id):
             if cur.get("auto_attempted_for") != cand:
                 cur["auto_attempted_for"] = cand
-                _do_confirm_send(cardinal, chat_id)
+                _schedule_confirm_send(cardinal, chat_id)
             return
 
         cur["prompted"] = True
@@ -3407,6 +3673,7 @@ def _prompt_current_order_if_needed(cardinal: "Cardinal", chat_id: Any) -> None:
         finalized=False,
         confirmed=False,
     )
+    cur["turn_ts"] = time.time()
     _safe_send(cardinal, chat_id, _tpl(chat_id, "purchase_created", qty=qty, order_id=oid))
     _mark_prompted(chat_id, oid)
 
@@ -3466,7 +3733,23 @@ def _is_auto_reply(msg) -> bool:
         pass
     return False
 
+_QUEUE_TICK_SEC = float(os.getenv("FTS_QUEUE_TICK_SEC", "5"))
+
+def _queue_watchdog(cardinal: "Cardinal"):
+    while True:
+        time.sleep(_QUEUE_TICK_SEC)
+        try:
+            for _ in range(5):
+                if not _maybe_rotate_queue_head(cardinal, "__orders__"):
+                    break
+        except Exception as e:
+            logger.debug(f"queue_watchdog failed: {e}")
+
 def new_order_handler(cardinal: Cardinal, event):
+    chat_id = _event_chat_id(event)
+    for _ in range(3):
+        if not _maybe_rotate_queue_head(cardinal, chat_id if chat_id is not None else "__orders__"):
+            break
     try:
         chat_id = _event_chat_id(event)
         cfg = _get_cfg_for_orders(chat_id if chat_id is not None else "__orders__")
@@ -3486,7 +3769,7 @@ def new_order_handler(cardinal: Cardinal, event):
             or getattr(order, "order_id", None)
             or getattr(event, "order_id", None)
         )
-        if order_id and str(order_id) in _done_oids:
+        if order_id and (str(order_id) in _done_oids or str(order_id) in _blocked_oids):
             return
 
         text_blob = " ".join(str(x) for x in [
@@ -3526,7 +3809,7 @@ def new_order_handler(cardinal: Cardinal, event):
             getattr(order, "buyer_message", None),
             getattr(event, "message", None),
         ]:
-            u = _extract_username_from_text(candidate)
+            u = _extract_username_from_order_text(candidate)
             if u:
                 username = u
                 break
@@ -3625,16 +3908,83 @@ def new_order_handler(cardinal: Cardinal, event):
     except Exception as e:
         logger.exception(f"new_order_handler error: {e}")
 
+_IMMUTABLE_META = {
+    "CREDITS": "@tinechelovec",
+    "UUID": "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75",
+    "CREATOR_URL": "https://t.me/tinechelovec",
+    "GROUP_URL": "https://t.me/dev_thc_chat",
+    "CHANNEL_URL": "https://t.me/by_thc",
+    "GITHUB_URL": "https://github.com/tinechelovec/FPC-Plugin-Telegram-Stars",
+    "INSTRUCTION_URL": "https://teletype.in/@tinechelovec/FTS-Plugin",
+}
+
+_IMMUTABLE_OK = True
+_IMMUTABLE_REASON = ""
+
+def _meta_guard() -> bool:
+    global _IMMUTABLE_OK, _IMMUTABLE_REASON
+    if not _IMMUTABLE_OK:
+        return False
+
+    for k, expected in _IMMUTABLE_META.items():
+        cur = globals().get(k, None)
+        if cur != expected:
+            _IMMUTABLE_OK = False
+            _IMMUTABLE_REASON = f"{k} изменён"
+            try:
+                logger.critical(f"[ANTI-TAMPER] immutable field changed: {k} expected={expected!r} got={cur!r}")
+            except Exception:
+                pass
+            return False
+
+    return True
+
+def _tamper_text() -> str:
+    reason = _IMMUTABLE_REASON or "обнаружены изменения в данных плагина"
+    return (
+        "⛔️ <b>Плагин не работает.</b>\n\n"
+        f"Причина: <code>{reason}</code>\n\n"
+        "Похоже, файл плагина был изменён или подменён.\n"
+        "Установите оригинальную версию или обратитесь к создателю:\n\n"
+        f"👤 <b>Создатель:</b> <a href=\"{_IMMUTABLE_META['CREATOR_URL']}\">{_IMMUTABLE_META['CREDITS']}</a>\n"
+        f"👥 <b>Группа:</b> <a href=\"{_IMMUTABLE_META['GROUP_URL']}\">dev chat</a>\n"
+        f"📣 <b>Канал:</b> <a href=\"{_IMMUTABLE_META['CHANNEL_URL']}\">channel</a>\n"
+        f"🌐 <b>GitHub:</b> <a href=\"{_IMMUTABLE_META['GITHUB_URL']}\">repo</a>\n"
+        f"📖 <b>Инструкция:</b> <a href=\"{_IMMUTABLE_META['INSTRUCTION_URL']}\">open</a>\n"
+    )
+
+def _tamper_kb() -> InlineKeyboardMarkup:
+    kb = K()
+    kb.row(B("👤 Создатель", url=_IMMUTABLE_META["CREATOR_URL"]),
+           B("🌐 GitHub", url=_IMMUTABLE_META["GITHUB_URL"]))
+    kb.row(B("👥 Группа", url=_IMMUTABLE_META["GROUP_URL"]),
+           B("📣 Канал", url=_IMMUTABLE_META["CHANNEL_URL"]))
+    kb.add(B("📖 Инструкция", url=_IMMUTABLE_META["INSTRUCTION_URL"]))
+    return kb
+
+CREDITS = _IMMUTABLE_META["CREDITS"]
+UUID = _IMMUTABLE_META["UUID"]
+CREATOR_URL = _IMMUTABLE_META["CREATOR_URL"]
+GROUP_URL = _IMMUTABLE_META["GROUP_URL"]
+CHANNEL_URL = _IMMUTABLE_META["CHANNEL_URL"]
+GITHUB_URL = _IMMUTABLE_META["GITHUB_URL"]
+INSTRUCTION_URL = _IMMUTABLE_META["INSTRUCTION_URL"]
+
+
 def _do_confirm_send(cardinal: "Cardinal", chat_id):
     pend = _active_item_for_chat(chat_id)
+    for _ in range(3):
+        if not _maybe_rotate_queue_head(cardinal, chat_id):
+            break
 
     if not pend:
         _safe_send(cardinal, chat_id, "Нет активного заказа. Если нужно — дождитесь нового сообщения о заказе.")
         return
 
     if FTS_GLOBAL_QUEUE:
+        mode = _queue_mode(chat_id)
         head = _current(chat_id)
-        if not head or pend is not head:
+        if mode in (1, 3) and (not head or pend is not head):
             pend["preconfirmed"] = True
             pos = _queue_pos_of(pend)
             _safe_send(
@@ -3679,6 +4029,7 @@ def _do_confirm_send(cardinal: "Cardinal", chat_id):
 
     _safe_send(cardinal, chat_id, _tpl(chat_id, "sending", qty=qty, username=username.lstrip("@")))
 
+    oid = pend.get("order_id")
     _set_sending(chat_id, True)
     try:
         resp = _order_stars_with_retry(
@@ -3693,20 +4044,22 @@ def _do_confirm_send(cardinal: "Cardinal", chat_id):
 
     if resp and resp.get("ok"):
         order_url = f"https://funpay.com/orders/{oid}/" if oid else ""
-        _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=qty, username=username.lstrip('@'), order_url=order_url))
-
-        _mark_done(chat_id, oid)
+        _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=qty, username=username.lstrip("@"), order_url=order_url))
         _log("info", f"SEND OK {qty}⭐ -> @{username}")
 
-        pend.update(finalized=True)
-        if (not FTS_GLOBAL_QUEUE) or (pend is _current(chat_id)):
-            _pop_current(chat_id)
+        if oid:
+            _finalize_order(oid, chat_id, ok=True)
 
         if _has_queue(chat_id):
-            _notify_next_turn(cardinal)
+            _notify_next_turn(cardinal, chat_id)
         return
 
-    kind, human = _classify_send_failure((resp or {}).get("text",""), (resp or {}).get("status",0), username.lstrip("@"), jwt)
+    kind, human = _classify_send_failure(
+        (resp or {}).get("text", ""),
+        (resp or {}).get("status", 0),
+        username.lstrip("@"),
+        jwt
+    )
 
     if kind == "username":
         pend.update(stage="await_username", finalized=False, candidate=None)
@@ -3717,7 +4070,8 @@ def _do_confirm_send(cardinal: "Cardinal", chat_id):
     _log("error", f"SEND FAIL {qty}⭐ -> @{username}: {human} | status={(resp or {}).get('status')}")
     pend.update(finalized=True)
 
-    _mark_prompted(chat_id, oid)
+    if oid:
+        _finalize_order(oid, chat_id, ok=False, reason=human)
 
     if cfg.get("auto_refund", False) and oid:
         _safe_send(cardinal, chat_id, "🔁 Пытаюсь оформить возврат…")
@@ -3727,8 +4081,7 @@ def _do_confirm_send(cardinal: "Cardinal", chat_id):
         _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
 
     _maybe_auto_deactivate(cardinal, cfg, chat_id)
-    if (not FTS_GLOBAL_QUEUE) or (pend is _current(chat_id)):
-        _pop_current(chat_id, keep_prompted=False)
+
     if _has_queue(chat_id):
         _notify_next_turn(cardinal, chat_id)
 
@@ -3737,7 +4090,7 @@ def _cb_confirm_send(cardinal: "Cardinal", call):
         cardinal.telegram.bot.answer_callback_query(call.id)
     except Exception:
         pass
-    _do_confirm_send(cardinal, call.message.chat.id)
+    _schedule_confirm_send(cardinal, call.message.chat.id)
 
 def _cb_change_username(cardinal: "Cardinal", call):
     chat_id = call.message.chat.id
@@ -3808,14 +4161,19 @@ def _apply_username_for_item(cardinal: "Cardinal", chat_id: Any, item: dict, una
     _safe_send(cardinal, chat_id, _tpl(chat_id, "username_valid", qty=qty, username=uname, order_id=item.get("order_id"),),)
     if item.get("preconfirmed"):
         if (not FTS_GLOBAL_QUEUE) or (_current(chat_id) is item):
-            _do_confirm_send(cardinal, chat_id)
+            _schedule_confirm_send(cardinal, chat_id)
         return
     if _auto_send_without_plus(chat_id):
-        if FTS_GLOBAL_QUEUE and (_current(chat_id) is not item):
+        if FTS_GLOBAL_QUEUE and (_current(chat_id) is not item) and (_queue_mode(chat_id) != 2):
             return
-        if (not FTS_GLOBAL_QUEUE) or (_current(chat_id) is item):
-            _do_confirm_send(cardinal, chat_id)
+
+        if FTS_GLOBAL_QUEUE and (_current(chat_id) is not item) and item.get("order_id"):
+            _schedule_confirm_send(cardinal, chat_id, str(item.get("order_id")))
             return
+
+        _schedule_confirm_send(cardinal, chat_id)
+        return
+
 
     _safe_send(
         cardinal,
@@ -3838,11 +4196,37 @@ def _do_confirm_send_for_oid(cardinal: "Cardinal", chat_id: Any, oid: str):
         return
     head = _current(chat_id)
     if head and str(head.get("order_id")) == str(oid):
-        _do_confirm_send(cardinal, chat_id)
+        _schedule_confirm_send(cardinal, chat_id)
         return
 
     item = _pending_by_oid(chat_id, oid)
+    if FTS_GLOBAL_QUEUE and _queue_mode(chat_id) in (1, 3):
+        head = _current(chat_id)
+        if not head or str(head.get("order_id")) != str(oid):
+            item["preconfirmed"] = True
+            pos = _queue_pos_of(item)
+            _safe_send(
+                cardinal,
+                chat_id,
+                f"✅ Подтверждение принято. Сейчас ещё не ваша очередь (позиция {pos}). "
+                "Когда очередь дойдёт — отправлю автоматически."
+            )
+            return
+
     if not item:
+        if FTS_GLOBAL_QUEUE and _queue_mode(chat_id) in (1, 3):
+            head = _current(chat_id)
+            if not head or str(head.get("order_id")) != str(oid):
+                item["preconfirmed"] = True
+                pos = _queue_pos_of(item)
+                _safe_send(
+                    cardinal,
+                    chat_id,
+                    f"✅ Подтверждение принято. Сейчас ещё не ваша очередь (позиция {pos}). "
+                    "Когда очередь дойдёт — отправлю автоматически."
+                )
+                return
+
         _safe_send(cardinal, chat_id, f"Не нашёл активный заказ #{oid} для подтверждения.")
         return
 
@@ -3880,33 +4264,39 @@ def _do_confirm_send_for_oid(cardinal: "Cardinal", chat_id: Any, oid: str):
     finally:
         _set_sending(chat_id, False)
 
-    if resp and resp.get("ok"):
-        order_url = f"https://funpay.com/orders/{oid}/"
-        _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=qty, username=username, order_url=order_url))
-        item.update(finalized=True)
-        try:
-            _q(chat_id).remove(item)
-        except ValueError:
-            pass
+        if resp and resp.get("ok"):
+            order_url = f"https://funpay.com/orders/{oid}/"
+            _safe_send(cardinal, chat_id, _tpl(chat_id, "sent", qty=qty, username=username, order_url=order_url))
 
-        _mark_done(chat_id, oid)
-        _preorders.pop(str(oid), None)
+            _finalize_order(oid, chat_id, ok=True)
+            return
 
-    else:
-        kind, human = _classify_send_failure((resp or {}).get("text",""), (resp or {}).get("status",0), username.lstrip("@"), jwt)
+        kind, human = _classify_send_failure(
+            (resp or {}).get("text", ""),
+            (resp or {}).get("status", 0),
+            username.lstrip("@"),
+            jwt
+        )
+
         if kind == "username":
             item.update(stage="await_username", finalized=False, candidate=None)
             _safe_send(cardinal, chat_id, _tpl(chat_id, "username_invalid", order_id=oid))
+            return
+
+        _safe_send(cardinal, chat_id, _tpl(chat_id, "failed", reason=human))
+        item.update(finalized=True)
+
+        _finalize_order(oid, chat_id, ok=False, reason=human)
+
+        if cfg.get("auto_refund", False) and oid:
+            _safe_send(cardinal, chat_id, "🔁 Пытаюсь оформить возврат…")
+            ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
+            _log("info" if ok_ref else "error", f"REFUND #{oid} -> {'OK' if ok_ref else 'FAIL'}")
         else:
-            _safe_send(cardinal, chat_id, _tpl(chat_id, "failed", reason=human))
-            item.update(finalized=True)
-            if cfg.get("auto_refund", False) and oid:
-                _safe_send(cardinal, chat_id, "🔁 Пытаюсь оформить возврат…")
-                ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
-                _log("info" if ok_ref else "error", f"REFUND #{oid} -> {'OK' if ok_ref else 'FAIL'}")
-            else:
-                _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
-            _maybe_auto_deactivate(cardinal, cfg, chat_id)
+            _safe_send(cardinal, chat_id, "⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.")
+
+        _maybe_auto_deactivate(cardinal, cfg, chat_id)
+        return
 
 def _find_order_for_back(chat_id: Any, order_id: Optional[str]) -> Optional[dict]:
     q = _q(chat_id)
@@ -3924,6 +4314,10 @@ def _list_pending_oids(chat_id: Any) -> List[str]:
     return [str(x.get("order_id")) for x in _q(chat_id) if _allowed_stages(x) and x.get("order_id")]
 
 def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
+    chat_id = _event_chat_id(event)
+    for _ in range(3):
+        if not _maybe_rotate_queue_head(cardinal, chat_id if chat_id is not None else "__orders__"):
+            break
     try:
         my_user = (getattr(cardinal.account, "username", None) or "").lower()
         author  = (getattr(event.message, "author", "") or "").lower()
@@ -3983,7 +4377,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         if author == "funpay" and _funpay_is_system_paid_message(text):
             qty, oid = _funpay_extract_qty_and_order_id(text)
             hint_uname = _extract_explicit_handle(text)
-            if oid and str(oid) in _done_oids:
+            if oid and (str(oid) in _done_oids or str(oid) in _blocked_oids):
                 return
             _set_order_qty(chat_id, oid, qty)
             if qty is not None and qty < 50:
@@ -4197,12 +4591,12 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         if m_plus and author != "funpay":
             oid_arg = m_plus.group(1)
             if oid_arg:
-                _do_confirm_send_for_oid(cardinal, chat_id, oid_arg)
+                _schedule_confirm_send(cardinal, chat_id, oid_arg)
             else:
-                _do_confirm_send(cardinal, chat_id)
+                _schedule_confirm_send(cardinal, chat_id)
             return
 
-        username = _extract_username_from_text(text)
+        username = _extract_username_from_order_text(text)
         if not username:
             if pend:
                 pend.update(stage="await_username", candidate=None)
@@ -4249,7 +4643,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         if _auto_send_without_plus(chat_id):
             if FTS_GLOBAL_QUEUE and (pend is not _current(chat_id)):
                 return
-            _do_confirm_send(cardinal, chat_id)
+            _schedule_confirm_send(cardinal, chat_id)
             return
 
         _safe_send(
@@ -4269,7 +4663,7 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
             return
 
         if str(pend.get("stage")) == "await_confirm" and text.lower() in {"+", "++", "да", "ок", "ok"}:
-            _do_confirm_send(cardinal, chat_id)
+            _schedule_confirm_send(cardinal, chat_id)
             return
 
     except Exception as e:
