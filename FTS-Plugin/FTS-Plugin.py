@@ -236,7 +236,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.6.1"
+VERSION     = "1.6.2"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -262,6 +262,61 @@ FNP_MIN_BALANCE_TON   = float(os.getenv("FTS_Plugin_MIN_BALANCE_TON", "5.0"))
 
 PLUGIN_FOLDER  = "storage/plugins/FTS-Plugin"
 SETTINGS_FILE  = os.path.join(PLUGIN_FOLDER, "settings.json")
+_SETTINGS_IO_LOCK = threading.RLock()
+SETTINGS_BAK = SETTINGS_FILE + ".bak"
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def _load_settings() -> dict:
+    with _SETTINGS_IO_LOCK:
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.error(f"Load settings error: {e}")
+
+        try:
+            with open(SETTINGS_BAK, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                logger.warning("Settings restored from .bak")
+                return data
+        except Exception:
+            pass
+
+        try:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            bad = SETTINGS_FILE + f".corrupt.{ts}"
+            if os.path.exists(SETTINGS_FILE):
+                os.replace(SETTINGS_FILE, bad)
+                logger.warning(f"Corrupt settings moved to {bad}")
+        except Exception:
+            pass
+
+        return {}
+
+def _save_settings(data: dict) -> None:
+    if not isinstance(data, dict):
+        return
+    with _SETTINGS_IO_LOCK:
+        try:
+            try:
+                if os.path.exists(SETTINGS_FILE):
+                    shutil.copy2(SETTINGS_FILE, SETTINGS_BAK)
+            except Exception:
+                pass
+
+            _atomic_write_json(SETTINGS_FILE, data)
+        except Exception as e:
+            logger.error(f"Save settings error: {e}")
+
 os.makedirs(PLUGIN_FOLDER, exist_ok=True)
 if not os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -357,41 +412,44 @@ def _get_cfg(chat_id: Any) -> dict:
     data = _load_settings()
     key = str(chat_id)
     cfg = data.get(key) or {}
-    cfg.setdefault("plugin_enabled", True)
-    cfg.setdefault("lots_active", False)
-    cfg.setdefault("auto_refund", False)
-    cfg.setdefault("auto_deactivate", True)
-    cfg.setdefault("manual_refund_enabled", False)
-    cfg.setdefault("manual_refund_priority", True)
-    cfg.setdefault("preorder_username", False)
+
+    changed = False
+    def setdef(k, v):
+        nonlocal changed
+        if k not in cfg:
+            cfg[k] = v
+            changed = True
+
+    setdef("plugin_enabled", True)
+    setdef("lots_active", False)
+    setdef("auto_refund", False)
+    setdef("auto_deactivate", True)
+    setdef("manual_refund_enabled", False)
+    setdef("manual_refund_priority", True)
+    setdef("preorder_username", False)
     cfg["preorder_username"] = _cfg_bool(cfg, "preorder_username", False)
-    cfg.setdefault("markup_percent", 0.0)
-    cfg.setdefault("fragment_jwt", None)
-    cfg.setdefault("wallet_version", None)
-    cfg.setdefault("balance_ton", None)
-    cfg.setdefault("last_wallet_raw", None)
-    cfg.setdefault("templates", _default_templates())
-    cfg.setdefault("category_id", FNP_STARS_CATEGORY_ID)
+    setdef("markup_percent", 0.0)
+    setdef("fragment_jwt", None)
+    setdef("wallet_version", None)
+    setdef("balance_ton", None)
+    setdef("last_wallet_raw", None)
+    setdef("templates", _default_templates())
+    setdef("category_id", FNP_STARS_CATEGORY_ID)
     cfg["category_id"] = FNP_STARS_CATEGORY_ID
-    cfg.setdefault("min_balance_ton", FNP_MIN_BALANCE_TON)
-    cfg.setdefault("star_lots", [])
-    cfg.setdefault("retry_liteserver", LITESERVER_RETRY_DEFAULT)
-    cfg.setdefault("auto_send_without_plus", False)
+    setdef("min_balance_ton", FNP_MIN_BALANCE_TON)
+    setdef("star_lots", [])
+    setdef("retry_liteserver", LITESERVER_RETRY_DEFAULT)
+    setdef("auto_send_without_plus", False)
     cfg["auto_send_without_plus"] = _cfg_bool(cfg, "auto_send_without_plus", False)
-    cfg.setdefault("skip_username_check", False)
+    setdef("skip_username_check", False)
     cfg["skip_username_check"] = _cfg_bool(cfg, "skip_username_check", False)
-    cfg.setdefault("queue_mode", 1)
-    cfg.setdefault("queue_timeout_sec", QUEUE_TIMEOUT_DEFAULT)
-    try:
-        cfg["queue_mode"] = int(cfg.get("queue_mode") or 1)
-    except Exception:
-        cfg["queue_mode"] = 1
-    try:
-        cfg["queue_timeout_sec"] = int(float(cfg.get("queue_timeout_sec") or QUEUE_TIMEOUT_DEFAULT))
-    except Exception:
-        cfg["queue_timeout_sec"] = QUEUE_TIMEOUT_DEFAULT
+    setdef("queue_mode", 1)
+    setdef("queue_timeout_sec", QUEUE_TIMEOUT_DEFAULT)
+
     data[key] = cfg
-    _save_settings(data)
+    if changed:
+        _save_settings(data)
+
     return cfg
 
 def _get_cfg_for_orders(chat_id: Any) -> dict:
@@ -1430,6 +1488,9 @@ CBT_TOGGLE_LITESERVER_RETRY = f"{UUID}:toggle_liteserver_retry"
 CBT_TOGGLE_USERNAME_CHECK   = f"{UUID}:toggle_username_check"
 CBT_TOGGLE_AUTOSEND_PLUS = f"{UUID}:toggle_autosend_plus"
 CBT_TOGGLE_QUEUE_MODE = f"{UUID}:toggle_queue_mode"
+CBT_RESET_SETTINGS_ASK = f"{UUID}:reset_settings_ask"
+CBT_RESET_SETTINGS_YES = f"{UUID}:reset_settings_yes"
+CBT_RESET_SETTINGS_NO  = f"{UUID}:reset_settings_no"
 
 _fsm: dict[int, dict] = {}
 
@@ -1476,6 +1537,7 @@ def _settings_kb(chat_id: Any) -> InlineKeyboardMarkup:
     kb.row(B("📜 Логи", callback_data=CBT_LOGS))
     kb.row(B("📊 Статистика", callback_data=CBT_STATS))
     kb.row(B("🔄 Обновить", callback_data=CBT_REFRESH))
+    kb.row(B("♻️ Сброс настроек", callback_data=CBT_RESET_SETTINGS_ASK))
     kb.add(B("🏠 Домой", callback_data=CBT_HOME))
     kb.add(B("◀️ Назад", callback_data=CBT_HOME))
     return kb
@@ -2261,6 +2323,9 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _toggle_autosend_plus(bot, c),    func=lambda c: c.data == CBT_TOGGLE_AUTOSEND_PLUS)
     tg.cbq_handler(lambda c: _toggle_queue_mode(bot, c),       func=lambda c: c.data == CBT_TOGGLE_QUEUE_MODE)
 
+    tg.cbq_handler(lambda c: _open_reset_settings_confirm(bot, c), func=lambda c: c.data == CBT_RESET_SETTINGS_ASK)
+    tg.cbq_handler(lambda c: _cb_reset_settings_yes(cardinal, c),  func=lambda c: c.data == CBT_RESET_SETTINGS_YES)
+    tg.cbq_handler(lambda c: _cb_reset_settings_no(bot, c),        func=lambda c: c.data == CBT_RESET_SETTINGS_NO)
 
 def _open_home(bot, call):
     _safe_edit(bot, call.message.chat.id, call.message.id, _about_text(), _home_kb())
@@ -3262,6 +3327,75 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
                 type("obj", (), {"message": type("m", (), {"chat": type("c", (), {"id": chat_id})(), "id": message.message_id})(), "id": ""})
             )
             return
+    
+def _reset_settings_confirm_text() -> str:
+    return (
+        "⚠️ <b>Сброс настроек</b>\n\n"
+        "Это действие очистит файл <code>settings.json</code>.\n"
+        "Все настройки плагина будут сброшены к значениям по умолчанию.\n\n"
+        "<b>Продолжить?</b>"
+    )
+
+def _reset_settings_confirm_kb() -> InlineKeyboardMarkup:
+    kb = K()
+    kb.row(
+        B("✅ Да, сбросить", callback_data=CBT_RESET_SETTINGS_YES),
+        B("❌ Отмена", callback_data=CBT_RESET_SETTINGS_NO),
+    )
+    return kb
+
+def _open_reset_settings_confirm(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _reset_settings_confirm_text(), _reset_settings_confirm_kb())
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+def _clear_settings_json_file() -> tuple[bool, str]:
+    try:
+        with _SETTINGS_IO_LOCK:
+            try:
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                if os.path.exists(SETTINGS_FILE):
+                    shutil.copy2(SETTINGS_FILE, SETTINGS_FILE + f".reset.{ts}.bak")
+            except Exception:
+                pass
+
+            _atomic_write_json(SETTINGS_FILE, {})
+        return True, "✅ Настройки сброшены (settings.json очищен)."
+    except Exception as e:
+        logger.error(f"Reset settings error: {e}")
+        return False, f"❌ Не удалось сбросить настройки: {e}"
+
+def _cb_reset_settings_yes(cardinal: "Cardinal", call):
+    bot = cardinal.telegram.bot
+    chat_id = call.message.chat.id
+    try:
+        bot.answer_callback_query(call.id, "Сбрасываю…")
+    except Exception:
+        pass
+
+    ok, msg = _clear_settings_json_file()
+
+    try:
+        _fsm.pop(chat_id, None)
+    except Exception:
+        pass
+
+    bot.send_message(chat_id, msg, parse_mode="HTML" if "<" in msg else None)
+
+    try:
+        _open_settings(bot, call)
+    except Exception:
+        pass
+
+def _cb_reset_settings_no(bot, call):
+    try:
+        bot.answer_callback_query(call.id, "Отменено.")
+    except Exception:
+        pass
+    _open_settings(bot, call)
 
 def _jwt_confirmed(bot, call):
     chat_id = call.message.chat.id
