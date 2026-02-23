@@ -9,6 +9,7 @@ import time
 import random
 import shutil
 import threading
+import html as _html
 
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -157,6 +158,9 @@ class _HumanFormatter(logging.Formatter):
             msg, _ = _HumanLog.humanize(record)
         return msg
 
+def _h(x) -> str:
+    return _html.escape(str(x), quote=False)
+
 def _setup_logging():
     for h in list(logger.handlers):
         logger.removeHandler(h)
@@ -236,7 +240,7 @@ def _log(level: str, msg: str):
         logger.debug(f"{msg}")
 
 NAME        = "FTS-Plugin"
-VERSION     = "1.6.2"
+VERSION     = "1.6.3"
 DESCRIPTION = "Плагин по продаже звезд."
 CREDITS     = "@tinechelovec"
 UUID        = "fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75"
@@ -259,13 +263,15 @@ FRAGMENT_ORDER_STARS   = os.getenv("FRAGMENT_ORDER_STARS", f"{FRAGMENT_BASE}/ord
 
 FNP_STARS_CATEGORY_ID = int(os.getenv("FTS_Plugin_CATEGORY_ID", "2418"))
 FNP_MIN_BALANCE_TON   = float(os.getenv("FTS_Plugin_MIN_BALANCE_TON", "5.0"))
+FTS_MIN_STARS = int(os.getenv("FTS_MIN_STARS", "50"))
 
 PLUGIN_FOLDER  = "storage/plugins/FTS-Plugin"
 SETTINGS_FILE  = os.path.join(PLUGIN_FOLDER, "settings.json")
+SETTINGS_BAK   = SETTINGS_FILE + ".bak"
 _SETTINGS_IO_LOCK = threading.RLock()
-SETTINGS_BAK = SETTINGS_FILE + ".bak"
 
 def _atomic_write_json(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
@@ -273,28 +279,62 @@ def _atomic_write_json(path: str, data: dict) -> None:
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
+def _try_parse_settings_text(txt: str) -> Optional[dict]:
+    if txt is None:
+        return None
+    s = txt.lstrip("\ufeff").strip()
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except json.JSONDecodeError:
+        try:
+            dec = json.JSONDecoder()
+            obj, idx = dec.raw_decode(s)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return None
+
 def _load_settings() -> dict:
     with _SETTINGS_IO_LOCK:
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    txt = f.read()
+                obj = _try_parse_settings_text(txt)
+                if isinstance(obj, dict):
+                    try:
+                        _atomic_write_json(SETTINGS_FILE, obj)
+                    except Exception:
+                        pass
+                    return obj
         except Exception as e:
             logger.error(f"Load settings error: {e}")
 
         try:
-            with open(SETTINGS_BAK, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                logger.warning("Settings restored from .bak")
-                return data
+            if os.path.exists(SETTINGS_BAK):
+                with open(SETTINGS_BAK, "r", encoding="utf-8") as f:
+                    txt = f.read()
+                obj = _try_parse_settings_text(txt)
+                if isinstance(obj, dict):
+                    logger.warning("Settings restored from .bak")
+                    try:
+                        _atomic_write_json(SETTINGS_FILE, obj)
+                    except Exception:
+                        pass
+                    return obj
         except Exception:
             pass
 
         try:
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            bad = SETTINGS_FILE + f".corrupt.{ts}"
             if os.path.exists(SETTINGS_FILE):
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                bad = SETTINGS_FILE + f".corrupt.{ts}"
                 os.replace(SETTINGS_FILE, bad)
                 logger.warning(f"Corrupt settings moved to {bad}")
         except Exception:
@@ -307,6 +347,7 @@ def _save_settings(data: dict) -> None:
         return
     with _SETTINGS_IO_LOCK:
         try:
+            json.dumps(data, ensure_ascii=False)
             try:
                 if os.path.exists(SETTINGS_FILE):
                     shutil.copy2(SETTINGS_FILE, SETTINGS_BAK)
@@ -319,24 +360,19 @@ def _save_settings(data: dict) -> None:
 
 os.makedirs(PLUGIN_FOLDER, exist_ok=True)
 if not os.path.exists(SETTINGS_FILE):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump({}, f, indent=4, ensure_ascii=False)
+    try:
+        _atomic_write_json(SETTINGS_FILE, {})
+    except Exception:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=4, ensure_ascii=False)
 
-LOG_FILE_LOCAL = os.path.join(PLUGIN_FOLDER, "lot.txt")
+LOG_FILE_LOCAL = os.path.join(PLUGIN_FOLDER, "log.txt")
 try:
     _fh_local = logging.FileHandler(LOG_FILE_LOCAL, encoding="utf-8")
     _fh_local.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [FTS-Plugin] %(message)s"))
     logger.addHandler(_fh_local)
 except Exception as e:
     logger.debug(f"Local file logging init failed: {e}")
-
-def _load_settings() -> dict:
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Load settings error: {e}")
-        return {}
 
 def _cfg_bool(cfg: dict, key: str, default: bool = False) -> bool:
     v = cfg.get(key, default)
@@ -358,13 +394,6 @@ def _auto_send_without_plus(chat_id: Any) -> bool:
         return _cfg_bool(cfg, "auto_send_without_plus", False)
     except Exception:
         return True
-
-def _save_settings(data: dict) -> None:
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Save settings error: {e}")
 
 _anti_dup_prompts: Dict[str, float] = {}
 
@@ -428,6 +457,7 @@ def _get_cfg(chat_id: Any) -> dict:
     setdef("manual_refund_priority", True)
     setdef("preorder_username", False)
     cfg["preorder_username"] = _cfg_bool(cfg, "preorder_username", False)
+    setdef("unit_star_price", None)
     setdef("markup_percent", 0.0)
     setdef("fragment_jwt", None)
     setdef("wallet_version", None)
@@ -470,13 +500,14 @@ def _skip_username_check(chat_id: Any) -> bool:
         return False
 
 def _set_cfg(chat_id: Any, **updates) -> dict:
-    data = _load_settings()
-    key = str(chat_id)
-    cfg = data.get(key) or {}
-    cfg.update(updates)
-    data[key] = cfg
-    _save_settings(data)
-    return cfg
+    with _SETTINGS_IO_LOCK:
+        data = _load_settings()
+        key = str(chat_id)
+        cfg = data.get(key) or {}
+        cfg.update(updates)
+        data[key] = cfg
+        _save_settings(data)
+        return cfg
 
 def _state_on(v: bool) -> str:
     return "🟢 Включено" if v else "🔴 Выключено"
@@ -591,7 +622,13 @@ def _toggle_preorder_username(bot, call):
 def _stars_text(chat_id: Any) -> str:
     cfg = _get_cfg(chat_id)
     items = cfg.get("star_lots") or []
-    header = f"<b>⚙️ Настройка лотов</b>\n\nТекущая наценка: <b>{cfg.get('markup_percent', 0.0)}%</b>\n\n"
+    unit = cfg.get("unit_star_price")
+    unit_txt = f"{unit}" if isinstance(unit, (int, float)) else "—"
+    header = (
+        f"<b>⚙️ Настройка лотов</b>\n\n"
+        f"Текущая наценка: <b>{cfg.get('markup_percent', 0.0)}%</b>\n"
+        f"Цена за 1⭐: <b>{unit_txt}</b>\n\n"
+    )
     if not items:
         body = "Пока нет лотов со звёздами.\nНажмите «➕ Добавить лот»."
     else:
@@ -622,23 +659,39 @@ def _extract_qty_from_title(title: str) -> Optional[int]:
     if not title:
         return None
 
-    m = _re.search(r"(\d{2,7})\s*(?:зв[её]зд\w*|stars?|⭐️|⭐)", title, _re.I)
+    s = (title or "").strip()
+
+    m = _re.search(r"(\d{1,7})\s*(?:зв[её]зд\w*|stars?)\b", s, _re.I)
     if m:
         try:
-            v = int(m.group(1))
-            return v if v >= 50 else None
+            return int(m.group(1))
         except Exception:
-            pass
+            return None
 
-    nums = []
-    for x in _re.findall(r"\d{2,7}", title):
+    m = _re.search(r"(\d{1,7})\s*(?:⭐️|⭐)", s)
+    if m:
         try:
-            n = int(x)
-            if n >= 50:
-                nums.append(n)
+            return int(m.group(1))
         except Exception:
-            pass
-    return max(nums) if nums else None
+            return None
+
+    m = _re.search(r"(?:⭐️|⭐)\s*(\d{1,7})", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    if _re.search(r"(?:зв[её]зд|stars?|⭐️|⭐)", s, _re.I):
+        nums = []
+        for x in _re.findall(r"\d{1,7}", s):
+            try:
+                nums.append(int(x))
+            except Exception:
+                pass
+        return max(nums) if nums else None
+
+    return None
 
 _sending_chats: set[str] = set()
 
@@ -657,7 +710,7 @@ def _set_sending(chat_id: Any, v: bool):
 def _extract_username_from_text(text: str) -> Optional[str]:
     if not text:
         return None
-    s = str(text)
+    s = _strip_invisible(str(text))
 
     m = _re.search(r'(?i)(?:по|by)\s*username\s*[,:\-]?\s*@?([A-Za-z0-9_]{5,32})', s)
     if m:
@@ -678,7 +731,7 @@ def _extract_username_from_text(text: str) -> Optional[str]:
 def _extract_username_from_order_text(text: str) -> Optional[str]:
     if not text:
         return None
-    s = str(text)
+    s = _strip_invisible(str(text))
 
     u = _extract_username_from_text(s)
     if u:
@@ -1171,46 +1224,106 @@ def _human_auth_error(raw_resp: Any, status: int) -> str:
     except Exception:
         return f"Не удалось создать токен (HTTP {status}). Проверьте данные и повторите."
 
-def _get_my_lots_by_category(cardinal: "Cardinal", category_id: int) -> Dict[int, Any]:
-    lots: Dict[int, Any] = {}
+def _get_my_subcategory_lots_safe(cardinal: "Cardinal", subcategory_id: int) -> list:
+    acc = getattr(cardinal, "account", None)
+    if not acc:
+        return []
+    fn = getattr(acc, "get_my_subcategory_lots", None)
+    if not callable(fn):
+        return []
     try:
-        cardinal.update_lots_and_categories()
+        return fn(int(subcategory_id)) or []
+    except Exception as e:
+        logger.warning(f"_get_my_subcategory_lots_safe failed: {e}")
+        return []
 
-        all_map = (cardinal.tg_profile.get_sorted_lots(2) or {})
-
-        for subcat, items in all_map.items():
-            try:
-                sid = int(
-                    getattr(subcat, "id", None)
-                    or getattr(subcat, "subcategory_id", None)
-                    or getattr(subcat, "category_id", None)
-                    or 0
-                )
-            except Exception:
-                sid = 0
-
-            if sid != int(category_id):
+def _get_my_lot_ids_by_subcategory(cardinal: "Cardinal", subcategory_id: int) -> list[int]:
+    ids: set[int] = set()
+    for lot in _get_my_subcategory_lots_safe(cardinal, subcategory_id):
+        try:
+            lid = getattr(lot, "id", None)
+            if lid is None:
                 continue
+            ids.add(int(lid))
+        except Exception:
+            pass
+    return sorted(ids)
 
+def _get_my_lots_by_category(cardinal: "Cardinal", category_id: int) -> Dict[int, Any]:
+    category_id = int(category_id)
+    lots: Dict[int, Any] = {}
+
+    def _extract_ids_from_sorted_map(all_map: Any) -> list[int]:
+        ids: list[int] = []
+        if not isinstance(all_map, dict):
+            return ids
+
+        for _k, items in all_map.items():
             if isinstance(items, dict):
                 for key, val in items.items():
                     lid = getattr(key, "id", key)
                     try:
-                        lid = int(lid)
+                        ids.append(int(lid))
                     except Exception:
                         continue
-                    lots[lid] = val
             else:
                 seq = items if isinstance(items, (list, tuple, set)) else []
                 for val in seq:
                     lid = getattr(val, "id", None)
-                    if lid is not None:
-                        try:
-                            lots[int(lid)] = val
-                        except Exception:
-                            pass
+                    if lid is None:
+                        continue
+                    try:
+                        ids.append(int(lid))
+                    except Exception:
+                        pass
+        return ids
+
+    try:
+        cardinal.update_lots_and_categories()
+
+        cand_ids: set[int] = set()
+        prof = getattr(cardinal, "tg_profile", None) or getattr(cardinal, "profile", None)
+
+        if prof and hasattr(prof, "get_sorted_lots"):
+            for mode in (2, 1, 0, 3):
+                try:
+                    all_map = prof.get_sorted_lots(mode) or {}
+                    cand_ids.update(_extract_ids_from_sorted_map(all_map))
+                except Exception:
+                    continue
+
+        for lot_id in sorted(cand_ids):
+            try:
+                fields = cardinal.account.get_lot_fields(int(lot_id))
+                if not fields:
+                    continue
+
+                sub = getattr(fields, "subcategory", None) or getattr(fields, "subcat", None)
+                cid = None
+
+                if sub is not None:
+                    for attr in ("id", "subcategory_id", "category_id"):
+                        if hasattr(sub, attr):
+                            cid = getattr(sub, attr)
+                            break
+
+                if cid is None:
+                    for attr in ("subcategory_id", "category_id"):
+                        if hasattr(fields, attr):
+                            cid = getattr(fields, attr)
+                            break
+
+                if cid is None:
+                    continue
+
+                if int(cid) == category_id:
+                    lots[int(lot_id)] = fields
+            except Exception:
+                continue
+
     except Exception as e:
         logger.warning(f"_get_my_lots_by_category failed: {e}")
+
     return lots
 
 def _is_stars_lot(cardinal: "Cardinal", lot_id: int) -> bool:
@@ -1304,20 +1417,17 @@ def _apply_star_lots_state(cardinal: "Cardinal", star_lots: List[dict], enabled:
 def _apply_category_state(cardinal: "Cardinal", category_id: int, enabled: bool) -> Dict[str, List[int]]:
     category_id = int(category_id or FNP_STARS_CATEGORY_ID)
     report = {"ok": [], "skip": [], "err": []}
+    lot_ids = _get_my_lot_ids_by_subcategory(cardinal, category_id)
+    logger.info(f"[CATEGORY] apply_state: subcategory={category_id} lots={len(lot_ids)} enabled={enabled}")
 
-    lots = _get_my_lots_by_category(cardinal, category_id)
-    for key, _ in (lots or {}).items():
+    for lot_id in lot_ids:
         try:
-            lot_id = int(getattr(key, "id", key))
             ok = _activate_lot(cardinal, lot_id) if enabled else _deactivate_lot(cardinal, lot_id)
-            (report["ok"] if ok else report["skip"]).append(lot_id)
+            (report["ok"] if ok else report["skip"]).append(int(lot_id))
         except Exception as e:
-            try:
-                bad_id = int(getattr(key, "id", 0) or 0)
-            except Exception:
-                bad_id = 0
-            report["err"].append(bad_id)
-            logger.warning(f"apply_category_state {key} failed: {e}")
+            report["err"].append(int(lot_id))
+            logger.warning(f"apply_category_state {lot_id} failed: {e}")
+
     return report
 
 def _event_chat_id(e) -> Any:
@@ -1465,6 +1575,7 @@ CBT_STAR_ACT_ALL  = f"{UUID}:star_act_all"
 CBT_STAR_DEACT_ALL= f"{UUID}:star_deact_all"
 CBT_STAR_TOGGLE_P = f"{UUID}:star_toggle:"
 CBT_STAR_DEL_P    = f"{UUID}:star_del:"
+CBT_STAR_AUTOADD   = f"{UUID}:star_autoadd"
 
 CBT_CONFIRM_SEND    = f"{UUID}:confirm_send"
 CBT_CHANGE_USERNAME = f"{UUID}:change_username"
@@ -1491,8 +1602,27 @@ CBT_TOGGLE_QUEUE_MODE = f"{UUID}:toggle_queue_mode"
 CBT_RESET_SETTINGS_ASK = f"{UUID}:reset_settings_ask"
 CBT_RESET_SETTINGS_YES = f"{UUID}:reset_settings_yes"
 CBT_RESET_SETTINGS_NO  = f"{UUID}:reset_settings_no"
+CBT_UNIT_PRICE         = f"{UUID}:unit_price"
+CBT_UNIT_PRICE_APPLY   = f"{UUID}:unit_price_apply"
+CBT_UNIT_PRICE_CHANGE  = f"{UUID}:unit_price_change"
 
 _fsm: dict[int, dict] = {}
+
+CLEAN_FSM_SENSITIVE = bool(int(os.getenv("FTS_Plugin_CLEAN_FSM_SENSITIVE", "1")))
+
+def _track_fsm_mid(state: dict, mid: Optional[int]) -> None:
+    if not CLEAN_FSM_SENSITIVE or not mid:
+        return
+    state.setdefault("cleanup_msg_ids", [])
+    state["cleanup_msg_ids"].append(int(mid))
+
+def _cleanup_fsm_msgs(bot, chat_id: Any, state: dict) -> None:
+    if not CLEAN_FSM_SENSITIVE:
+        return
+    ids = state.get("cleanup_msg_ids") or []
+    for mid in sorted(set(ids), reverse=True):
+        _safe_delete(bot, chat_id, mid)
+    state["cleanup_msg_ids"] = []
 
 def _home_kb() -> InlineKeyboardMarkup:
     kb = K()
@@ -1613,10 +1743,12 @@ def _stars_kb(chat_id: Any) -> InlineKeyboardMarkup:
             B("💰 Цена", callback_data=f"{CBT_STAR_PRICE_P}{lot_id}"),
             B("🗑", callback_data=f"{CBT_STAR_DEL_P}{lot_id}")
         )
+    kb.row(B("➕ Добавить лот", callback_data=CBT_STAR_ADD))
     kb.row(
-        B("➕ Добавить лот", callback_data=CBT_STAR_ADD),
+        B("⭐ Цена за 1⭐", callback_data=CBT_UNIT_PRICE),
         B("💹 Наценка", callback_data=CBT_MARKUP)
     )
+    kb.row(B(f"🤖 Автодобавление лотов (кат. {cfg.get('category_id', FNP_STARS_CATEGORY_ID)})", callback_data=CBT_STAR_AUTOADD))
     kb.row(B("♻️ Сбросить наценку", callback_data=CBT_MARKUP_RESET))
     kb.row(B("🔄 Обновить", callback_data=CBT_REFRESH))
     kb.row(
@@ -1752,8 +1884,9 @@ def _kb_cancel_fsm() -> InlineKeyboardMarkup:
 
 def _fsm_cancel(cardinal: "Cardinal", call):
     chat_id = call.message.chat.id
-    st = _fsm.pop(chat_id, None)
-    pmid = (st or {}).get("prompt_msg_id")
+    st = _fsm.pop(chat_id, None) or {}
+    _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, st)
+    pmid = st.get("prompt_msg_id")
     _safe_delete(cardinal.telegram.bot, chat_id, pmid)
     try:
         cardinal.telegram.bot.answer_callback_query(call.id, "Отменено.")
@@ -1797,7 +1930,7 @@ def _parse_order_info_from_text(text: str) -> tuple[Optional[int], Optional[str]
 def _validate_username(u: str) -> bool:
     if not u:
         return False
-    u = u.strip().lstrip('@')
+    u = _strip_invisible(u).strip().lstrip('@')
     return bool(_re.fullmatch(r"[A-Za-z0-9_]{5,32}", u))
 
 def _funpay_is_system_paid_message(text: str) -> bool:
@@ -2143,6 +2276,225 @@ def _get_lot_price_currency(cardinal: "Cardinal", lot_id: int) -> tuple[Optional
     except Exception:
         return None, "RUB"
 
+def _collect_unit_price_targets(cardinal: "Cardinal", cfg: dict, unit_price: float) -> tuple[List[dict], int]:
+    rows: List[dict] = []
+    skipped = 0
+
+    star_lots = cfg.get("star_lots") or []
+    if star_lots:
+        lot_ids = []
+        qty_map: Dict[int, Optional[int]] = {}
+        for it in star_lots:
+            try:
+                lid = int(it.get("lot_id"))
+                lot_ids.append(lid)
+                qty_map[lid] = int(it.get("qty")) if it.get("qty") else None
+            except Exception:
+                continue
+    else:
+        lot_ids = list(_get_my_lots_by_category(cardinal, FNP_STARS_CATEGORY_ID).keys())
+        qty_map = {}
+
+    seen = set()
+    for lot_id in lot_ids:
+        if lot_id in seen:
+            continue
+        seen.add(lot_id)
+
+        try:
+            if not _is_stars_lot(cardinal, int(lot_id)):
+                skipped += 1
+                continue
+
+            fields = cardinal.account.get_lot_fields(int(lot_id))
+            if not fields:
+                skipped += 1
+                continue
+
+            title = getattr(fields, "title", None) or getattr(fields, "name", None) or ""
+
+            old_price = None
+            for price_attr in ("price", "cost", "amount", "price_rub"):
+                if hasattr(fields, price_attr):
+                    try:
+                        old_price = float(getattr(fields, price_attr))
+                        break
+                    except Exception:
+                        pass
+            if old_price is None:
+                skipped += 1
+                continue
+
+            currency = getattr(fields, "currency", None) or getattr(fields, "cur", None) or "RUB"
+
+            qty = qty_map.get(int(lot_id))
+            if qty is None:
+                q = _extract_qty_from_title(title)
+                qty = int(q) if q else None
+
+            if not qty or int(qty) <= 0:
+                skipped += 1
+                continue
+
+            new_price = float(unit_price) * float(qty)
+
+            curr_name = getattr(currency, "name", str(currency)).upper()
+            if curr_name in ("RUB", "RUR", "₽"):
+                new_price = float(int(round(new_price)))
+            else:
+                new_price = round(new_price, 2)
+
+            rows.append({
+                "lot_id": int(lot_id),
+                "title": title,
+                "qty": int(qty),
+                "currency": currency,
+                "old_price": float(old_price),
+                "new_price": float(new_price),
+                "diff": round(float(new_price) - float(old_price), 2),
+            })
+        except Exception:
+            skipped += 1
+            continue
+
+    return rows, skipped
+
+def _unit_price_preview_text(unit_price: float, rows: List[dict], skipped: int) -> str:
+    lines = [f"<b>Цена за 1⭐: {unit_price}</b>", ""]
+    if not rows:
+        lines.append("Лотов для пересчёта не найдено.")
+        if skipped:
+            lines.append(f"Пропущено: <b>{skipped}</b>")
+        return "\n".join(lines)
+
+    lines.append("<b>Предпросмотр (первые 20):</b>")
+    lines.append("")
+
+    currencies = {getattr(r["currency"], "name", str(r["currency"])) for r in rows}
+    can_total = (len(currencies) == 1)
+
+    total_old = 0.0
+    total_new = 0.0
+
+    for r in rows[:20]:
+        lot_id = r["lot_id"]
+        qty = r.get("qty")
+        cur = r.get("currency")
+        oldp = r["old_price"]
+        newp = r["new_price"]
+        diff = r["diff"]
+
+        if can_total:
+            total_old += float(oldp)
+            total_new += float(newp)
+
+        lines.append(
+            f"• LOT <code>{lot_id}</code> — <b>{qty}⭐</b>: "
+            f"{_format_currency(oldp, cur)} → <b>{_format_currency(newp, cur)}</b> "
+            f"({('+' if diff >= 0 else '')}{_format_currency(diff, cur)})"
+        )
+
+    more = len(rows) - 20
+    if more > 0:
+        lines.append(f"… и ещё {more} лот(ов)")
+
+    if skipped:
+        lines.append("")
+        lines.append(f"Пропущено: <b>{skipped}</b> (нет qty/цены или не звёздная категория)")
+
+    if can_total and rows:
+        lines.append("")
+        lines.append(
+            f"Итого: {_format_currency(total_old, rows[0]['currency'])} → "
+            f"<b>{_format_currency(total_new, rows[0]['currency'])}</b>"
+        )
+
+    lines.append("")
+    lines.append("Применить новые цены ко всем лотам по цене за 1⭐?")
+    return "\n".join(lines)
+
+def _kb_unit_price_preview() -> InlineKeyboardMarkup:
+    kb = K()
+    kb.row(
+        B("✅ Применить", callback_data=CBT_UNIT_PRICE_APPLY),
+        B("✏️ Изменить цену 1⭐", callback_data=CBT_UNIT_PRICE_CHANGE),
+    )
+    kb.add(B("❌ Отмена", callback_data=CBT_FSM_CANCEL))
+    return kb
+
+def _start_unit_price(bot, call):
+    chat_id = call.message.chat.id
+    _fsm[chat_id] = {"step": "unit_star_price_value"}
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    cur = _get_cfg(chat_id).get("unit_star_price")
+    cur_txt = f"{cur}" if isinstance(cur, (int, float)) else "—"
+
+    m = bot.send_message(
+        chat_id,
+        f"Введите <b>цену за 1⭐</b> (число). Сейчас: <b>{cur_txt}</b>\n"
+        "Пример: 1.25\n(или /cancel)",
+        parse_mode="HTML",
+        reply_markup=_kb_cancel_fsm()
+    )
+    st = _fsm.get(chat_id) or {}
+    st["prompt_msg_id"] = getattr(m, "message_id", None)
+    _fsm[chat_id] = st
+
+def _cb_unit_price_change(cardinal: "Cardinal", call):
+    chat_id = call.message.chat.id
+    try:
+        cardinal.telegram.bot.answer_callback_query(call.id, "Введите новую цену за 1⭐ сообщением ниже.")
+    except Exception:
+        pass
+
+    st = _fsm.get(chat_id) or {}
+    st["step"] = "unit_star_price_value"
+    _fsm[chat_id] = st
+
+    m = cardinal.telegram.bot.send_message(
+        chat_id,
+        "Введите новую цену за 1⭐ (или /cancel):",
+        reply_markup=_kb_cancel_fsm()
+    )
+    st["prompt_msg_id"] = getattr(m, "message_id", None)
+    _fsm[chat_id] = st
+
+def _cb_unit_price_apply(cardinal: "Cardinal", call):
+    chat_id = call.message.chat.id
+    try:
+        cardinal.telegram.bot.answer_callback_query(call.id, "Применяю…")
+    except Exception:
+        pass
+
+    st = _fsm.get(chat_id) or {}
+    rows = st.get("unit_rows")
+    unit_price = st.get("unit_price")
+    if not rows or unit_price is None:
+        cardinal.telegram.bot.send_message(chat_id, "⚠️ Нет данных для применения. Запустите заново через «⭐ Цена за 1⭐».")
+        return
+
+    rep = _apply_markup_prices(cardinal, rows)
+    okn = len(rep["ok"])
+    ern = len(rep["err"])
+    total = len(rows)
+
+    _set_cfg(chat_id, unit_star_price=float(unit_price))
+
+    msg = f"✅ Готово: обновлено {okn} из {total} лот(ов) по цене 1⭐={unit_price}."
+    if ern:
+        msg += f"\n⚠️ Ошибок: {ern}. См. логи."
+    cardinal.telegram.bot.send_message(chat_id, msg)
+
+    _fsm.pop(chat_id, None)
+    try:
+        _open_stars(cardinal.telegram.bot, call)
+    except Exception:
+        pass
+
 def _start_markup(bot, call):
     chat_id = call.message.chat.id
     _fsm[chat_id] = {"step": "markup_percent"}
@@ -2237,6 +2589,7 @@ def init_cardinal(cardinal: Cardinal):
         "set_min_balance",
         "star_add_qty", "star_add_lotid",
         "msg_edit_value",
+        "unit_star_price_value",
         "markup_percent",
         "set_jwt",
         "star_price_value",
@@ -2250,9 +2603,7 @@ def init_cardinal(cardinal: Cardinal):
         content_types=["text", "document"]
     )
 
-    tg.cbq_handler(
-        lambda c: _open_home(bot, c),
-        func=lambda c: (
+    tg.cbq_handler(lambda c: _open_home(bot, c), func=lambda c: (
             c.data.startswith(f"{CBT.EDIT_PLUGIN}:{UUID}")
             or c.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}")
             or c.data == f"{UUID}:0"
@@ -2287,6 +2638,7 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _star_deact_all(bot, c),   func=lambda c: c.data == CBT_STAR_DEACT_ALL)
     tg.cbq_handler(lambda c: _star_toggle(bot, c),      func=lambda c: c.data.startswith(CBT_STAR_TOGGLE_P))
     tg.cbq_handler(lambda c: _star_delete(bot, c),      func=lambda c: c.data.startswith(CBT_STAR_DEL_P))
+    tg.cbq_handler(lambda c: _cb_star_autoadd(cardinal, c), func=lambda c: c.data == CBT_STAR_AUTOADD)
 
     tg.cbq_handler(lambda c: _cb_confirm_send(cardinal, c),    func=lambda c: c.data == CBT_CONFIRM_SEND)
     tg.cbq_handler(lambda c: _cb_change_username(cardinal, c), func=lambda c: c.data == CBT_CHANGE_USERNAME)
@@ -2326,6 +2678,9 @@ def init_cardinal(cardinal: Cardinal):
     tg.cbq_handler(lambda c: _open_reset_settings_confirm(bot, c), func=lambda c: c.data == CBT_RESET_SETTINGS_ASK)
     tg.cbq_handler(lambda c: _cb_reset_settings_yes(cardinal, c),  func=lambda c: c.data == CBT_RESET_SETTINGS_YES)
     tg.cbq_handler(lambda c: _cb_reset_settings_no(bot, c),        func=lambda c: c.data == CBT_RESET_SETTINGS_NO)
+    tg.cbq_handler(lambda c: _start_unit_price(bot, c),        func=lambda c: c.data == CBT_UNIT_PRICE)
+    tg.cbq_handler(lambda c: _cb_unit_price_apply(cardinal, c), func=lambda c: c.data == CBT_UNIT_PRICE_APPLY)
+    tg.cbq_handler(lambda c: _cb_unit_price_change(cardinal, c),func=lambda c: c.data == CBT_UNIT_PRICE_CHANGE)
 
 def _open_home(bot, call):
     _safe_edit(bot, call.message.chat.id, call.message.id, _about_text(), _home_kb())
@@ -2464,7 +2819,7 @@ def _open_stars(bot, call):
 
 def _send_logs(bot, call):
     chat_id = call.message.chat.id
-    path = os.getenv("FTS_RAW_LOG_FILE") or os.path.join(PLUGIN_FOLDER, "lot.txt")
+    path = os.getenv("FTS_RAW_LOG_FILE") or os.path.join(PLUGIN_FOLDER, "log.txt")
     try:
 
         if not os.path.exists(path):
@@ -2472,7 +2827,7 @@ def _send_logs(bot, call):
                 pass
 
         with open(path, "rb") as f:
-            bot.send_document(chat_id, ("lot.txt", f.read()), caption="Логи FTS-Plugin")
+            bot.send_document(chat_id, ("log.txt", f.read()), caption="Логи FTS-Plugin")
 
         try:
             bot.answer_callback_query(call.id)
@@ -2701,6 +3056,212 @@ def _star_delete(bot, call):
     _set_cfg(chat_id, star_lots=items)
     _open_stars(bot, call)
 
+_MAINT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("FTS_MAINT_WORKERS", "1")),
+    thread_name_prefix="FTS-MAINT"
+)
+_MAINT_JOBS: dict[str, Any] = {}
+_MAINT_JOBS_LOCK = threading.Lock()
+
+def _schedule_maint_job(key: str, fn, *args, **kwargs) -> bool:
+    with _MAINT_JOBS_LOCK:
+        old = _MAINT_JOBS.get(key)
+        if old is not None and not old.done():
+            return False
+
+        fut = _MAINT_EXECUTOR.submit(fn, *args, **kwargs)
+        _MAINT_JOBS[key] = fut
+
+        def _cleanup(_f):
+            with _MAINT_JOBS_LOCK:
+                cur = _MAINT_JOBS.get(key)
+                if cur is _f:
+                    _MAINT_JOBS.pop(key, None)
+
+        fut.add_done_callback(_cleanup)
+        return True
+
+def _autoadd_report_text(rep: dict) -> str:
+    lines = []
+    lines.append("<b>🤖 Автодобавление лотов</b>")
+    lines.append("")
+    lines.append(f"Категория: <code>{_h(rep.get('category_id'))}</code>")
+    lines.append(f"Найдено лотов в категории: <b>{_h(rep.get('found', 0))}</b>")
+    lines.append(f"Добавлено: <b>{_h(rep.get('added', 0))}</b>")
+    lines.append(f"Обновлено: <b>{_h(rep.get('updated', 0))}</b>")
+    lines.append(f"Без изменений: <b>{_h(rep.get('unchanged', 0))}</b>")
+    lines.append(f"Пропущено: <b>{_h(rep.get('skipped', 0))}</b>")
+    try:
+        lines.append(f"Время: <code>{float(rep.get('elapsed_sec', 0)):.2f}s</code>")
+    except Exception:
+        lines.append(f"Время: <code>{_h(rep.get('elapsed_sec', 0))}s</code>")
+
+    preview = rep.get("preview") or []
+    if preview:
+        lines.append("")
+        lines.append("<b>Что получилось (первые 25):</b>")
+        for row in preview[:25]:
+            qty, lot_id, active, status = row
+            st = "🟢 ON" if active else "🔴 OFF"
+            lines.append(
+                f"• <b>{_h(qty)}</b>⭐ — LOT <code>{_h(lot_id)}</code> — {st} — <i>{_h(status)}</i>"
+            )
+
+        more = rep.get("preview_more", 0)
+        if more:
+            lines.append(f"… и ещё {_h(more)} лот(ов)")
+
+    return "\n".join(lines)
+
+def _autoadd_star_lots(cardinal: "Cardinal", chat_id: Any, category_id: int) -> dict:
+    t0 = time.time()
+    category_id = int(category_id)
+
+    logger.info(f"[AUTOADD] start: chat_id={chat_id} category_id={category_id}")
+
+    cfg = _get_cfg(chat_id)
+    existing_list = cfg.get("star_lots") or []
+    existing_map: Dict[int, dict] = {}
+
+    for it in existing_list:
+        try:
+            lid = int(it.get("lot_id"))
+            existing_map[lid] = {
+                "lot_id": lid,
+                "qty": int(it.get("qty") or 0) if it.get("qty") is not None else None,
+                "active": bool(it.get("active", False)),
+            }
+        except Exception:
+            continue
+
+    lots = _get_my_subcategory_lots_safe(cardinal, category_id)
+    logger.info(f"[AUTOADD] found lots in subcategory {category_id}: {len(lots)}")
+
+    added = updated = unchanged = skipped = errors = 0
+    preview_rows = []
+
+    for lot in lots:
+        try:
+            lot_id = getattr(lot, "id", None)
+            if lot_id is None:
+                skipped += 1
+                continue
+            lot_id = int(lot_id)
+
+            title = (getattr(lot, "title", None) or getattr(lot, "name", None) or "").strip()
+            active_now = bool(getattr(lot, "active", True))
+
+            qty = _extract_qty_from_title(title)
+            if qty is None:
+                skipped += 1
+                logger.info(f"[AUTOADD] skip lot={lot_id}: qty_not_found title={title!r}")
+                continue
+
+            qty = int(qty)
+            if qty < FTS_MIN_STARS:
+                skipped += 1
+
+                existing_map.pop(lot_id, None)
+
+                preview_rows.append((qty, lot_id, active_now, f"пропущен (меньше {FTS_MIN_STARS}⭐)"))
+                logger.info(f"[AUTOADD] skip lot={lot_id}: qty<{FTS_MIN_STARS} qty={qty} title={title!r}")
+                continue
+
+            if lot_id not in existing_map:
+                existing_map[lot_id] = {"lot_id": lot_id, "qty": qty, "active": active_now}
+                added += 1
+                preview_rows.append((qty, lot_id, active_now, "добавлен"))
+                logger.info(f"[AUTOADD] add: lot={lot_id} qty={qty} active={active_now} title={title!r}")
+            else:
+                cur = existing_map[lot_id]
+                before_qty = int(cur.get("qty") or 0)
+                before_active = bool(cur.get("active", False))
+
+                if before_qty == qty and before_active == active_now:
+                    unchanged += 1
+                    preview_rows.append((qty, lot_id, active_now, "без изменений"))
+                else:
+                    cur["qty"] = qty
+                    cur["active"] = active_now
+                    updated += 1
+                    preview_rows.append((qty, lot_id, active_now, "обновлён"))
+                    logger.info(
+                        f"[AUTOADD] update: lot={lot_id} qty {before_qty}->{qty} active {before_active}->{active_now} title={title!r}"
+                    )
+
+        except Exception as e:
+            errors += 1
+            logger.warning(f"[AUTOADD] error lot={getattr(lot,'id',None)}: {e}")
+
+    out_list = sorted(
+        [
+            v for v in existing_map.values()
+            if isinstance(v, dict)
+            and v.get("lot_id")
+            and int(v.get("qty") or 0) >= FTS_MIN_STARS
+        ],
+        key=lambda x: (int(x.get("qty") or 0), int(x.get("lot_id") or 0))
+    )
+
+    _set_cfg(chat_id, star_lots=out_list)
+
+    elapsed = time.time() - t0
+    logger.info(
+        f"[AUTOADD] done: chat_id={chat_id} category_id={category_id} "
+        f"found={len(lots)} added={added} updated={updated} unchanged={unchanged} "
+        f"skipped={skipped} errors={errors} elapsed={elapsed:.2f}s"
+    )
+
+    preview_sorted = sorted(preview_rows, key=lambda r: (int(r[0]), int(r[1])))
+    return {
+        "category_id": category_id,
+        "found": len(lots),
+        "added": added,
+        "updated": updated,
+        "unchanged": unchanged,
+        "skipped": skipped,
+        "errors": errors,
+        "elapsed_sec": elapsed,
+        "preview": preview_sorted[:25],
+        "preview_more": max(0, len(preview_sorted) - 25),
+    }
+
+def _cb_star_autoadd(cardinal: "Cardinal", call):
+    bot = cardinal.telegram.bot
+    chat_id = call.message.chat.id
+
+    try:
+        bot.answer_callback_query(call.id, "Запускаю автоскан…")
+    except Exception:
+        pass
+
+    job_key = f"autoadd:{chat_id}"
+
+    def _run():
+        try:
+            bot.send_message(chat_id, f"🔎 Сканирую лоты категории <code>{FNP_STARS_CATEGORY_ID}</code>…", parse_mode="HTML")
+        except Exception:
+            pass
+
+        rep = _autoadd_star_lots(cardinal, chat_id, FNP_STARS_CATEGORY_ID)
+
+        try:
+            bot.send_message(chat_id, _autoadd_report_text(rep), parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as e:
+            logger.warning(f"[AUTOADD] send report failed: {e}")
+
+        try:
+            _safe_edit(bot, chat_id, call.message.id, _stars_text(chat_id), _stars_kb(chat_id))
+        except Exception:
+            pass
+
+    ok = _schedule_maint_job(job_key, _run)
+    if not ok:
+        try:
+            bot.answer_callback_query(call.id, "Уже выполняется автоскан. Подожди завершения.", show_alert=True)
+        except Exception:
+            pass
+
 def _toggle_liteserver_retry(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -2840,6 +3401,9 @@ def _ask_set_min_balance(bot, call):
     bot.send_message(chat_id, f"Введите новый порог баланса в TON (сейчас {cur}). Можно с точкой или запятой. Пример: 5.5\n(или /cancel)", reply_markup=_kb_cancel_fsm())
 
 def _cancel_cmd(cardinal: "Cardinal", chat_id: Any):
+    st = _fsm.get(chat_id) or {}
+    if st.get("step") in {"jwt_api_key", "jwt_phone", "jwt_wallet_ver", "jwt_seed", "set_jwt"}:
+        _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, st)
     _fsm.pop(chat_id, None)
     if _has_queue(chat_id):
         _pop_current(chat_id, keep_prompted=False)
@@ -2863,7 +3427,9 @@ def _select_wallet_version(bot, call):
     _fsm[chat_id] = st
     try: bot.answer_callback_query(call.id, f"Версия выбрана: {ver}")
     except Exception: pass
-    bot.send_message(chat_id, "Введите 24 слова мнемофразы одной строкой (или /cancel):")
+    m = bot.send_message(chat_id, "Введите 24 слова мнемофразы одной строкой (или /cancel):")
+    _track_fsm_mid(st, getattr(m, "message_id", None))
+    _fsm[chat_id] = st
 
 def _star_price_start(bot, call):
     chat_id = call.message.chat.id
@@ -2901,15 +3467,21 @@ CLEAN_USER_MSGS = bool(int(os.getenv("FTS_Plugin_CLEAN_USER_MSGS", "0")))
 
 def _ask_set_jwt(bot, call):
     chat_id = call.message.chat.id
-    _fsm[chat_id] = {"step": "set_jwt"}
+    st = {"step": "set_jwt"}
+    _fsm[chat_id] = st
+
     try: bot.answer_callback_query(call.id)
     except Exception: pass
-    bot.send_message(
+
+    m = bot.send_message(
         chat_id,
         "Пришлите файлом (.txt / .json). "
         "В JSON токен может лежать в ключах token/jwt/access/authorization. (или /cancel)",
         reply_markup=_kb_cancel_fsm()
     )
+    st = _fsm.get(chat_id) or st
+    _track_fsm_mid(st, getattr(m, "message_id", None))
+    _fsm[chat_id] = st
 
 def _del_jwt(bot, call):
     chat_id = call.message.chat.id
@@ -2920,10 +3492,20 @@ def _del_jwt(bot, call):
 
 def _start_create_jwt(bot, call):
     chat_id = call.message.chat.id
-    _fsm[chat_id] = {"step": "jwt_api_key"}
+    st = {"step": "jwt_api_key"}
+    _fsm[chat_id] = st
+
     try: bot.answer_callback_query(call.id)
     except Exception: pass
-    bot.send_message(chat_id, "Введите API-ключ Fragment (или /cancel). Его можно взять в dashboard: https://fragment-api.com/dashboard", reply_markup=_kb_cancel_fsm())
+
+    m = bot.send_message(
+        chat_id,
+        "Введите API-ключ Fragment (или /cancel). Его можно взять в dashboard: https://fragment-api.com/dashboard",
+        reply_markup=_kb_cancel_fsm()
+    )
+    st = _fsm.get(chat_id) or st
+    _track_fsm_mid(st, getattr(m, "message_id", None))
+    _fsm[chat_id] = st
 
 def _clean_jwt_text(s: str) -> str:
     try:
@@ -2967,18 +3549,27 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
     chat_id = message.chat.id
     text = (message.text or "").strip()
     state = _fsm.get(chat_id) or {}
+    if state.get("step") in {"jwt_api_key", "jwt_phone", "jwt_wallet_ver", "jwt_seed", "set_jwt"}:
+        _track_fsm_mid(state, getattr(message, "message_id", None))
 
     if state.get("step") == "jwt_api_key":
         if text.lower() in ("/cancel", "cancel", "отмена"):
-            _fsm.pop(chat_id, None); cardinal.telegram.bot.send_message(chat_id, "❌ Отменено."); return
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+            return
+
         state["api_key"] = text
         state["step"] = "jwt_phone"
         _fsm[chat_id] = state
-        cardinal.telegram.bot.send_message(
+
+        m = cardinal.telegram.bot.send_message(
             chat_id,
             "Укажите телефон (без «+», только цифры), или /cancel:",
             reply_markup=_kb_cancel_fsm()
         )
+        _track_fsm_mid(state, getattr(m, "message_id", None))
+        _fsm[chat_id] = state
         return
     
     if state.get("step") == "msg_edit_value":
@@ -3021,21 +3612,54 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
 
     if state.get("step") == "jwt_phone":
         if text.lower() in ("/cancel", "cancel", "отмена"):
-            _fsm.pop(chat_id, None); cardinal.telegram.bot.send_message(chat_id, "❌ Отменено."); return
-        state["phone"] = text; state["step"] = "jwt_wallet_ver"; _fsm[chat_id] = state
-        kb = K(); kb.row(B("W5 (V5R1)", callback_data=f"{UUID}:ver:W5"), B("V4R2", callback_data=f"{UUID}:ver:V4R2"))
-        cardinal.telegram.bot.send_message(chat_id, "Укажите версию кошелька (W5 или V4R2). Можно нажать кнопку или ввести текстом. По умолчанию W5.", reply_markup=kb); return
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+            return
+
+        state["phone"] = text
+        state["step"] = "jwt_wallet_ver"
+        _fsm[chat_id] = state
+
+        kb = K()
+        kb.row(B("W5 (V5R1)", callback_data=f"{UUID}:ver:W5"), B("V4R2", callback_data=f"{UUID}:ver:V4R2"))
+
+        m = cardinal.telegram.bot.send_message(
+            chat_id,
+            "Укажите версию кошелька (W5 или V4R2). Можно нажать кнопку или ввести текстом. По умолчанию W5.",
+            reply_markup=kb
+        )
+        _track_fsm_mid(state, getattr(m, "message_id", None))
+        _fsm[chat_id] = state
+        return
 
     if state.get("step") == "jwt_wallet_ver":
         if text.lower() in ("/cancel", "cancel", "отмена"):
-            _fsm.pop(chat_id, None); cardinal.telegram.bot.send_message(chat_id, "❌ Отменено."); return
-        ver = _normalize_wallet_version(text); state["wallet_version"] = ver; state["step"] = "jwt_seed"; _fsm[chat_id] = state
-        cardinal.telegram.bot.send_message(chat_id, "Вставьте 24 слова мнемофразы одной строкой (или /cancel):", reply_markup=_kb_cancel_fsm())
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+            return
+
+        ver = _normalize_wallet_version(text)
+        state["wallet_version"] = ver
+        state["step"] = "jwt_seed"
+        _fsm[chat_id] = state
+
+        m = cardinal.telegram.bot.send_message(
+            chat_id,
+            "Вставьте 24 слова мнемофразы одной строкой (или /cancel):",
+            reply_markup=_kb_cancel_fsm()
+        )
+        _track_fsm_mid(state, getattr(m, "message_id", None))
+        _fsm[chat_id] = state
         return
 
     if state.get("step") == "jwt_seed":
         if text.lower() in ("/cancel", "cancel", "отмена"):
-            _fsm.pop(chat_id, None); cardinal.telegram.bot.send_message(chat_id, "❌ Отменено."); return
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+            return
 
         words = [w.strip() for w in text.replace("\n", " ").split(" ") if w.strip()]
         if len(words) != 24:
@@ -3050,13 +3674,15 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
 
         jwt, raw, sc = _authenticate_fragment(api_key=api_key, phone_number=phone, version=wallet_ver, mnemonics=words)
         if jwt:
-                _set_cfg(chat_id, fragment_jwt=jwt)
-                cardinal.telegram.bot.send_message(chat_id, "✅ Успешно: токен создан и привязан.")
-                ver, bal, resp = _check_fragment_wallet(jwt)
-                if ver is not None or bal is not None or resp is not None:
-                    _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
-                _fsm.pop(chat_id, None)
-                return
+            _set_cfg(chat_id, fragment_jwt=jwt)
+            cardinal.telegram.bot.send_message(chat_id, "✅ Успешно: токен создан и привязан.")
+            ver, bal, resp = _check_fragment_wallet(jwt)
+            if ver is not None or bal is not None or resp is not None:
+                _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+
+            _fsm.pop(chat_id, None)
+            return
         
         human = _human_auth_error(raw, sc)
         cardinal.telegram.bot.send_message(chat_id, f"❌ Не удалось создать токен. {human}")
@@ -3070,11 +3696,10 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
                     ver, bal, resp = _check_fragment_wallet(jwt)
                     if ver is not None or bal is not None or resp is not None:
                         _set_cfg(chat_id, wallet_version=ver, balance_ton=(round(bal, 6) if isinstance(bal, (int, float)) else None), last_wallet_raw=resp)
+                    _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+
                     _fsm.pop(chat_id, None)
                     return
-                human2 = _human_auth_error(raw, sc)
-                cardinal.telegram.bot.send_message(chat_id, f"❌ Повтор не удался. {human2}")
-                return
         else:
             human = _human_auth_error(raw, sc)
             if sc == 400:
@@ -3087,6 +3712,46 @@ def _handle_fsm(message: Message, cardinal: Cardinal):
             except Exception:
                 text = str(raw)[:1900]
             cardinal.telegram.bot.send_message(chat_id, f"Ответ сервера:\n<code>{text}</code>", parse_mode="HTML")
+
+    if state.get("step") == "unit_star_price_value":
+            pmid = (_fsm.get(chat_id) or {}).get("prompt_msg_id")
+            if text.lower() in ("/cancel", "cancel", "отмена"):
+                _safe_delete(cardinal.telegram.bot, chat_id, pmid)
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+                _fsm.pop(chat_id, None)
+                m_cancel = cardinal.telegram.bot.send_message(chat_id, "❌ Отменено.")
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(m_cancel, "message_id", None))
+                return
+
+            t = text.replace(",", ".").strip()
+            try:
+                unit_price = float(t)
+                if unit_price <= 0:
+                    raise ValueError
+            except Exception:
+                _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+                cardinal.telegram.bot.send_message(chat_id, "⚠️ Введите положительное число. Пример: 1.25")
+                return
+
+            _safe_delete(cardinal.telegram.bot, chat_id, pmid)
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, "message_id", None))
+
+            cfg = _get_cfg(chat_id)
+            if _CARDINAL_REF is None:
+                cardinal.telegram.bot.send_message(chat_id, "⚠️ Внутренняя ошибка: нет ссылки на Cardinal.")
+                return
+
+            rows, skipped = _collect_unit_price_targets(_CARDINAL_REF, cfg, unit_price)
+            preview = _unit_price_preview_text(unit_price, rows, skipped)
+
+            st = _fsm.get(chat_id) or {}
+            st["unit_price"] = unit_price
+            st["unit_rows"] = rows
+            st["step"] = "unit_price_preview"
+            _fsm[chat_id] = st
+
+            cardinal.telegram.bot.send_message(chat_id, preview, parse_mode="HTML", reply_markup=_kb_unit_price_preview())
+            return
 
     if state.get("step") == "markup_percent":
         pmid = (_fsm.get(chat_id) or {}).get("prompt_msg_id")
@@ -3916,19 +4581,19 @@ def new_order_handler(cardinal: Cardinal, event):
             _log("info", f"[IGNORE] gift/account-login order ignored (#{order_id})")
             return
 
-        if qty is not None and qty < 50:
-            try:
-                _safe_send(
-                    cardinal,
-                    chat_id,
-                    "Извините, временно появилась ошибка при обработке заказа. "
-                    "Заказы с количеством звёзд меньше 50⭐ обрабатываются вручную. "
-                    "Мы временно отключили лоты и свяжемся с вами."
-                )
-            except Exception:
-                pass
-            cfg_local = _get_cfg_for_orders(chat_id if chat_id is not None else "__orders__")
-            _deactivate_all_star_lots(cardinal, cfg_local, chat_id, reason="невалидный заказ (<50⭐)")
+        if qty is not None and qty < FTS_MIN_STARS:
+            _safe_send(
+                cardinal,
+                chat_id,
+                f"⚠️ Заказ на {qty}⭐ меньше минимального для авто-обработки ({FTS_MIN_STARS}⭐). "
+                "Напишите продавцу или дождитесь ручной обработки."
+            )
+            if cfg.get("auto_refund", False) and order_id:
+                _safe_send(cardinal, chat_id, "🔁 Пытаюсь оформить возврат…")
+                ok_ref = _auto_refund_order(cardinal, order_id, chat_id, reason=f"qty<{FTS_MIN_STARS}")
+                _log("info" if ok_ref else "error", f"REFUND #{order_id} -> {'OK' if ok_ref else 'FAIL'}")
+            if order_id:
+                _finalize_order(str(order_id), chat_id, ok=False, reason=f"qty<{FTS_MIN_STARS}")
             return
 
         item = _ensure_pending(chat_id, order_id, qty if qty is not None else 50)
@@ -4447,8 +5112,23 @@ def _find_order_for_back(chat_id: Any, order_id: Optional[str]) -> Optional[dict
 def _list_pending_oids(chat_id: Any) -> List[str]:
     return [str(x.get("order_id")) for x in _q(chat_id) if _allowed_stages(x) and x.get("order_id")]
 
+_INVIS_RE = _re.compile(
+    r"[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u00AD\u034F\u061C\u180E\uFE00-\uFE0F]",
+    _re.UNICODE
+)
+
+def _strip_invisible(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s)
+    s = s.replace("＋", "+")
+    s = s.replace("\u00A0", " ")
+    s = _INVIS_RE.sub("", s)
+    return s
+
 def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
     chat_id = _event_chat_id(event)
+    allowed_oids: set[str] = set()
     for _ in range(3):
         if not _maybe_rotate_queue_head(cardinal, chat_id if chat_id is not None else "__orders__"):
             break
@@ -4457,7 +5137,17 @@ def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
         author  = (getattr(event.message, "author", "") or "").lower()
 
         chat_id = _event_chat_id(event)
-        text = (event.message.text or "").strip()
+        text = _strip_invisible(event.message.text or "").strip()
+        try:
+            if chat_id is not None:
+                for it in _q(chat_id):
+                    oid = it.get("order_id")
+                    if oid and _allowed_stages(it):
+                        allowed_oids.add(str(oid))
+        except Exception:
+            allowed_oids = set()
+
+        text = _strip_invisible(event.message.text or "").strip()
 
         if _is_auto_reply(event.message):
             try:
