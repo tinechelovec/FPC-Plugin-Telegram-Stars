@@ -138,8 +138,16 @@ def _schedule_job(key, fn, *args, **kwargs):
         fut.add_done_callback(_cleanup)
         return True
 def _schedule_confirm_send(cardinal, chat_id, oid=None, *, notify_busy=True):
-    job_key = f"send:{chat_id}:{oid or 'cur'}"
+    requested_oid = oid
+    try:
+        active = _active_item_for_chat(chat_id)
+        if not requested_oid and active:
+            requested_oid = active.get('order_id')
+    except Exception:
+        requested_oid = oid
+    job_key = f"send_oid:{requested_oid}" if requested_oid else f"send:{chat_id}:cur"
     def _run():
+        _set_sending(chat_id, True)
         try:
             if oid:
                 _do_confirm_send_for_oid(cardinal, chat_id, oid)
@@ -147,6 +155,8 @@ def _schedule_confirm_send(cardinal, chat_id, oid=None, *, notify_busy=True):
                 _do_confirm_send(cardinal, chat_id)
         except Exception as e:
             logger.exception(f'background send failed: {e}')
+        finally:
+            _set_sending(chat_id, False)
     return _schedule_job(job_key, _run)
 def _log(level, msg):
     if level == 'info':
@@ -184,7 +194,7 @@ def _order_log(level, action, oid=None, chat_id=None, qty=None, username=None, *
 def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
 NAME = 'FTS-Plugin'
-VERSION = '1.7.2'
+VERSION = '1.7.3'
 DESCRIPTION = 'Плагин по продаже звезд.'
 CREDITS = _s64('QHRpbmVjaGVsb3ZlYw==')
 UUID = _s64('ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1')
@@ -495,10 +505,10 @@ def _sanitize_cfg(raw, chat_id=None):
     cfg['autodump_notifications'] = _cfg_bool(cfg, 'autodump_notifications', True)
     cfg['balance_lot_filter_enabled'] = _cfg_bool(cfg, 'balance_lot_filter_enabled', True)
     cfg['balance_lot_filter_notifications'] = _cfg_bool(cfg, 'balance_lot_filter_notifications', True)
-    cfg['order_watch_enabled'] = _cfg_bool(cfg, 'order_watch_enabled', True)
+    cfg['order_watch_enabled'] = _cfg_bool(cfg, 'order_watch_enabled', False)
     cfg['order_watch_interval_sec'] = _as_int(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT), ORDER_WATCH_INTERVAL_DEFAULT, 60, 86400)
     cfg['order_wait_reminder_sec'] = _as_int(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT), ORDER_WAIT_REMINDER_DEFAULT, 120, 86400)
-    cfg['order_review_reminder_enabled'] = _cfg_bool(cfg, 'order_review_reminder_enabled', True)
+    cfg['order_review_reminder_enabled'] = _cfg_bool(cfg, 'order_review_reminder_enabled', False)
     cfg['order_review_reminder_sec'] = _as_int(cfg.get('order_review_reminder_sec', ORDER_REVIEW_REMINDER_DEFAULT), ORDER_REVIEW_REMINDER_DEFAULT, 300, 604800)
     cfg['order_records'] = _sanitize_order_records(cfg.get('order_records'))
     cfg['config_version'] = SETTINGS_SCHEMA_VERSION
@@ -1815,7 +1825,7 @@ def _mini_settings_text(chat_id):
     watch_every = _fmt_minutes_from_sec(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT))
     wait_after = _fmt_minutes_from_sec(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT))
     review_after = _fmt_minutes_from_sec(cfg.get('order_review_reminder_sec', ORDER_REVIEW_REMINDER_DEFAULT))
-    order_summary = f"{_state_on(cfg.get('order_watch_enabled', True))}, проверка {watch_every}, ожидание {wait_after}, отзыв {review_after}"
+    order_summary = f"{_state_on(cfg.get('order_watch_enabled', False))}, проверка {watch_every}, ожидание {wait_after}, отзыв {review_after}"
     fb_line = ''
     if _normalize_stars_currency(cfg.get('stars_currency')) == FTS_CURRENCY_USDT_TON:
         fb_line = f"• Автопереход USDT → TON: <b>{_state_on(cfg.get('usdt_fallback_to_ton', False))}</b>\n"
@@ -1870,14 +1880,14 @@ def _order_tools_text(chat_id):
                 sent += 1
     except Exception:
         pass
-    return f"<b>🧹 Заказы и отзывы</b>\n\n• Проверка зависших заказов: <b>{_state_on(cfg.get('order_watch_enabled', True))}</b>\n• Интервал проверки: <code>{watch_every}</code>\n• Напоминать ожидание через: <code>{wait_after}</code>\n• Напоминание об отзыве: <b>{_state_on(cfg.get('order_review_reminder_enabled', True))}</b>\n• Просить отзыв через: <code>{review_after}</code> после отправки\n• Записей заказов: <code>{len(recs)}</code>; активных: <code>{active}</code>; отправленных: <code>{sent}</code>\n\nЗдесь всё, что связано с повторной проверкой ваших заказов, зависшими заказами и просьбой оставить отзыв."
+    return f"<b>🧹 Заказы и отзывы</b>\n\n• Проверка зависших заказов: <b>{_state_on(cfg.get('order_watch_enabled', False))}</b>\n• Интервал проверки: <code>{watch_every}</code>\n• Напоминать ожидание через: <code>{wait_after}</code>\n• Напоминание об отзыве: <b>{_state_on(cfg.get('order_review_reminder_enabled', False))}</b>\n• Просить отзыв через: <code>{review_after}</code> после отправки\n• Записей заказов: <code>{len(recs)}</code>; активных: <code>{active}</code>; отправленных: <code>{sent}</code>\n\nЗдесь всё, что связано с повторной проверкой ваших заказов, зависшими заказами и просьбой оставить отзыв."
 def _order_tools_kb(chat_id):
     cfg = _get_cfg(chat_id)
     kb = K()
-    kb.row(B('🧹 Проверка заказов: ' + ('ВКЛ' if cfg.get('order_watch_enabled', True) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_ORDER_WATCH))
+    kb.row(B('🧹 Проверка заказов: ' + ('ВКЛ' if cfg.get('order_watch_enabled', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_ORDER_WATCH))
     kb.row(B(f"⏱ Проверять каждые: {_fmt_minutes_from_sec(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT))}", callback_data=CBT_ORDER_WATCH_INTERVAL))
     kb.row(B(f"⏳ Напоминать ожидание: {_fmt_minutes_from_sec(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT))}", callback_data=CBT_ORDER_WAIT_REMINDER))
-    kb.row(B('⭐ Напоминание об отзыве: ' + ('ВКЛ' if cfg.get('order_review_reminder_enabled', True) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_REVIEW_REMINDER))
+    kb.row(B('⭐ Напоминание об отзыве: ' + ('ВКЛ' if cfg.get('order_review_reminder_enabled', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_REVIEW_REMINDER))
     kb.row(B(f"🕒 Отзыв через: {_fmt_minutes_from_sec(cfg.get('order_review_reminder_sec', ORDER_REVIEW_REMINDER_DEFAULT))}", callback_data=CBT_REVIEW_REMINDER_TIME))
     kb.row(B('🔍 Проверить зависшие сейчас', callback_data=CBT_ORDER_WATCH_RUN))
     kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
@@ -3222,8 +3232,8 @@ def _order_record_review_ready(rec):
     return int(rec.get('sent_ts') or rec.get('finalized_ts') or 0) > 0
 def _order_health_check(cardinal, chat_id, *, manual=False):
     cfg = _get_cfg(chat_id)
-    watch_enabled = _cfg_bool(cfg, 'order_watch_enabled', True)
-    review_enabled = _cfg_bool(cfg, 'order_review_reminder_enabled', True)
+    watch_enabled = _cfg_bool(cfg, 'order_watch_enabled', False)
+    review_enabled = _cfg_bool(cfg, 'order_review_reminder_enabled', False)
     if not watch_enabled and (not review_enabled):
         return (0, 0, 0)
     now = time.time()
@@ -3296,8 +3306,8 @@ def _start_auto_maintenance(cardinal):
                         continue
                     auto_price_on = _cfg_bool(cfg, 'auto_price_fragment_enabled', False)
                     autodump_on = _cfg_bool(cfg, 'autodump_enabled', False)
-                    watch_on = _cfg_bool(cfg, 'order_watch_enabled', True)
-                    review_on = _cfg_bool(cfg, 'order_review_reminder_enabled', True)
+                    watch_on = _cfg_bool(cfg, 'order_watch_enabled', False)
+                    review_on = _cfg_bool(cfg, 'order_review_reminder_enabled', False)
                     if auto_price_on or autodump_on:
                         _maybe_auto_price_update(cardinal, cid)
                         _maybe_autodump_update(cardinal, cid)
@@ -3324,6 +3334,10 @@ def init_cardinal(cardinal):
         _order_log('info', 'config_migrated', chat_id='startup', schema=SETTINGS_SCHEMA_VERSION, notes=';'.join(notes) if notes else 'ok')
     except Exception as e:
         logger.warning(f'Startup settings self-check failed: {e}')
+    try:
+        _hydrate_order_state_from_settings()
+    except Exception as e:
+        logger.debug(f'order state hydrate failed: {e}')
     tg = cardinal.telegram
     bot = tg.bot
     _start_auto_maintenance(cardinal)
@@ -3525,7 +3539,7 @@ def _download_plugin_update_from_github():
             result.update(ok=True, changed=False)
             return result
         with open(pending_file, 'wb') as f:
-            f.write(source.encode('utf-8'))
+            f.write(payload)
             f.flush()
             os.fsync(f.fileno())
         try:
@@ -3580,7 +3594,7 @@ def _install_pending_plugin_update(remote_version=None):
             shutil.copy2(SETTINGS_FILE, SETTINGS_BAK)
         tmp_file = plugin_file + '.update.tmp'
         with open(tmp_file, 'wb') as f:
-            f.write(source.encode('utf-8'))
+            f.write(payload)
             f.flush()
             os.fsync(f.fileno())
         try:
@@ -3840,30 +3854,10 @@ def _stats_collect(lines, since_ts):
             continue
         m = _re.search('SEND result:\\s*ok=(True|False).*?currency=([a-z0-9_]+)?.*?order_status=([A-Za-z_\\-]+|-)?', ln)
         if m and last:
-            cur = m.group(2) or last.get('cur', 'ton')
             st = (m.group(3) or '').upper()
-            if m.group(1) == 'True':
-                stats['ok'] += 1
-                stats['qty_ok'] += last['qty']
-                stats['per_user'][last['user']]['qty'] += last['qty']
-                stats['per_user'][last['user']]['cnt'] += 1
-                stats['currency'][cur]['ok'] += 1
-                stats['currency'][cur]['qty'] += last['qty']
-                if st in {'PENDING', 'BLOCKCHAIN_SENT'}:
-                    stats['pending'] += 1
-                if ts:
-                    stats['last_ok'] = ts
-                day = time.strftime('%Y-%m-%d', time.localtime(ts or time.time()))
-                stats['per_day'][day]['qty'] += last['qty']
-                stats['per_day'][day]['ok'] += 1
-            else:
-                stats['fail'] += 1
-                stats['qty_fail'] += last['qty']
-                stats['currency'][cur]['fail'] += 1
-                if ts:
-                    stats['last_fail'] = ts
-                day = time.strftime('%Y-%m-%d', time.localtime(ts or time.time()))
-                stats['per_day'][day]['fail'] += 1
+            if m.group(1) == 'True' and st in {'PENDING', 'BLOCKCHAIN_SENT'}:
+                stats['pending'] += 1
+            continue
         m = _re.search('REFUND\\s+#?([A-Za-z0-9\\-]+)\\s*->\\s*(OK|FAIL)', ln)
         if m:
             if m.group(2) == 'OK':
@@ -4262,7 +4256,7 @@ def _ask_review_reminder_time(bot, call):
     _ask_order_timer(bot, call, step='set_review_reminder_time', cfg_key='order_review_reminder_sec', title='напоминание об отзыве после отправки', default_sec=ORDER_REVIEW_REMINDER_DEFAULT, min_min=5, max_min=10080, example=30)
 def _toggle_order_watch(bot, call):
     chat_id = call.message.chat.id
-    v = not _cfg_bool(_get_cfg(chat_id), 'order_watch_enabled', True)
+    v = not _cfg_bool(_get_cfg(chat_id), 'order_watch_enabled', False)
     _set_cfg(chat_id, order_watch_enabled=v)
     try:
         bot.answer_callback_query(call.id, 'Проверка зависших заказов включена.' if v else 'Проверка зависших заказов выключена.')
@@ -4271,7 +4265,7 @@ def _toggle_order_watch(bot, call):
     _open_order_tools(bot, call)
 def _toggle_review_reminder(bot, call):
     chat_id = call.message.chat.id
-    v = not _cfg_bool(_get_cfg(chat_id), 'order_review_reminder_enabled', True)
+    v = not _cfg_bool(_get_cfg(chat_id), 'order_review_reminder_enabled', False)
     _set_cfg(chat_id, order_review_reminder_enabled=v)
     try:
         bot.answer_callback_query(call.id, 'Напоминание об отзыве включено.' if v else 'Напоминание об отзыве выключено.')
@@ -5068,6 +5062,57 @@ def _mark_done(chat_id, oid):
     _remove_order_everywhere(s)
 _blocked_oids = set()
 _failed_orders = {}
+_recent_msg_events = {}
+_recent_order_events = {}
+def _recent_once(cache, key, ttl=3.0):
+    now = time.time()
+    try:
+        for k, ts in list(cache.items()):
+            if now - float(ts or 0) > ttl * 4:
+                cache.pop(k, None)
+    except Exception:
+        pass
+    last = float(cache.get(key) or 0)
+    if now - last < ttl:
+        return True
+    cache[key] = now
+    return False
+def _seen_message_event(event, chat_id, author, text):
+    try:
+        msg = getattr(event, 'message', None)
+        mid = getattr(msg, 'message_id', None) or getattr(msg, 'id', None)
+        keys = ['msgtxt:%s:%s:%s' % (chat_id, author or '', (text or '')[:500])]
+        if mid:
+            keys.append(f'msgid:{chat_id}:{mid}')
+        if any(_recent_once(_recent_msg_events, k, 2.5) for k in keys):
+            return True
+        for k in keys:
+            _recent_msg_events[k] = time.time()
+        return False
+    except Exception:
+        return False
+def _seen_order_event(order_id, chat_id, qty):
+    try:
+        key = f'order:{order_id or "noid"}:{chat_id}:{qty or 0}'
+        return _recent_once(_recent_order_events, key, 20.0)
+    except Exception:
+        return False
+def _hydrate_order_state_from_settings():
+    try:
+        data = _load_settings()
+        for cid, cfg in list(data.items()):
+            if cid in (SETTINGS_META_KEY, LEGACY_SETTINGS_KEY) or not isinstance(cfg, dict):
+                continue
+            for oid, rec in dict(cfg.get('order_records') or {}).items():
+                if not oid or not isinstance(rec, dict):
+                    continue
+                st = str(rec.get('status') or '').lower()
+                if st in {'sent', 'sent_pending'}:
+                    _done_oids.add(str(oid))
+                elif st in {'failed', 'refunded', 'cancelled', 'canceled'}:
+                    _blocked_oids.add(str(oid))
+    except Exception as e:
+        logger.debug(f'hydrate order state skipped: {e}')
 def _finalize_order(oid, chat_id, *, ok, reason=''):
     oid = str(oid)
     if ok:
@@ -5362,6 +5407,8 @@ def new_order_handler(cardinal, event):
         title = getattr(order, 'title', None) or getattr(order, 'name', None) or ''
         qty = _extract_qty_from_title(title)
         order_id = getattr(order, 'id', None) or getattr(order, 'order_id', None) or getattr(event, 'order_id', None)
+        if _seen_order_event(order_id, chat_id, qty):
+            return
         _order_log('info', 'new_order', oid=order_id or 'noid', chat_id=chat_id, qty=qty if qty is not None else 'unknown', title=title or '-')
         if order_id and (str(order_id) in _done_oids or str(order_id) in _blocked_oids):
             _order_log('info', 'ignore_done_or_blocked', oid=order_id, chat_id=chat_id)
@@ -5410,7 +5457,7 @@ def new_order_handler(cardinal, event):
         if jwt and (qty is not None and qty >= 50):
             if use_pre and username and (not order_id):
                 item.update(stage='await_confirm', candidate=username.lstrip('@'), prompted=True, finalized=False, confirmed=False, stage_ts=time.time())
-                _safe_send(cardinal, chat_id, f'Ник из заказа: @{username}. Добавил отправку {qty}⭐ в фоновую очередь…')
+                _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=qty, username=str(username).lstrip('@')))
                 _schedule_confirm_send(cardinal, chat_id)
                 return
             cand = (username or '').lstrip('@')
@@ -5530,18 +5577,16 @@ def _do_confirm_send(cardinal, chat_id):
         pend.update(stage='await_username', finalized=False, candidate=None)
         _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid'))
         return
+    pend.update(finalized=True)
     _safe_send(cardinal, chat_id, _tpl(chat_id, 'failed', reason=human))
     _order_log('error', 'send_fail', oid=oid or 'noid', chat_id=chat_id, qty=qty, username=username, status=(resp or {}).get('status'), reason=human)
     _log('error', f"SEND FAIL {qty}⭐ -> @{username}: {human} | status={(resp or {}).get('status')}")
-    pend.update(finalized=True)
     if oid:
         _finalize_order(oid, chat_id, ok=False, reason=human)
     if _should_auto_refund(cfg, oid, resp, human):
         _safe_send(cardinal, chat_id, '🔁 Пытаюсь оформить возврат…')
         ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
         _log('info' if ok_ref else 'error', f"REFUND #{oid} -> {('OK' if ok_ref else 'FAIL')}")
-    else:
-        _safe_send(cardinal, chat_id, '⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.')
     _maybe_auto_deactivate(cardinal, cfg, chat_id)
     if _has_queue(chat_id):
         _notify_next_turn(cardinal, chat_id)
@@ -5646,11 +5691,11 @@ def _do_confirm_send_for_oid(cardinal, chat_id, oid):
         _safe_send(cardinal, chat_id, f'Минимум 50⭐. Заказ #{oid}.')
         return
     _order_log('info', 'confirm_start', oid=oid, chat_id=chat_id, qty=qty, username=username, stage=item.get('stage'))
-    _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=qty, username=username))
     if not _check_username_exists_throttled(username, jwt, chat_id):
         _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid', order_id=oid))
         item.update(stage='await_username', finalized=False, candidate=None)
         return
+    _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=qty, username=username))
     _set_sending(chat_id, True)
     resp = None
     try:
@@ -5669,16 +5714,14 @@ def _do_confirm_send_for_oid(cardinal, chat_id, oid):
             item.update(stage='await_username', finalized=False, candidate=None)
             _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid', order_id=oid))
             return
+        item.update(finalized=True)
         _safe_send(cardinal, chat_id, _tpl(chat_id, 'failed', reason=human))
         _order_log('error', 'send_fail', oid=oid, chat_id=chat_id, qty=qty, username=username, status=(resp or {}).get('status'), reason=human)
-        item.update(finalized=True)
         _finalize_order(oid, chat_id, ok=False, reason=human)
         if _should_auto_refund(cfg, oid, resp, human):
             _safe_send(cardinal, chat_id, '🔁 Пытаюсь оформить возврат…')
             ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
             _log('info' if ok_ref else 'error', f"REFUND #{oid} -> {('OK' if ok_ref else 'FAIL')}")
-        else:
-            _safe_send(cardinal, chat_id, '⏳ У продавца автовозврат отключён. Пожалуйста, дождитесь продавца.')
         _maybe_auto_deactivate(cardinal, cfg, chat_id)
         return
 def _list_pending_oids(chat_id):
@@ -5703,6 +5746,8 @@ def new_message_handler(cardinal, event):
         author = (getattr(event.message, 'author', '') or '').lower()
         chat_id = _event_chat_id(event)
         text = _strip_invisible(event.message.text or '').strip()
+        if _seen_message_event(event, chat_id, author, text):
+            return
         try:
             if chat_id is not None:
                 for it in _q(chat_id):
@@ -5811,7 +5856,7 @@ def new_message_handler(cardinal, event):
                 _update_current(chat_id, prompted=True)
                 _mark_prompted(chat_id, oid)
                 _order_record_update(chat_id, oid, status='await_confirm', qty=real_qty, username=uname)
-                _safe_send(cardinal, chat_id, f'Ник из заказа: @{uname}. Добавил отправку {real_qty}⭐ в фоновую очередь…')
+                _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=real_qty, username=str(uname).lstrip('@')))
                 if oid:
                     _schedule_confirm_send(cardinal, chat_id, str(oid))
                 else:
@@ -5827,7 +5872,7 @@ def new_message_handler(cardinal, event):
             return
         if not text:
             return
-        if author == my_user and (_current(chat_id) or {}).get('stage') not in {'await_username', 'await_confirm'}:
+        if author == my_user and not (_re.match('^\\s*(?:\\+{1,2}|ok|да)\\s*$', text, _re.I) or _re.fullmatch('\\s*@?[A-Za-z0-9_]{5,32}\\s*', text)):
             return
         if author == 'funpay':
             u = _extract_username_from_text(text)

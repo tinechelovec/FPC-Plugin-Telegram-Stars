@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 import os, re, html, shutil, logging
 import requests
 
 NAME = "FTS-Temp-Updater"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Временный мини-плагин для обновления FTS-Plugin командой /update_fts."
 CREDITS = "@tinechelovec"
 UUID = "6d3d1fc0-2e6d-46b8-9cf8-14a81911d0a7"
@@ -123,7 +122,7 @@ def _download():
     new_ver = _ver(src)
     if not new_ver:
         raise RuntimeError("в скачанном файле не найдена VERSION")
-    return src, new_ver
+    return src, new_ver, data
 
 def _cleanup_pyc(path):
     try:
@@ -136,10 +135,10 @@ def _cleanup_pyc(path):
     except Exception:
         pass
 
-def _atomic_replace(path, source):
+def _atomic_replace(path, payload):
     tmp = path + ".fts_update_tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(source)
+    with open(tmp, "wb") as f:
+        f.write(payload)
         f.flush()
         os.fsync(f.fileno())
     try:
@@ -167,13 +166,13 @@ def _cmd_update(cardinal, message):
         old_src = _read(target)
         old_ver = _ver(old_src) or "не найдена"
         _send(bot, chat_id, f"⏬ <b>Проверяю обновление FTS-Plugin…</b>\n\nТекущая версия: <code>{_h(old_ver)}</code>")
-        new_src, new_ver = _download()
+        new_src, new_ver, new_payload = _download()
         _send(bot, chat_id, f"🧩 <b>Версии FTS-Plugin</b>\n\nТекущая: <code>{_h(old_ver)}</code>\nНовая: <code>{_h(new_ver)}</code>")
         if old_ver != "не найдена" and _vkey(new_ver) <= _vkey(old_ver):
             _send(bot, chat_id, "✅ <b>Обновление не требуется.</b>\n\nФайл плагина, конфиг и updater не изменены.")
             return
         compile(new_src, target, "exec")
-        _atomic_replace(target, new_src)
+        _atomic_replace(target, new_payload)
         self_status = _delete_self()
         _send(
             bot,
