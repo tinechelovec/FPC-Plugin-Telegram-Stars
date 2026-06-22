@@ -197,7 +197,7 @@ def _order_log(level, action, oid=None, chat_id=None, qty=None, username=None, *
 def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
 NAME = 'FTS-Plugin'
-VERSION = '1.7.4'
+VERSION = '1.7.4' # v2 вторая верссия, так как какой то человек написал о баге через секунду после выхода обновления :)
 DESCRIPTION = 'Плагин по продаже звезд.'
 CREDITS = _s64('QHRpbmVjaGVsb3ZlYw==')
 UUID = _s64('ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1')
@@ -3756,13 +3756,23 @@ def _order_health_check(cardinal, chat_id):
                 if now - ts < wait_sec or now - float(item.get('last_reminder_ts') or 0) < wait_sec:
                     continue
                 with _REMINDER_LOCK:
-                    if not _cfg_bool(_get_cfg_for_orders(chat_id), 'order_watch_enabled', False):
+                    current_cfg = _get_cfg_for_orders(chat_id)
+                    if not _cfg_bool(current_cfg, 'order_watch_enabled', False):
                         break
                     cid = item.get('chat_id') or chat_id
                     qty = int(item.get('qty') or 50)
                     oid = item.get('order_id') or '—'
-                    msg = f'⏳ Напоминание по заказу #{oid}: я всё ещё жду Telegram-тег для {qty}⭐. Пришлите @username одной строкой.' if stage == 'await_username' else f"⏳ Напоминание по заказу #{oid}: ник @{item.get('candidate') or '—'} принят, но я жду подтверждение '+'."
-                    if _reminder_send(cardinal, cid, msg, 'order_wait', oid, stage=stage, qty=qty):
+                    auto_mode = _cfg_bool(current_cfg, 'auto_send_without_plus', False)
+                    if stage == 'await_username':
+                        mode = 'username'
+                        msg = f'⏳ Напоминание по заказу #{oid}: я всё ещё жду Telegram-тег для {qty}⭐. Пришлите @username одной строкой.'
+                    elif auto_mode:
+                        mode = 'auto'
+                        msg = f'⏳ Напоминание по заказу #{oid}: заказ ещё ожидает обработки. Ничего писать не нужно — звёзды отправятся автоматически.'
+                    else:
+                        mode = 'plus'
+                        msg = f"⏳ Напоминание по заказу #{oid}: ник @{item.get('candidate') or '—'} принят, но я жду подтверждение '+'."
+                    if _reminder_send(cardinal, cid, msg, 'order_wait', oid, stage=stage, qty=qty, mode=mode):
                         item['last_reminder_ts'] = now
                         wait_sent += 1
                         _order_record_update(cid, item.get('order_id'), status=stage, qty=qty, username=item.get('candidate'), last_wait_reminder_ts=int(now))
