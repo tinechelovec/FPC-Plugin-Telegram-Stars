@@ -157,7 +157,10 @@ def _schedule_confirm_send(cardinal, chat_id, oid=None, *, notify_busy=True):
             logger.exception(f'background send failed: {e}')
         finally:
             _set_sending(chat_id, False)
-    return _schedule_job(job_key, _run)
+    scheduled = _schedule_job(job_key, _run)
+    if not scheduled:
+        _order_log('debug', 'send_job_busy', oid=requested_oid or 'noid', chat_id=chat_id)
+    return scheduled
 def _log(level, msg):
     if level == 'info':
         logger.info(f'{msg}')
@@ -194,7 +197,7 @@ def _order_log(level, action, oid=None, chat_id=None, qty=None, username=None, *
 def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
 NAME = 'FTS-Plugin'
-VERSION = '1.7.3'
+VERSION = '1.7.4'
 DESCRIPTION = 'Плагин по продаже звезд.'
 CREDITS = _s64('QHRpbmVjaGVsb3ZlYw==')
 UUID = _s64('ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1')
@@ -233,12 +236,18 @@ if FTS_DEFAULT_CURRENCY not in FTS_SUPPORTED_CURRENCIES:
 PLUGIN_FOLDER = 'storage/plugins/FTS-Plugin'
 SETTINGS_FILE = os.path.join(PLUGIN_FOLDER, 'settings.json')
 SETTINGS_BAK = SETTINGS_FILE + '.bak'
-SETTINGS_SCHEMA_VERSION = 4
+ORDERS_FILE = os.path.join(PLUGIN_FOLDER, 'orders.json')
+ORDERS_BAK = ORDERS_FILE + '.bak'
+SETTINGS_SCHEMA_VERSION = 5
+ORDERS_SCHEMA_VERSION = 1
 LEGACY_SETTINGS_KEY = '__legacy__'
 SETTINGS_META_KEY = '__meta__'
 _CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
 _CFG_TOKEN_ALIASES = ('jwt', 'token', 'fragment_token', 'fragmentApiToken', 'fragment_api_token')
 _SETTINGS_IO_LOCK = threading.RLock()
+_ORDERS_IO_LOCK = threading.RLock()
+_REMINDER_LOCK = threading.RLock()
+_RUNTIME_PROFILE_KEYS = {'__orders__', '__global_orders__'}
 def _atomic_write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
@@ -467,6 +476,161 @@ def _sanitize_order_records(items):
             r['qty'] = _as_int(r.get('qty'), 0, 0)
         out[str(oid)] = r
     return out
+def _orders_db_default():
+    return {
+        '__meta__': {
+            'schema': ORDERS_SCHEMA_VERSION,
+            'plugin': NAME,
+            'updated_at': int(time.time())
+        },
+        'records': {}
+    }
+def _merge_order_records(base, incoming):
+    out = dict(base or {})
+    for oid, raw in _sanitize_order_records(incoming).items():
+        oid_s = str(oid)
+        old = dict(out.get(oid_s) or {})
+        new = dict(raw or {})
+        old_ts = _as_int(old.get('updated_ts'), 0, 0)
+        new_ts = _as_int(new.get('updated_ts'), 0, 0)
+        merged = ({**old, **new} if new_ts >= old_ts else {**new, **old})
+        chats = []
+        for value in (
+            old.get('chat_id'), new.get('chat_id'),
+            *(old.get('chat_history') or []),
+            *(new.get('chat_history') or [])
+        ):
+            if value is None:
+                continue
+            value = str(value)
+            if value and value not in chats:
+                chats.append(value)
+        if chats:
+            merged['chat_history'] = chats[-8:]
+            merged['chat_id'] = str((new if new_ts >= old_ts else old).get('chat_id') or chats[-1])
+        merged['oid'] = str(merged.get('oid') or oid_s)
+        out[oid_s] = merged
+    if len(out) > ORDER_RECORDS_LIMIT:
+        rows = sorted(
+            out.items(),
+            key=lambda kv: _as_int((kv[1] or {}).get('updated_ts'), 0, 0)
+        )
+        out = dict(rows[-ORDER_RECORDS_LIMIT:])
+    return out
+def _normalize_orders_db(data):
+    data = data if isinstance(data, dict) else {}
+    raw_records = data.get('records')
+    if not isinstance(raw_records, dict):
+        raw_records = {
+            k: v for k, v in data.items()
+            if k != '__meta__' and isinstance(v, dict)
+        }
+    result = _orders_db_default()
+    result['records'] = _merge_order_records({}, raw_records)
+    meta = data.get('__meta__') if isinstance(data.get('__meta__'), dict) else {}
+    result['__meta__'].update(meta)
+    result['__meta__'].update({
+        'schema': ORDERS_SCHEMA_VERSION,
+        'plugin': NAME,
+        'updated_at': int(time.time())
+    })
+    return result
+def _load_orders_db():
+    with _ORDERS_IO_LOCK:
+        for path, label in ((ORDERS_FILE, 'orders.json'), (ORDERS_BAK, 'orders.json.bak')):
+            try:
+                if not os.path.exists(path):
+                    continue
+                with open(path, 'r', encoding='utf-8') as f:
+                    obj = _try_parse_settings_text(f.read())
+                if isinstance(obj, dict):
+                    data = _normalize_orders_db(obj)
+                    if label != 'orders.json':
+                        logger.warning('Orders database restored from .bak')
+                        _atomic_write_json(ORDERS_FILE, data)
+                    return data
+            except Exception as e:
+                logger.warning(f'Load {label} error: {e}')
+        return _orders_db_default()
+def _save_orders_db(data):
+    with _ORDERS_IO_LOCK:
+        try:
+            normalized = _normalize_orders_db(data)
+            try:
+                if os.path.exists(ORDERS_FILE):
+                    shutil.copy2(ORDERS_FILE, ORDERS_BAK)
+            except Exception:
+                pass
+            _atomic_write_json(ORDERS_FILE, normalized)
+            return normalized
+        except Exception as e:
+            logger.error(f'Save orders database error: {e}')
+            return _normalize_orders_db(data)
+def _get_order_records():
+    return dict((_load_orders_db().get('records') or {}))
+def _get_order_record(oid):
+    if not oid:
+        return {}
+    return dict(_get_order_records().get(str(oid)) or {})
+def _profile_is_runtime_default(raw):
+    if not isinstance(raw, dict) or raw.get('fragment_jwt'):
+        return False
+    probe = dict(raw)
+    probe.pop('order_records', None)
+    default = _sanitize_cfg({})
+    for key, value in probe.items():
+        if key == 'config_version':
+            continue
+        if key not in default or value != default.get(key):
+            return False
+    return True
+def _read_raw_settings_for_migration():
+    for path in (SETTINGS_FILE, SETTINGS_BAK):
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, 'r', encoding='utf-8') as f:
+                obj = _try_parse_settings_text(f.read())
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return {}
+def _migrate_orders_storage():
+    raw = _read_raw_settings_for_migration()
+    if not isinstance(raw, dict):
+        return (0, 0)
+    db = _load_orders_db()
+    records = dict(db.get('records') or {})
+    moved = 0
+    removed_profiles = 0
+    cleaned = dict(raw)
+    for key, value in list(cleaned.items()):
+        if not isinstance(value, dict) or key == SETTINGS_META_KEY:
+            continue
+        profile = dict(value)
+        embedded = profile.pop('order_records', None)
+        if isinstance(embedded, dict) and embedded:
+            before = len(records)
+            records = _merge_order_records(records, embedded)
+            moved += max(0, len(records) - before)
+        delete_runtime = (
+            key in _RUNTIME_PROFILE_KEYS
+            or str(key).startswith('users-')
+            or (isinstance(embedded, dict) and _profile_is_runtime_default(value))
+        )
+        if delete_runtime:
+            cleaned.pop(key, None)
+            removed_profiles += 1
+        else:
+            cleaned[key] = profile
+    db['records'] = records
+    if moved or not os.path.exists(ORDERS_FILE):
+        _save_orders_db(db)
+    normalized, _, _ = _migrate_settings_data(cleaned)
+    if normalized != raw:
+        _save_settings(normalized)
+    return (moved, removed_profiles)
 def _sanitize_cfg(raw, chat_id=None):
     raw = raw if isinstance(raw, dict) else {}
     cfg = dict(raw)
@@ -510,7 +674,7 @@ def _sanitize_cfg(raw, chat_id=None):
     cfg['order_wait_reminder_sec'] = _as_int(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT), ORDER_WAIT_REMINDER_DEFAULT, 120, 86400)
     cfg['order_review_reminder_enabled'] = _cfg_bool(cfg, 'order_review_reminder_enabled', False)
     cfg['order_review_reminder_sec'] = _as_int(cfg.get('order_review_reminder_sec', ORDER_REVIEW_REMINDER_DEFAULT), ORDER_REVIEW_REMINDER_DEFAULT, 300, 604800)
-    cfg['order_records'] = _sanitize_order_records(cfg.get('order_records'))
+    cfg.pop('order_records', None)
     cfg['config_version'] = SETTINGS_SCHEMA_VERSION
     return cfg
 def _migrate_settings_data(data):
@@ -583,8 +747,7 @@ def _tpl(chat_id, key, **kw):
     cfg_owner = _get_cfg_for_orders(chat_id)
     tpls = (cfg_owner.get('templates') if isinstance(cfg_owner, dict) else None) or {}
     if not tpls:
-        cfg_local = _get_cfg(chat_id)
-        tpls = (cfg_local.get('templates') if isinstance(cfg_local, dict) else None) or {}
+        tpls = _default_templates()
     default = _default_templates().get(key, '')
     raw = tpls.get(key, default)
     return _fmt_tpl(raw, **kw)
@@ -598,44 +761,45 @@ def _get_cfg(chat_id):
     if changed:
         _save_settings(data)
     return cfg
-def _cfg_key_for_orders(chat_id):
-    key = str(chat_id)
-    try:
-        data = _load_settings()
-        cfg = data.get(key) or {}
+def _owner_cfg_entry(data, chat_id=None):
+    data = data if isinstance(data, dict) else {}
+    key = str(chat_id) if chat_id is not None else None
+    if key:
+        cfg = data.get(key)
         if isinstance(cfg, dict) and cfg.get('fragment_jwt'):
-            return key
-        legacy = data.get(LEGACY_SETTINGS_KEY)
-        if isinstance(legacy, dict) and legacy.get('fragment_jwt'):
-            return LEGACY_SETTINGS_KEY
-        for k, v in data.items():
-            if k == SETTINGS_META_KEY:
-                continue
-            if isinstance(v, dict) and v.get('fragment_jwt'):
-                return str(k)
+            return (key, cfg)
+    for k, value in data.items():
+        if k in {SETTINGS_META_KEY, LEGACY_SETTINGS_KEY} or k in _RUNTIME_PROFILE_KEYS:
+            continue
+        if isinstance(value, dict) and value.get('fragment_jwt'):
+            return (str(k), value)
+    legacy = data.get(LEGACY_SETTINGS_KEY)
+    return (LEGACY_SETTINGS_KEY, legacy) if isinstance(legacy, dict) and legacy.get('fragment_jwt') else (None, None)
+def _cfg_key_for_orders(chat_id):
+    try:
+        return _owner_cfg_entry(_load_settings(), chat_id)[0]
     except Exception as e:
         logger.warning(f'_cfg_key_for_orders failed: {e}')
-    return key
+        return None
 def _get_cfg_for_orders(chat_id):
-    cfg = _get_cfg(chat_id)
-    if cfg.get('fragment_jwt'):
-        return cfg
-    data = _load_settings()
-    legacy = data.get(LEGACY_SETTINGS_KEY)
-    if isinstance(legacy, dict) and legacy.get('fragment_jwt'):
-        return _sanitize_cfg(legacy, chat_id=LEGACY_SETTINGS_KEY)
-    for k, v in data.items():
-        if k == SETTINGS_META_KEY:
-            continue
-        if isinstance(v, dict) and v.get('fragment_jwt'):
-            return _sanitize_cfg(v, chat_id=k)
-    return cfg
+    try:
+        _key, cfg = _owner_cfg_entry(_load_settings(), chat_id)
+        if isinstance(cfg, dict):
+            return _sanitize_cfg(cfg, chat_id=_key)
+    except Exception as e:
+        logger.warning(f'_get_cfg_for_orders failed: {e}')
+    return _sanitize_cfg({})
 def _set_cfg_for_orders(chat_id, **updates):
-    return _set_cfg(_cfg_key_for_orders(chat_id), **updates)
+    key = _cfg_key_for_orders(chat_id)
+    if key is None:
+        logger.warning(f'Order settings owner not found; update skipped for chat_id={chat_id}')
+        cfg = _sanitize_cfg({})
+        cfg.update(updates)
+        return _sanitize_cfg(cfg)
+    return _set_cfg(key, **updates)
 def _skip_username_check(chat_id):
     try:
-        cfg = _get_cfg(chat_id)
-        return _cfg_bool(cfg, 'skip_username_check', False)
+        return _cfg_bool(_get_cfg_for_orders(chat_id), 'skip_username_check', False)
     except Exception:
         return False
 def _set_cfg(chat_id, **updates):
@@ -1356,6 +1520,317 @@ def _order_is_stars(order):
         return int(cand) == int(FNP_STARS_CATEGORY_ID)
     except Exception:
         return False
+FTS_LOT_SAVE_VERIFY_DELAY_SEC = float(os.getenv('FTS_LOT_SAVE_VERIFY_DELAY_SEC', '1.0'))
+FTS_LOT_SAVE_RETRIES = max(1, min(3, int(os.getenv('FTS_LOT_SAVE_RETRIES', '3'))))
+FTS_LOT_SAVE_LOCATION = os.getenv('FTS_LOT_SAVE_LOCATION', 'trade').strip() or 'trade'
+FTS_LOT_FALLBACK_UA = os.getenv(
+    'FTS_LOT_FALLBACK_UA',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+).strip()
+_LOT_UA_WARNING_SHOWN = False
+_LOT_SAVE_FAILURES = {}
+def _remember_lot_save_failure(lot_id, code=None, message=None):
+    key = int(lot_id)
+    with _STATE_LOCK:
+        if not code and not message:
+            _LOT_SAVE_FAILURES.pop(key, None)
+            return
+        _LOT_SAVE_FAILURES[key] = {
+            'code': str(code or 'save_failed'),
+            'message': str(message or 'FunPay не сохранил изменение лота.'),
+            'ts': int(time.time())
+        }
+def _lot_save_failure(lot_id):
+    try:
+        key = int(lot_id)
+    except Exception:
+        return None
+    with _STATE_LOCK:
+        item = _LOT_SAVE_FAILURES.get(key)
+        return dict(item) if isinstance(item, dict) else None
+def _lot_failure_user_text(lot_ids=None, fallback='Не удалось изменить лот. Подробности находятся в логе.'):
+    for lot_id in _sanitize_lot_ids(lot_ids or []):
+        item = _lot_save_failure(lot_id)
+        if not item:
+            continue
+        if item.get('code') == 'premium_limit':
+            return ('FunPay не включил лот: достигнут лимит активных лотов. '
+                    'Выключите другой активный лот или увеличьте лимит на странице Premium.')
+        if item.get('message'):
+            return _short_log_value(item.get('message'), 190)
+    return fallback
+def _is_terminal_lot_save_error(value):
+    low = str(value or '').lower()
+    return ('funpay_premium_limit' in low or '/premium/limit' in low or
+            'достигнут лимит активных лотов' in low)
+def _lot_raw_fields(fields):
+    if fields is None:
+        return None
+    try:
+        raw = getattr(fields, 'fields', None)
+        if callable(raw):
+            raw = raw()
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+def _lot_fields_diag(fields):
+    if fields is None:
+        return 'fields=None'
+    raw = _lot_raw_fields(fields)
+    raw_active = raw.get('active') if isinstance(raw, dict) else None
+    raw_amount = raw.get('amount') if isinstance(raw, dict) else None
+    return (f"active={bool(getattr(fields, 'active', False))} "
+            f"raw_active={_short_log_value(raw_active, 32)} "
+            f"amount={_short_log_value(getattr(fields, 'amount', raw_amount), 32)} "
+            f"raw_amount={_short_log_value(raw_amount, 32)}")
+def _response_diag(response, limit=350):
+    if response is None:
+        return 'response=None'
+    try:
+        status = getattr(response, 'status_code', None)
+        url = getattr(response, 'url', None)
+        ctype = ''
+        headers = getattr(response, 'headers', None)
+        if headers:
+            ctype = headers.get('Content-Type') or headers.get('content-type') or ''
+        text = getattr(response, 'text', '') or ''
+        text = _short_log_value(text, limit)
+        return f'status={status} url={_short_log_value(url, 140)} ctype={_short_log_value(ctype, 80)} body={text}'
+    except Exception as e:
+        return f'response_diag_error={e}'
+def _funpay_save_error(response):
+    if response is None:
+        return None
+    data = response if isinstance(response, dict) else None
+    if data is None:
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+    if isinstance(data, dict):
+        redirect_url = str(data.get('url') or data.get('redirect') or data.get('redirect_url') or '')
+        if '/premium/limit' in redirect_url.lower():
+            return ('FUNPAY_PREMIUM_LIMIT: достигнут лимит активных лотов FunPay; '
+                    'выключите другой активный лот или увеличьте лимит на странице Premium')
+        errors = data.get('errors')
+        error = data.get('error')
+        if error or errors:
+            return _short_log_value(error or errors, 500)
+        if data.get('success') is False or data.get('ok') is False or data.get('saved') is False:
+            return _short_log_value(data, 500)
+    try:
+        text = str(getattr(response, 'text', '') or '')
+        low = text.lower()
+        if '<form' in low and ('account/login' in low or 'name="password"' in low):
+            return 'FunPay returned a login page instead of a save response'
+        if 'cf-chl-' in low or 'cloudflare' in low and 'challenge' in low:
+            return 'FunPay/Cloudflare returned an anti-bot challenge'
+    except Exception:
+        pass
+    return None
+def _ensure_account_user_agent(account):
+    global _LOT_UA_WARNING_SHOWN
+    try:
+        if getattr(account, 'user_agent', None):
+            return
+        if FTS_LOT_FALLBACK_UA:
+            account.user_agent = FTS_LOT_FALLBACK_UA
+            if not _LOT_UA_WARNING_SHOWN:
+                _LOT_UA_WARNING_SHOWN = True
+                logger.warning('[LOTS] Cardinal user_agent is empty; installed a Linux browser fallback User-Agent')
+    except Exception as e:
+        logger.debug(f'[LOTS] user-agent fallback failed: {e}')
+def _renew_lot_fields(fields, account=None, target=None):
+    try:
+        if target is not None:
+            fields.active = bool(target)
+    except Exception:
+        pass
+    try:
+        if account is not None and hasattr(fields, 'csrf_token') and getattr(account, 'csrf_token', None):
+            fields.csrf_token = account.csrf_token
+    except Exception:
+        pass
+    renew = getattr(fields, 'renew_fields', None)
+    if callable(renew):
+        renewed = renew()
+        if renewed is not None:
+            fields = renewed
+    raw = _lot_raw_fields(fields)
+    if isinstance(raw, dict):
+        raw['offer_id'] = str(getattr(fields, 'lot_id', raw.get('offer_id') or 0))
+        raw['location'] = FTS_LOT_SAVE_LOCATION
+        if target is not None:
+            if bool(target):
+                raw['active'] = 'on'
+            else:
+                raw.pop('active', None)
+        if account is not None and getattr(account, 'csrf_token', None):
+            raw['csrf_token'] = account.csrf_token
+    return fields
+def _lot_payload(fields, account=None, target=None):
+    fields = _renew_lot_fields(fields, account, target=target)
+    raw = _lot_raw_fields(fields)
+    if not isinstance(raw, dict):
+        raise RuntimeError('FunPayAPI did not expose lot form fields')
+    payload = dict(raw)
+    payload['offer_id'] = str(getattr(fields, 'lot_id', payload.get('offer_id') or 0))
+    payload['location'] = FTS_LOT_SAVE_LOCATION
+    if target is not None:
+        if bool(target):
+            payload['active'] = 'on'
+        else:
+            payload.pop('active', None)
+    if account is not None and getattr(account, 'csrf_token', None):
+        payload['csrf_token'] = account.csrf_token
+    return fields, payload
+def _save_lot_raw(account, fields, target=None):
+    fields, payload = _lot_payload(fields, account, target=target)
+    lot_id = int(getattr(fields, 'lot_id', payload.get('offer_id') or 0))
+    headers = {
+        'accept': '*/*',
+        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'x-requested-with': 'XMLHttpRequest',
+        'origin': 'https://funpay.com',
+        'referer': f'https://funpay.com/lots/offerEdit?offer={lot_id}'
+    }
+    method = getattr(account, 'method', None)
+    if not callable(method):
+        raise RuntimeError('FunPayAPI Account.method is unavailable')
+    response = method('post', 'lots/offerSave', headers, payload, raise_not_200=True)
+    err = _funpay_save_error(response)
+    if err:
+        raise RuntimeError(f'FunPay rejected lot save: {err}; {_response_diag(response)}')
+    return response
+def _refresh_funpay_session(account):
+    get_fn = getattr(account, 'get', None)
+    if not callable(get_fn):
+        return False
+    try:
+        get_fn(update_phpsessid=True)
+        return True
+    except TypeError:
+        try:
+            get_fn(True)
+            return True
+        except Exception as e:
+            logger.warning(f'[LOTS] FunPay session refresh failed: {e}')
+    except Exception as e:
+        logger.warning(f'[LOTS] FunPay session refresh failed: {e}')
+    return False
+def _lot_subcategory_id(fields):
+    try:
+        sub = getattr(fields, 'subcategory', None) or getattr(fields, 'subcat', None)
+        if sub is not None:
+            for attr in ('id', 'subcategory_id', 'category_id'):
+                value = getattr(sub, attr, None)
+                if value is not None:
+                    return int(value)
+        for attr in ('subcategory_id', 'category_id'):
+            value = getattr(fields, attr, None)
+            if value is not None:
+                return int(value)
+        raw = _lot_raw_fields(fields) or {}
+        value = raw.get('node_id') or raw.get('subcategory_id')
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+def _read_lot_state(account, lot_id, subcategory_id=None):
+    trade_error = None
+    if subcategory_id is not None:
+        fn = getattr(account, 'get_my_subcategory_lots', None)
+        if callable(fn):
+            try:
+                lots = fn(int(subcategory_id)) or []
+                for lot in lots:
+                    try:
+                        if int(getattr(lot, 'id', getattr(lot, 'lot_id', 0))) == int(lot_id):
+                            state = bool(getattr(lot, 'active', False))
+                            return state, f'trade_active={state}'
+                    except Exception:
+                        continue
+                trade_error = f'lot not found in trade list ({len(lots)} items)'
+            except Exception as e:
+                trade_error = f'trade list error: {e}'
+    try:
+        check = account.get_lot_fields(int(lot_id))
+        raw = _lot_raw_fields(check) or {}
+        raw_active = raw.get('active')
+        if raw_active is not None:
+            state = str(raw_active).strip().lower() in ('on', '1', 'true', 'yes')
+        else:
+            state = bool(getattr(check, 'active', False)) if check else None
+        return state, f'{trade_error or "trade=n/a"}; {_lot_fields_diag(check)}'
+    except Exception as e:
+        return None, f'{trade_error or "trade=n/a"}; edit form error: {e}'
+def _set_lot_active_verified(cardinal, lot_id, enabled):
+    account = getattr(cardinal, 'account', None)
+    if account is None:
+        logger.warning(f'[LOTS] lot={lot_id} failed: Cardinal account is unavailable')
+        try:
+            _remember_lot_save_failure(lot_id, 'account_unavailable', 'Аккаунт FunPay недоступен в Cardinal.')
+        except Exception:
+            pass
+        return False
+    _ensure_account_user_agent(account)
+    lot_id = int(lot_id)
+    target = bool(enabled)
+    _remember_lot_save_failure(lot_id)
+    last_error = None
+    last_response = None
+    subcategory_id = None
+    for attempt in range(1, FTS_LOT_SAVE_RETRIES + 1):
+        try:
+            fields = account.get_lot_fields(lot_id)
+            if not fields:
+                raise RuntimeError('get_lot_fields returned empty')
+            subcategory_id = _lot_subcategory_id(fields) or subcategory_id
+            before, before_diag = _read_lot_state(account, lot_id, subcategory_id)
+            if before == target:
+                _remember_lot_save_failure(lot_id)
+                logger.info(f"[LOTS] lot={lot_id} already {'active' if target else 'inactive'} (verified via {before_diag})")
+                return True
+            fields, _ = _lot_payload(fields, account, target=target)
+            if attempt == 1:
+                result = account.save_lot(fields)
+                err = _funpay_save_error(result)
+                if err:
+                    raise RuntimeError(f'FunPay rejected lot save: {err}')
+                save_mode = 'save_lot+location'
+                last_response = result
+            else:
+                result = _save_lot_raw(account, fields, target=target)
+                save_mode = 'raw_post+location'
+                last_response = result
+            if FTS_LOT_SAVE_VERIFY_DELAY_SEC > 0:
+                time.sleep(FTS_LOT_SAVE_VERIFY_DELAY_SEC)
+            actual, verify_diag = _read_lot_state(account, lot_id, subcategory_id)
+            if actual == target:
+                _remember_lot_save_failure(lot_id)
+                logger.info(f"[LOTS] {'activated' if target else 'deactivated'} lot={lot_id} verified=True mode={save_mode} attempt={attempt} via={verify_diag}")
+                return True
+            last_error = (f"state mismatch after {save_mode}: expected={target} actual={actual}; "
+                          f"verify={verify_diag}; response={_response_diag(result)}")
+            logger.warning(f'[LOTS] lot={lot_id} {last_error}')
+        except Exception as e:
+            last_error = str(e)
+            if _is_terminal_lot_save_error(last_error):
+                _remember_lot_save_failure(
+                    lot_id,
+                    'premium_limit',
+                    'Достигнут лимит активных лотов FunPay. Выключите другой лот или увеличьте лимит Premium.'
+                )
+                logger.error(f'[LOTS] lot={lot_id} activation blocked by FunPay premium active-lot limit; no more retries')
+                break
+            logger.warning(f'[LOTS] lot={lot_id} save attempt={attempt}/{FTS_LOT_SAVE_RETRIES} failed: {e}')
+        if attempt < FTS_LOT_SAVE_RETRIES:
+            _refresh_funpay_session(account)
+            time.sleep(min(0.7 * attempt, 1.5))
+    if not _lot_save_failure(lot_id):
+        _remember_lot_save_failure(lot_id, 'save_failed', last_error or 'FunPay не сохранил изменение лота.')
+    logger.error(f"[LOTS] lot={lot_id} was NOT {'activated' if target else 'deactivated'}: {last_error or 'unknown error'}; last_response={_response_diag(last_response)}")
+    return False
 def _activate_lot(cardinal, lot_id, trusted=False):
     try:
         lot_id = int(lot_id)
@@ -1365,17 +1840,7 @@ def _activate_lot(cardinal, lot_id, trusted=False):
             return False
         if not is_star and trusted:
             logger.warning(f'_activate_lot trusted mode: category check failed for lot {lot_id}, trying to enable anyway')
-        fields = cardinal.account.get_lot_fields(lot_id)
-        if not fields:
-            logger.warning(f'_activate_lot skipped: get_lot_fields returned empty for lot {lot_id}')
-            return False
-        if not getattr(fields, 'active', False):
-            fields.active = True
-            cardinal.account.save_lot(fields)
-            logger.info(f'[LOTS] activated lot={lot_id}')
-        else:
-            logger.info(f'[LOTS] lot={lot_id} already active')
-        return True
+        return _set_lot_active_verified(cardinal, lot_id, True)
     except Exception as e:
         logger.warning(f'_activate_lot {lot_id} failed: {e}')
         return False
@@ -1388,17 +1853,7 @@ def _deactivate_lot(cardinal, lot_id, trusted=False):
             return False
         if not is_star and trusted:
             logger.warning(f'_deactivate_lot trusted mode: category check failed for lot {lot_id}, trying to disable anyway')
-        fields = cardinal.account.get_lot_fields(lot_id)
-        if not fields:
-            logger.warning(f'_deactivate_lot skipped: get_lot_fields returned empty for lot {lot_id}')
-            return False
-        if getattr(fields, 'active', False):
-            fields.active = False
-            cardinal.account.save_lot(fields)
-            logger.info(f'[LOTS] deactivated lot={lot_id}')
-        else:
-            logger.info(f'[LOTS] lot={lot_id} already inactive')
-        return True
+        return _set_lot_active_verified(cardinal, lot_id, False)
     except Exception as e:
         logger.warning(f'_deactivate_lot {lot_id} failed: {e}')
         return False
@@ -1548,8 +2003,7 @@ def _auto_refund_order(cardinal, order_id, chat_id, reason):
         if order_id and str(order_id) in _done_oids:
             logger.warning(f'[REFUND] skip #{order_id}: already sent/done')
             return False
-        cfg = _get_cfg(chat_id)
-        rec = (cfg.get('order_records') or {}).get(str(order_id), {}) if order_id else {}
+        rec = _get_order_record(order_id) if order_id else {}
         if str((rec or {}).get('status') or '') in {'sent', 'sent_pending'}:
             logger.warning(f"[REFUND] skip #{order_id}: order record status={(rec or {}).get('status')}")
             return False
@@ -1607,17 +2061,23 @@ def _apply_balance_lot_filter(cardinal, chat_id, cfg, bal_ton=None, bal_usdt=Non
             want = ok and (was or filtered or bool(cfg.get('lots_active')))
             it['balance_required_' + ('usdt' if cur == FTS_CURRENCY_USDT_TON else 'ton')] = round(need, 6)
             if not ok and was:
-                _deactivate_lot(cardinal, lid, trusted=True)
-                it['active'] = False
-                it['balance_filtered'] = True
-                changed = True
-                rows.append({'qty': qty, 'lot_id': lid, 'need': need, 'active': False})
+                state_ok = _deactivate_lot(cardinal, lid, trusted=True)
+                if state_ok:
+                    it['active'] = False
+                    it['balance_filtered'] = True
+                    changed = True
+                    rows.append({'qty': qty, 'lot_id': lid, 'need': need, 'active': False})
+                else:
+                    logger.warning(f'[BALANCE] failed to deactivate lot={lid}; local state was not changed')
             elif want and filtered and (not was):
-                _activate_lot(cardinal, lid, trusted=True)
-                it['active'] = True
-                it['balance_filtered'] = False
-                changed = True
-                rows.append({'qty': qty, 'lot_id': lid, 'need': need, 'active': True})
+                state_ok = _activate_lot(cardinal, lid, trusted=True)
+                if state_ok:
+                    it['active'] = True
+                    it['balance_filtered'] = False
+                    changed = True
+                    rows.append({'qty': qty, 'lot_id': lid, 'need': need, 'active': True})
+                else:
+                    logger.warning(f'[BALANCE] failed to activate lot={lid}; local state was not changed')
         except Exception as e:
             logger.debug(f'balance lot filter skip: {e}')
     if changed:
@@ -1665,10 +2125,12 @@ def _maybe_auto_deactivate(cardinal, cfg, chat_id=None):
             items = cfg.get('star_lots') or []
             known_ids = _managed_lot_ids_from_cfg(cfg)
             rep = _apply_category_state(cardinal, cat_id, False, known_lot_ids=known_ids)
+            ok_ids = set(_sanitize_lot_ids(rep.get('ok') or []))
             for it in items:
-                it['active'] = False
+                if int(it.get('lot_id') or 0) in ok_ids:
+                    it['active'] = False
             managed_ids = _merge_lot_ids(known_ids, _ids_from_report(rep))
-            _set_cfg(owner_chat, lots_active=False, star_lots=items, managed_lot_ids=managed_ids, last_auto_deact_reason=f'Баланс {bal_usdt} USDT < порога {thr_usdt}', last_lot_toggle_report=f'auto_deactivate_usdt: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
+            _set_cfg(owner_chat, lots_active=any((bool(x.get('active')) for x in items)), star_lots=items, managed_lot_ids=managed_ids, last_auto_deact_reason=f'Баланс {bal_usdt} USDT < порога {thr_usdt}', last_lot_toggle_report=f'auto_deactivate_usdt: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
             logger.warning(f'[AUTODEACT] USDT balance {bal_usdt} < {thr_usdt}. Выключены лоты категории {cat_id}. Managed={managed_ids}. Report={rep}')
         return
     thr = float(cfg.get('min_balance_ton') or FNP_MIN_BALANCE_TON)
@@ -1677,10 +2139,12 @@ def _maybe_auto_deactivate(cardinal, cfg, chat_id=None):
         items = cfg.get('star_lots') or []
         known_ids = _managed_lot_ids_from_cfg(cfg)
         rep = _apply_category_state(cardinal, cat_id, False, known_lot_ids=known_ids)
+        ok_ids = set(_sanitize_lot_ids(rep.get('ok') or []))
         for it in items:
-            it['active'] = False
+            if int(it.get('lot_id') or 0) in ok_ids:
+                it['active'] = False
         managed_ids = _merge_lot_ids(known_ids, _ids_from_report(rep))
-        _set_cfg(owner_chat, lots_active=False, star_lots=items, managed_lot_ids=managed_ids, last_auto_deact_reason=f'Баланс {bal_ton} TON < порога {thr}', last_lot_toggle_report=f'auto_deactivate_ton: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
+        _set_cfg(owner_chat, lots_active=any((bool(x.get('active')) for x in items)), star_lots=items, managed_lot_ids=managed_ids, last_auto_deact_reason=f'Баланс {bal_ton} TON < порога {thr}', last_lot_toggle_report=f'auto_deactivate_ton: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
         logger.warning(f'[AUTODEACT] Баланс {bal_ton} TON < {thr}. Выключены лоты категории {cat_id}. Managed={managed_ids}. Report={rep}')
 CBT_HOME = f'{UUID}:home'
 CBT_SETTINGS = f'{UUID}:settings'
@@ -1736,6 +2200,8 @@ CBT_LOGS = f'{UUID}:logs'
 CBT_STATS = f'{UUID}:stats'
 CBT_STATS_RANGE_P = f'{UUID}:stats_range:'
 CBT_UPDATE_PLUGIN = f'{UUID}:update_plugin'
+CBT_UPDATE_PLUGIN_LOCAL = f'{UUID}:update_plugin_local'
+CBT_UPDATE_PLUGIN_ONLINE = f'{UUID}:update_plugin_online'
 CBT_UPDATE_PLUGIN_YES = f'{UUID}:update_plugin_yes'
 CBT_UPDATE_PLUGIN_NO = f'{UUID}:update_plugin_no'
 CBT_DELETE_ASK = f'{UUID}:delete_ask'
@@ -1868,7 +2334,7 @@ def _order_tools_text(chat_id):
     watch_every = _fmt_minutes_from_sec(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT))
     wait_after = _fmt_minutes_from_sec(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT))
     review_after = _fmt_minutes_from_sec(cfg.get('order_review_reminder_sec', ORDER_REVIEW_REMINDER_DEFAULT))
-    recs = cfg.get('order_records') or {}
+    recs = _get_order_records()
     active = 0
     sent = 0
     try:
@@ -1880,11 +2346,11 @@ def _order_tools_text(chat_id):
                 sent += 1
     except Exception:
         pass
-    return f"<b>🧹 Заказы и отзывы</b>\n\n• Проверка зависших заказов: <b>{_state_on(cfg.get('order_watch_enabled', False))}</b>\n• Интервал проверки: <code>{watch_every}</code>\n• Напоминать ожидание через: <code>{wait_after}</code>\n• Напоминание об отзыве: <b>{_state_on(cfg.get('order_review_reminder_enabled', False))}</b>\n• Просить отзыв через: <code>{review_after}</code> после отправки\n• Записей заказов: <code>{len(recs)}</code>; активных: <code>{active}</code>; отправленных: <code>{sent}</code>\n\nЗдесь всё, что связано с повторной проверкой ваших заказов, зависшими заказами и просьбой оставить отзыв."
+    return f"<b>🧹 Заказы и отзывы</b>\n\n• Напоминание по заказу: <b>{_state_on(cfg.get('order_watch_enabled', False))}</b>\n• Интервал проверки: <code>{watch_every}</code>\n• Напоминать ожидание через: <code>{wait_after}</code>\n• Напоминание об отзыве: <b>{_state_on(cfg.get('order_review_reminder_enabled', False))}</b>\n• Просить отзыв через: <code>{review_after}</code> после отправки\n• Записей заказов: <code>{len(recs)}</code>; активных: <code>{active}</code>; отправленных: <code>{sent}</code>\n\nЗдесь всё, что связано с повторной проверкой ваших заказов, зависшими заказами и просьбой оставить отзыв."
 def _order_tools_kb(chat_id):
     cfg = _get_cfg(chat_id)
     kb = K()
-    kb.row(B('🧹 Проверка заказов: ' + ('ВКЛ' if cfg.get('order_watch_enabled', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_ORDER_WATCH))
+    kb.row(B('⏳ Напоминание по заказу: ' + ('ВКЛ' if cfg.get('order_watch_enabled', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_ORDER_WATCH))
     kb.row(B(f"⏱ Проверять каждые: {_fmt_minutes_from_sec(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT))}", callback_data=CBT_ORDER_WATCH_INTERVAL))
     kb.row(B(f"⏳ Напоминать ожидание: {_fmt_minutes_from_sec(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT))}", callback_data=CBT_ORDER_WAIT_REMINDER))
     kb.row(B('⭐ Напоминание об отзыве: ' + ('ВКЛ' if cfg.get('order_review_reminder_enabled', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_REVIEW_REMINDER))
@@ -1901,10 +2367,11 @@ def _open_order_tools(bot, call):
         pass
 def _saves_text(chat_id):
     try:
-        size = os.path.getsize(SETTINGS_FILE) if os.path.exists(SETTINGS_FILE) else 0
+        settings_size = os.path.getsize(SETTINGS_FILE) if os.path.exists(SETTINGS_FILE) else 0
+        orders_size = os.path.getsize(ORDERS_FILE) if os.path.exists(ORDERS_FILE) else 0
     except Exception:
-        size = 0
-    return f'<b>💾 Сохранения</b>\n\nЗдесь можно управлять файлом <code>settings.json</code>:\n• импортировать сохранения из JSON-файла или текста;\n• скачать текущие сохранения;\n• сбросить сохранения после подтверждения.\n\nТекущий файл: <code>{size} байт</code>\n\n⚠️ В сохранениях может быть JWT-токен. Не отправляйте файл посторонним.'
+        settings_size = orders_size = 0
+    return f'<b>💾 Сохранения</b>\n\nДанные разделены:\n• <code>settings.json</code> — настройки, токен и лоты;\n• <code>orders.json</code> — база заказов и их статусы.\n\nИмпорт и скачивание используют единый резервный файл. Сброс настроек не удаляет историю заказов.\n\nНастройки: <code>{settings_size} байт</code>\nЗаказы: <code>{orders_size} байт</code>\n\n⚠️ Резервная копия может содержать JWT-токен. Не отправляйте её посторонним.'
 def _saves_kb():
     kb = K()
     kb.row(B('📥 Импортировать', callback_data=CBT_SAVES_IMPORT))
@@ -1934,10 +2401,16 @@ def _ask_import_saves(bot, call):
 def _download_saves(bot, call):
     chat_id = call.message.chat.id
     try:
-        data = _load_settings()
-        payload = json.dumps(data if isinstance(data, dict) else {}, indent=4, ensure_ascii=False).encode('utf-8')
-        fname = f"FTS-Plugin-settings-{time.strftime('%Y%m%d-%H%M%S')}.json"
-        bot.send_document(chat_id, (fname, payload), caption='💾 Текущие сохранения FTS-Plugin. Файл может содержать JWT-токен.')
+        backup = {
+            'format': 'FTS-Plugin-backup',
+            'backup_version': 2,
+            'created_at': int(time.time()),
+            'settings': _load_settings(),
+            'orders': _load_orders_db()
+        }
+        payload = json.dumps(backup, indent=4, ensure_ascii=False).encode('utf-8')
+        fname = f"FTS-Plugin-backup-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        bot.send_document(chat_id, (fname, payload), caption='💾 Резервная копия настроек и базы заказов FTS-Plugin. Файл может содержать JWT-токен.')
         try:
             bot.answer_callback_query(call.id, 'Сохранения отправлены.')
         except Exception:
@@ -1950,12 +2423,25 @@ def _download_saves(bot, call):
 def _import_settings_payload(raw_text):
     try:
         obj = json.loads((raw_text or '').lstrip('\ufeff').strip())
-        if isinstance(obj, dict) and isinstance(obj.get('settings'), dict):
-            obj = obj['settings']
         if not isinstance(obj, dict):
             return (False, 'JSON должен быть объектом.')
-        _atomic_write_json(SETTINGS_FILE, obj)
-        return (True, '✅ Сохранения импортированы.')
+        settings_obj = obj.get('settings') if isinstance(obj.get('settings'), dict) else obj
+        orders_obj = obj.get('orders') if isinstance(obj.get('orders'), dict) else None
+        if not isinstance(settings_obj, dict):
+            return (False, 'В резервной копии нет объекта settings.')
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                shutil.copy2(SETTINGS_FILE, SETTINGS_FILE + f'.import.{ts}.bak')
+            if os.path.exists(ORDERS_FILE):
+                shutil.copy2(ORDERS_FILE, ORDERS_FILE + f'.import.{ts}.bak')
+        except Exception:
+            pass
+        _atomic_write_json(SETTINGS_FILE, settings_obj)
+        if orders_obj is not None:
+            _save_orders_db(orders_obj)
+        moved, removed = _migrate_orders_storage()
+        return (True, f'✅ Сохранения импортированы. Перенесено заказов: {moved}; удалено служебных профилей: {removed}.')
     except json.JSONDecodeError as e:
         return (False, f'Некорректный JSON: {e}')
     except Exception as e:
@@ -2215,10 +2701,15 @@ def _deactivate_all_star_lots(cardinal, cfg, chat_id, reason='временная
         rep = {'ok': [], 'skip': [], 'err': []}
         if _CARDINAL_REF is not None:
             rep = _apply_category_state(_CARDINAL_REF, FNP_STARS_CATEGORY_ID, False, known_lot_ids=known_ids)
-        for it in items:
-            it['active'] = False
+            ok_ids = set(_sanitize_lot_ids(rep.get('ok') or []))
+            for it in items:
+                if int(it.get('lot_id') or 0) in ok_ids:
+                    it['active'] = False
+        else:
+            for it in items:
+                it['active'] = False
         managed_ids = _merge_lot_ids(known_ids, _ids_from_report(rep))
-        _set_cfg(chat_id, lots_active=False, star_lots=items, managed_lot_ids=managed_ids, last_auto_deact_reason=reason, last_lot_toggle_report=f'auto_deactivate: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
+        _set_cfg(chat_id, lots_active=any((bool(x.get('active')) for x in items)), star_lots=items, managed_lot_ids=managed_ids, last_auto_deact_reason=reason, last_lot_toggle_report=f'auto_deactivate: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
     except Exception as e:
         logger.warning(f'_deactivate_all_star_lots failed: {e}')
 def _preview_kb():
@@ -3159,25 +3650,35 @@ def _cb_markup_apply(cardinal, call):
         pass
 def _order_record_update(chat_id, oid, **updates):
     if not oid:
-        return
+        return {}
     try:
         oid_s = str(oid)
-        cfg = _get_cfg(chat_id)
-        recs = dict(cfg.get('order_records') or {})
-        rec = dict(recs.get(oid_s) or {})
-        now = int(time.time())
-        rec.setdefault('oid', oid_s)
-        rec.setdefault('chat_id', str(chat_id))
-        rec.setdefault('created_ts', now)
-        rec.update({k: v for k, v in updates.items() if v is not None})
-        rec['updated_ts'] = now
-        recs[oid_s] = rec
-        if len(recs) > ORDER_RECORDS_LIMIT:
-            old = sorted(recs.items(), key=lambda kv: int((kv[1] or {}).get('updated_ts') or 0))
-            recs = dict(old[-ORDER_RECORDS_LIMIT:])
-        _set_cfg(chat_id, order_records=recs)
+        with _ORDERS_IO_LOCK:
+            db = _load_orders_db()
+            recs = dict(db.get('records') or {})
+            rec = dict(recs.get(oid_s) or {})
+            now = int(time.time())
+            rec.setdefault('oid', oid_s)
+            rec.setdefault('created_ts', now)
+            if chat_id is not None:
+                cid = str(chat_id)
+                old_cid = rec.get('chat_id')
+                history = list(rec.get('chat_history') or [])
+                for value in (old_cid, cid):
+                    if value and str(value) not in history:
+                        history.append(str(value))
+                if history:
+                    rec['chat_history'] = history[-8:]
+                rec['chat_id'] = cid
+            rec.update({k: v for k, v in updates.items() if v is not None})
+            rec['updated_ts'] = now
+            recs[oid_s] = rec
+            db['records'] = _merge_order_records({}, recs)
+            _save_orders_db(db)
+            return dict(db['records'].get(oid_s) or rec)
     except Exception as e:
-        logger.debug(f'order record update failed: {e}')
+        logger.warning(f'order record update failed: {e}')
+        return {}
 def _resp_indicates_delivery(resp):
     if not isinstance(resp, dict):
         return False
@@ -3230,65 +3731,68 @@ def _order_record_review_ready(rec):
     if st in {'PENDING', 'BLOCKCHAIN_SENT'}:
         return False
     return int(rec.get('sent_ts') or rec.get('finalized_ts') or 0) > 0
-def _order_health_check(cardinal, chat_id, *, manual=False):
-    cfg = _get_cfg(chat_id)
+def _reminder_send(cardinal, chat_id, text, kind, oid, **extra):
+    if not _safe_send(cardinal, chat_id, text):
+        _order_log('warn', 'reminder_failed', oid=oid, chat_id=chat_id, reminder=kind, **extra)
+        return False
+    _order_log('info', 'reminder_sent', oid=oid, chat_id=chat_id, reminder=kind, **extra)
+    return True
+def _order_health_check(cardinal, chat_id):
+    cfg = _get_cfg_for_orders(chat_id)
     watch_enabled = _cfg_bool(cfg, 'order_watch_enabled', False)
     review_enabled = _cfg_bool(cfg, 'order_review_reminder_enabled', False)
-    if not watch_enabled and (not review_enabled):
+    if not (watch_enabled or review_enabled):
         return (0, 0, 0)
     now = time.time()
-    wait_sent = review_sent = fixed = 0
-    wait_sec = int(cfg.get('order_wait_reminder_sec') or ORDER_WAIT_REMINDER_DEFAULT)
-    review_sec = int(cfg.get('order_review_reminder_sec') or ORDER_REVIEW_REMINDER_DEFAULT)
+    wait_sent = review_sent = 0
     if watch_enabled:
+        wait_sec = int(cfg.get('order_wait_reminder_sec') or ORDER_WAIT_REMINDER_DEFAULT)
         for item in list(_q(chat_id)):
             try:
                 if item.get('finalized') or not _allowed_stages(item):
                     continue
-                cid = item.get('chat_id') or chat_id
                 stage = str(item.get('stage') or '')
                 ts = float(item.get('stage_ts') or item.get('turn_ts') or item.get('created_ts') or now)
-                last = float(item.get('last_reminder_ts') or 0)
-                if now - ts >= wait_sec and now - last >= wait_sec:
+                if now - ts < wait_sec or now - float(item.get('last_reminder_ts') or 0) < wait_sec:
+                    continue
+                with _REMINDER_LOCK:
+                    if not _cfg_bool(_get_cfg_for_orders(chat_id), 'order_watch_enabled', False):
+                        break
+                    cid = item.get('chat_id') or chat_id
                     qty = int(item.get('qty') or 50)
                     oid = item.get('order_id') or '—'
                     msg = f'⏳ Напоминание по заказу #{oid}: я всё ещё жду Telegram-тег для {qty}⭐. Пришлите @username одной строкой.' if stage == 'await_username' else f"⏳ Напоминание по заказу #{oid}: ник @{item.get('candidate') or '—'} принят, но я жду подтверждение '+'."
-                    _safe_send(cardinal, cid, msg)
-                    item['last_reminder_ts'] = now
-                    wait_sent += 1
-                    _order_record_update(cid, item.get('order_id'), status=stage, qty=qty, username=item.get('candidate'), last_wait_reminder_ts=int(now))
+                    if _reminder_send(cardinal, cid, msg, 'order_wait', oid, stage=stage, qty=qty):
+                        item['last_reminder_ts'] = now
+                        wait_sent += 1
+                        _order_record_update(cid, item.get('order_id'), status=stage, qty=qty, username=item.get('candidate'), last_wait_reminder_ts=int(now))
             except Exception as e:
-                logger.debug(f'order watch queue item skipped: {e}')
+                logger.debug(f'order reminder skipped: {e}')
     if review_enabled:
-        recs = dict(cfg.get('order_records') or {})
-        changed = False
-        for oid, rec in list(recs.items()):
+        review_sec = int(cfg.get('order_review_reminder_sec') or ORDER_REVIEW_REMINDER_DEFAULT)
+        for oid, rec in list(_get_order_records().items()):
             try:
-                if not _order_record_review_ready(rec):
+                if not _order_record_review_ready(rec) or int(rec.get('review_reminder_ts') or 0) > 0:
                     continue
-                if int(rec.get('review_reminder_ts') or 0) > 0:
+                if now - int(rec.get('sent_ts') or rec.get('finalized_ts') or 0) < review_sec:
                     continue
-                sent_ts = int(rec.get('sent_ts') or rec.get('finalized_ts') or 0)
-                if now - sent_ts < review_sec:
-                    continue
-                cid = rec.get('chat_id') or chat_id
-                qty = int(rec.get('qty') or 0)
-                uname = str(rec.get('username') or '').lstrip('@')
-                _safe_send(cardinal, cid, f'⭐ Если всё пришло по заказу #{oid} ({qty}⭐ на @{uname}), пожалуйста, подтвердите заказ и оставьте отзыв. Спасибо!')
-                rec['review_reminder_ts'] = int(now)
-                rec['updated_ts'] = int(now)
-                recs[oid] = rec
-                changed = True
-                review_sent += 1
+                with _REMINDER_LOCK:
+                    if not _cfg_bool(_get_cfg_for_orders(chat_id), 'order_review_reminder_enabled', False):
+                        break
+                    cid = rec.get('chat_id') or chat_id
+                    qty = int(rec.get('qty') or 0)
+                    uname = str(rec.get('username') or '').lstrip('@')
+                    msg = f'⭐ Если всё пришло по заказу #{oid} ({qty}⭐ на @{uname}), пожалуйста, подтвердите заказ и оставьте отзыв. Спасибо!'
+                    if _reminder_send(cardinal, cid, msg, 'review', oid, qty=qty, username=uname):
+                        _order_record_update(cid, oid, review_reminder_ts=int(now))
+                        review_sent += 1
             except Exception as e:
                 logger.debug(f'review reminder skipped: {e}')
-        if changed:
-            _set_cfg(chat_id, order_records=recs)
     try:
-        _set_cfg(chat_id, last_order_watch_ts=int(now))
+        _set_cfg_for_orders(chat_id, last_order_watch_ts=int(now))
     except Exception:
         pass
-    return (wait_sent, review_sent, fixed)
+    return (wait_sent, review_sent, 0)
 _AUTO_MAINT_STARTED = False
 def _start_auto_maintenance(cardinal):
     global _AUTO_MAINT_STARTED
@@ -3298,27 +3802,16 @@ def _start_auto_maintenance(cardinal):
     def loop():
         while True:
             try:
-                data = _load_settings()
-                for cid, cfg in list(data.items()):
-                    if cid in (SETTINGS_META_KEY, LEGACY_SETTINGS_KEY):
-                        continue
-                    if not isinstance(cfg, dict):
-                        continue
-                    auto_price_on = _cfg_bool(cfg, 'auto_price_fragment_enabled', False)
-                    autodump_on = _cfg_bool(cfg, 'autodump_enabled', False)
-                    watch_on = _cfg_bool(cfg, 'order_watch_enabled', False)
-                    review_on = _cfg_bool(cfg, 'order_review_reminder_enabled', False)
-                    if auto_price_on or autodump_on:
+                cid, cfg = _owner_cfg_entry(_load_settings())
+                if isinstance(cfg, dict):
+                    if _cfg_bool(cfg, 'auto_price_fragment_enabled', False) or _cfg_bool(cfg, 'autodump_enabled', False):
                         _maybe_auto_price_update(cardinal, cid)
                         _maybe_autodump_update(cardinal, cid)
-                    if watch_on or review_on:
-                        try:
-                            last = int(cfg.get('last_order_watch_ts') or 0)
-                            interval = int(cfg.get('order_watch_interval_sec') or ORDER_WATCH_INTERVAL_DEFAULT)
-                            if time.time() - last >= max(60, interval):
-                                _order_health_check(cardinal, cid)
-                        except Exception as e:
-                            logger.debug(f'order health check skipped: {e}')
+                    if _cfg_bool(cfg, 'order_watch_enabled', False) or _cfg_bool(cfg, 'order_review_reminder_enabled', False):
+                        last = int(cfg.get('last_order_watch_ts') or 0)
+                        interval = int(cfg.get('order_watch_interval_sec') or ORDER_WATCH_INTERVAL_DEFAULT)
+                        if time.time() - last >= max(60, interval):
+                            _order_health_check(cardinal, cid)
             except Exception as e:
                 logger.debug(f'auto maintenance skipped: {e}')
             time.sleep(60)
@@ -3328,6 +3821,9 @@ def init_cardinal(cardinal):
     global _CARDINAL_REF
     _CARDINAL_REF = cardinal
     try:
+        moved_orders, removed_profiles = _migrate_orders_storage()
+        if moved_orders or removed_profiles:
+            logger.info(f'[DB] settings split complete: moved_orders={moved_orders} removed_runtime_profiles={removed_profiles}')
         data, changed, notes = _migrate_settings_data(_load_settings())
         if changed:
             _save_settings(data)
@@ -3350,7 +3846,7 @@ def init_cardinal(cardinal):
     def _send_home(m):
         return bot.send_message(m.chat.id, _about_text(), parse_mode='HTML', reply_markup=_home_kb(), disable_web_page_preview=True)
     tg.msg_handler(_send_home, commands=['fnp', 'stars_thc'])
-    fsm_steps = {'set_min_balance', 'star_add_qty', 'star_add_lotid', 'msg_edit_value', 'unit_star_price_value', 'markup_percent', 'set_jwt', 'saves_import', 'star_price_value', 'autodump_floor_value', 'set_autodump_interval', 'set_order_watch_interval', 'set_order_wait_reminder', 'set_review_reminder_time'}
+    fsm_steps = {'set_min_balance', 'star_add_qty', 'star_add_lotid', 'msg_edit_value', 'unit_star_price_value', 'markup_percent', 'set_jwt', 'saves_import', 'local_plugin_update', 'star_price_value', 'autodump_floor_value', 'set_autodump_interval', 'set_order_watch_interval', 'set_order_wait_reminder', 'set_review_reminder_time'}
     tg.msg_handler(lambda m: _handle_fsm(m, cardinal), func=lambda m: m.chat.id in _fsm and _fsm[m.chat.id].get('step') in fsm_steps, content_types=['text', 'document'])
     tg.cbq_handler(lambda c: _open_home(bot, c), func=lambda c: c.data.startswith(f'{CBT.EDIT_PLUGIN}:{UUID}') or c.data.startswith(f'{CBT.PLUGIN_SETTINGS}:{UUID}') or c.data == f'{UUID}:0' or (c.data == CBT_HOME))
     tg.cbq_handler(lambda c: _open_settings(bot, c), func=lambda c: c.data == CBT_SETTINGS)
@@ -3406,7 +3902,9 @@ def init_cardinal(cardinal):
     tg.cbq_handler(lambda c: _send_logs(bot, c), func=lambda c: c.data == CBT_LOGS)
     tg.cbq_handler(lambda c: _open_stats(bot, c), func=lambda c: c.data == CBT_STATS)
     tg.cbq_handler(lambda c: _open_stats(bot, c, c.data.split(':')[-1]), func=lambda c: c.data.startswith(CBT_STATS_RANGE_P))
-    tg.cbq_handler(lambda c: _cb_update_plugin(cardinal, c), func=lambda c: c.data == CBT_UPDATE_PLUGIN)
+    tg.cbq_handler(lambda c: _open_update_menu(bot, c), func=lambda c: c.data == CBT_UPDATE_PLUGIN)
+    tg.cbq_handler(lambda c: _ask_local_plugin_update(bot, c), func=lambda c: c.data == CBT_UPDATE_PLUGIN_LOCAL)
+    tg.cbq_handler(lambda c: _cb_update_plugin(cardinal, c), func=lambda c: c.data == CBT_UPDATE_PLUGIN_ONLINE)
     tg.cbq_handler(lambda c: _cb_update_plugin_yes(cardinal, c), func=lambda c: c.data == CBT_UPDATE_PLUGIN_YES)
     tg.cbq_handler(lambda c: _cb_update_plugin_no(bot, c), func=lambda c: c.data == CBT_UPDATE_PLUGIN_NO)
     tg.cbq_handler(lambda c: _open_delete_confirm(bot, c), func=lambda c: c.data == CBT_DELETE_ASK)
@@ -3473,6 +3971,49 @@ def _open_settings(bot, call):
             _safe_send_tg(bot, chat_id, '⚠️ Не удалось открыть настройки. Ошибка записана в лог плагина.')
         except Exception:
             pass
+def _update_menu_text():
+    return (f'<b>⬆️ Обновление FTS-Plugin</b>\n\n'
+            f'Текущая версия: <code>{_h(VERSION)}</code>\n\n'
+            '• <b>Обновить локально</b> — пришлите новый файл плагина <code>.py</code> в этот чат. '
+            'Он будет проверен и установлен вместо текущего файла.\n'
+            '• <b>Обновить онлайн</b> — проверить новую версию и скачать её с GitHub.\n\n'
+            'Перед заменой автоматически создаётся резервная копия текущего плагина и настроек.')
+def _update_menu_kb():
+    kb = K()
+    kb.row(B('📥 Обновить локально', callback_data=CBT_UPDATE_PLUGIN_LOCAL))
+    kb.row(B('🌐 Обновить онлайн', callback_data=CBT_UPDATE_PLUGIN_ONLINE))
+    kb.add(B('◀️ Назад', callback_data=CBT_HOME))
+    return kb
+def _open_update_menu(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _update_menu_text(), _update_menu_kb())
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+def _ask_local_plugin_update(bot, call):
+    chat_id = call.message.chat.id
+    old = _fsm.get(chat_id) or {}
+    if old.get('step') == 'local_plugin_update':
+        _cleanup_fsm_msgs(bot, chat_id, old)
+    state = {'step': 'local_plugin_update'}
+    _fsm[chat_id] = state
+    try:
+        bot.answer_callback_query(call.id, 'Пришлите файл плагина .py')
+    except Exception:
+        pass
+    msg = bot.send_message(
+        chat_id,
+        '📥 <b>Локальное обновление</b>\n\n'
+        'Пришлите новый файл FTS-Plugin с расширением <code>.py</code>.\n'
+        'После проверки файл сразу заменит текущий плагин. Старый файл и настройки будут сохранены в резервных копиях.\n\n'
+        'Для отмены: <code>/cancel</code>',
+        parse_mode='HTML',
+        reply_markup=_kb_cancel_fsm()
+    )
+    state = _fsm.get(chat_id) or state
+    _track_fsm_mid(state, getattr(msg, 'message_id', None))
+    _fsm[chat_id] = state
 def _plugin_version_key(value):
     nums = [int(x) for x in _re.findall('\\d+', str(value or ''))[:4]]
     nums.extend([0] * (4 - len(nums)))
@@ -3494,6 +4035,91 @@ def _cleanup_plugin_bytecode(plugin_file):
                     pass
     except Exception as e:
         logger.debug(f'Update pycache cleanup failed: {e}')
+def _validate_plugin_update_payload(payload, plugin_file=None, *, allow_same_version=True):
+    plugin_file = os.path.abspath(plugin_file or __file__)
+    if not isinstance(payload, (bytes, bytearray)):
+        raise RuntimeError('файл обновления не прочитан')
+    payload = bytes(payload)
+    if not payload or len(payload) < 10000:
+        raise RuntimeError(f'файл обновления слишком маленький ({len(payload)} байт)')
+    if len(payload) > 5 * 1024 * 1024:
+        raise RuntimeError('файл обновления слишком большой (>5MB)')
+    try:
+        source = payload.decode('utf-8-sig')
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f'файл обновления не в UTF-8: {e}') from e
+    low_head = source[:500].lower()
+    if '<html' in low_head or '<!doctype' in low_head:
+        raise RuntimeError('вместо Python-файла получена HTML-страница')
+    required = ('FTS-Plugin', 'def init_cardinal', 'BIND_TO_PRE_INIT', 'BIND_TO_NEW_MESSAGE')
+    missing = [item for item in required if item not in source]
+    if missing:
+        raise RuntimeError('это не файл FTS-Plugin: нет ' + ', '.join(missing))
+    if UUID not in source and 'ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1' not in source:
+        raise RuntimeError('UUID загруженного плагина не совпадает')
+    remote_version = _plugin_version_from_source(source)
+    if not remote_version:
+        raise RuntimeError('в загруженном файле не найдена VERSION')
+    compile(source, plugin_file, 'exec')
+    if _plugin_version_key(remote_version) < _plugin_version_key(VERSION):
+        raise RuntimeError(f'загружена более старая версия {remote_version}; текущая версия {VERSION}')
+    if (not allow_same_version) and _plugin_version_key(remote_version) <= _plugin_version_key(VERSION):
+        raise RuntimeError(f'обновление не новее текущей версии {VERSION}')
+    return source, remote_version
+def _install_local_plugin_update(payload, original_name=None):
+    plugin_file = os.path.abspath(__file__)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    backup_file = plugin_file + f'.pre-local-update.{stamp}.bak'
+    result = {
+        'ok': False,
+        'changed': False,
+        'current_version': VERSION,
+        'remote_version': None,
+        'backup_file': backup_file,
+        'source_name': original_name,
+        'error': None,
+    }
+    tmp_file = plugin_file + '.local-update.tmp'
+    try:
+        source, remote_version = _validate_plugin_update_payload(payload, plugin_file, allow_same_version=True)
+        result['remote_version'] = remote_version
+        try:
+            with open(plugin_file, 'rb') as f:
+                current_payload = f.read()
+        except Exception:
+            current_payload = None
+        if current_payload == bytes(payload):
+            result.update(ok=True, changed=False)
+            return result
+        if os.path.isfile(SETTINGS_FILE):
+            os.makedirs(os.path.dirname(SETTINGS_BAK), exist_ok=True)
+            shutil.copy2(SETTINGS_FILE, SETTINGS_BAK)
+        with open(tmp_file, 'wb') as f:
+            f.write(bytes(payload))
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp_file, os.stat(plugin_file).st_mode)
+        except Exception:
+            pass
+        shutil.copy2(plugin_file, backup_file)
+        os.replace(tmp_file, plugin_file)
+        _cleanup_plugin_bytecode(plugin_file)
+        result.update(ok=True, changed=True)
+        logger.warning(
+            f'Plugin updated from local Telegram file: {VERSION} -> {remote_version}; '
+            f'source={original_name or "unknown"}; backup={backup_file}'
+        )
+        return result
+    except Exception as e:
+        result['error'] = str(e)
+        logger.exception(f'Local plugin update failed: {e}')
+        try:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except Exception:
+            pass
+        return result
 def _pending_update_file(plugin_file=None):
     return os.path.abspath(plugin_file or __file__) + '.update.pending'
 def _download_plugin_update_from_github():
@@ -3627,15 +4253,15 @@ def _cb_update_plugin(cardinal, call):
     if result.get('ok') and result.get('changed'):
         kb = K()
         kb.row(B('✅ Обновить', callback_data=CBT_UPDATE_PLUGIN_YES), B('❌ Отмена', callback_data=CBT_UPDATE_PLUGIN_NO))
-        kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_HOME))
+        kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_UPDATE_PLUGIN))
         text = f"🆕 <b>Найдена новая версия плагина.</b>\n\nТекущая версия: <code>{_h(result.get('current_version'))}</code>\nНовая версия: <code>{_h(result.get('remote_version'))}</code>\n\nФайл уже скачан во временный буфер и прошёл базовую проверку.\nУстановить обновление сейчас?"
     elif result.get('ok'):
         kb = K()
-        kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_HOME))
+        kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_UPDATE_PLUGIN))
         text = f"✅ <b>Обновление не требуется.</b>\n\nУстановлена версия: <code>{_h(result.get('current_version'))}</code>\nВерсия на GitHub: <code>{_h(result.get('remote_version') or 'не определена')}</code>\n\nКонфиг не изменён."
     else:
         kb = K()
-        kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_HOME))
+        kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_UPDATE_PLUGIN))
         text = f"❌ <b>Не удалось проверить обновление.</b>\n\nОшибка: <code>{_h(result.get('error') or 'неизвестная ошибка')}</code>\n\nТекущий файл и конфиг не изменены."
     if not _safe_edit(bot, chat_id, call.message.id, text, kb):
         _safe_send_tg(bot, chat_id, text, kb)
@@ -3649,7 +4275,7 @@ def _cb_update_plugin_yes(cardinal, call):
     _safe_edit(bot, chat_id, call.message.id, '⏬ <b>Устанавливаю обновление…</b>\n\nСохраняю резервную копию и заменяю файл плагина.', None)
     result = _install_pending_plugin_update()
     kb = K()
-    kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_HOME))
+    kb.row(B('🌐 GitHub', url=GITHUB_URL), B('◀️ Назад', callback_data=CBT_UPDATE_PLUGIN))
     if result.get('ok') and result.get('changed'):
         text = f"✅ <b>Плагин обновлён.</b>\n\nВерсия: <code>{_h(result.get('current_version'))}</code> → <code>{_h(result.get('remote_version'))}</code>\n💾 Старый конфиг сохранён.\n🛟 Предыдущий файл плагина сохранён как <code>{_h(os.path.basename(str(result.get('backup_file') or '')))}</code>.\n\n🔁 Для загрузки новой версии выполните: <code>/restart</code>"
     elif result.get('ok'):
@@ -3671,7 +4297,7 @@ def _cb_update_plugin_no(bot, call):
     except Exception:
         pass
     kb = K()
-    kb.row(B('🔄 Проверить снова', callback_data=CBT_UPDATE_PLUGIN), B('◀️ Назад', callback_data=CBT_HOME))
+    kb.row(B('🔄 Проверить снова', callback_data=CBT_UPDATE_PLUGIN_ONLINE), B('◀️ Назад', callback_data=CBT_UPDATE_PLUGIN))
     text = '❌ <b>Обновление отменено.</b>\n\nФайл плагина и конфиг не изменены.'
     if not _safe_edit(bot, chat_id, call.message.id, text, kb):
         _safe_send_tg(bot, chat_id, text, kb)
@@ -3925,12 +4551,18 @@ def _star_act_all(bot, call):
     rep = {'ok': [], 'skip': [], 'err': []}
     if _CARDINAL_REF is not None:
         rep = _apply_star_lots_state(_CARDINAL_REF, items, True)
+    ok_ids = set(_sanitize_lot_ids(rep.get('ok') or [])) if _CARDINAL_REF is not None else {int(x.get('lot_id')) for x in items if x.get('lot_id')}
     for it in items:
-        it['active'] = True
+        if int(it.get('lot_id') or 0) in ok_ids:
+            it['active'] = True
+    lots_active = any((bool(x.get('active')) for x in items))
     managed_ids = _merge_lot_ids(_managed_lot_ids_from_cfg(cfg), [x.get('lot_id') for x in items])
-    _set_cfg(chat_id, star_lots=items, lots_active=True, managed_lot_ids=managed_ids, last_auto_deact_reason=None, last_lot_toggle_report=f'star_act_all: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
+    _set_cfg(chat_id, star_lots=items, lots_active=lots_active, managed_lot_ids=managed_ids, last_auto_deact_reason=None if lots_active else cfg.get('last_auto_deact_reason'), last_lot_toggle_report=f'star_act_all: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
     try:
-        bot.answer_callback_query(call.id, 'Лоты включены.')
+        text = ('Лоты включены.' if len(ok_ids) == len(items) else
+                _lot_failure_user_text([x.get('lot_id') for x in items if int(x.get('lot_id') or 0) not in ok_ids],
+                                       f'Включено {len(ok_ids)} из {len(items)}. Подробности находятся в логе.'))
+        bot.answer_callback_query(call.id, text, show_alert=len(ok_ids) != len(items))
     except Exception:
         pass
     _open_stars(bot, call)
@@ -3944,12 +4576,16 @@ def _star_deact_all(bot, call):
     rep = {'ok': [], 'skip': [], 'err': []}
     if _CARDINAL_REF is not None:
         rep = _apply_star_lots_state(_CARDINAL_REF, items, False)
+    ok_ids = set(_sanitize_lot_ids(rep.get('ok') or [])) if _CARDINAL_REF is not None else {int(x.get('lot_id')) for x in items if x.get('lot_id')}
     for it in items:
-        it['active'] = False
+        if int(it.get('lot_id') or 0) in ok_ids:
+            it['active'] = False
+    lots_active = any((bool(x.get('active')) for x in items))
     managed_ids = _merge_lot_ids(_managed_lot_ids_from_cfg(cfg), [x.get('lot_id') for x in items], _ids_from_report(rep))
-    _set_cfg(chat_id, star_lots=items, lots_active=False, managed_lot_ids=managed_ids, last_lot_toggle_report=f'star_deact_all: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
+    _set_cfg(chat_id, star_lots=items, lots_active=lots_active, managed_lot_ids=managed_ids, last_lot_toggle_report=f'star_deact_all: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
     try:
-        bot.answer_callback_query(call.id, 'Лоты выключены.')
+        text = 'Лоты выключены.' if len(ok_ids) == len(items) else f'Выключено {len(ok_ids)} из {len(items)}. Ошибки смотри в логе.'
+        bot.answer_callback_query(call.id, text, show_alert=len(ok_ids) != len(items))
     except Exception:
         pass
     _open_stars(bot, call)
@@ -3977,7 +4613,9 @@ def _star_toggle(bot, call):
     managed_ids = _merge_lot_ids(_managed_lot_ids_from_cfg(cfg), [lot_id])
     _set_cfg(chat_id, star_lots=items, lots_active=any((bool(x.get('active')) for x in items)), managed_lot_ids=managed_ids, last_auto_deact_reason=None if enabled and ok else cfg.get('last_auto_deact_reason'), last_lot_toggle_report=f'star_toggle lot={lot_id} enabled={enabled} ok={ok}', last_lot_toggle_ts=int(time.time()))
     try:
-        bot.answer_callback_query(call.id, 'Лот включён.' if enabled and ok else 'Лот выключен.' if ok else 'Не удалось изменить лот, смотри лог.', show_alert=not ok)
+        text = ('Лот включён.' if enabled and ok else 'Лот выключен.' if ok else
+                _lot_failure_user_text([lot_id]))
+        bot.answer_callback_query(call.id, text, show_alert=not ok)
     except Exception:
         pass
     _open_stars(bot, call)
@@ -4256,17 +4894,21 @@ def _ask_review_reminder_time(bot, call):
     _ask_order_timer(bot, call, step='set_review_reminder_time', cfg_key='order_review_reminder_sec', title='напоминание об отзыве после отправки', default_sec=ORDER_REVIEW_REMINDER_DEFAULT, min_min=5, max_min=10080, example=30)
 def _toggle_order_watch(bot, call):
     chat_id = call.message.chat.id
-    v = not _cfg_bool(_get_cfg(chat_id), 'order_watch_enabled', False)
-    _set_cfg(chat_id, order_watch_enabled=v)
+    with _REMINDER_LOCK:
+        v = not _cfg_bool(_get_cfg(chat_id), 'order_watch_enabled', False)
+        _set_cfg(chat_id, order_watch_enabled=v)
+    _order_log('info', 'reminder_setting', chat_id=chat_id, reminder='order_wait', enabled=v)
     try:
-        bot.answer_callback_query(call.id, 'Проверка зависших заказов включена.' if v else 'Проверка зависших заказов выключена.')
+        bot.answer_callback_query(call.id, 'Напоминание по заказу включено.' if v else 'Напоминание по заказу выключено.')
     except Exception:
         pass
     _open_order_tools(bot, call)
 def _toggle_review_reminder(bot, call):
     chat_id = call.message.chat.id
-    v = not _cfg_bool(_get_cfg(chat_id), 'order_review_reminder_enabled', False)
-    _set_cfg(chat_id, order_review_reminder_enabled=v)
+    with _REMINDER_LOCK:
+        v = not _cfg_bool(_get_cfg(chat_id), 'order_review_reminder_enabled', False)
+        _set_cfg(chat_id, order_review_reminder_enabled=v)
+    _order_log('info', 'reminder_setting', chat_id=chat_id, reminder='review', enabled=v)
     try:
         bot.answer_callback_query(call.id, 'Напоминание об отзыве включено.' if v else 'Напоминание об отзыве выключено.')
     except Exception:
@@ -4280,7 +4922,7 @@ def _cb_order_watch_run(cardinal, call):
     except Exception:
         pass
     def _run():
-        w, r, _ = _order_health_check(cardinal, chat_id, manual=True)
+        w, r, _ = _order_health_check(cardinal, chat_id)
         try:
             bot.send_message(chat_id, f'✅ Проверка заказов завершена. Напоминаний по ожиданию: {w}; просьб об отзыве: {r}.')
         except Exception:
@@ -4349,8 +4991,10 @@ def _toggle_lots(bot, call):
     if _CARDINAL_REF is not None:
         if star_lots:
             rep = _apply_star_lots_state(_CARDINAL_REF, star_lots, desired)
+            ok_ids = set(_sanitize_lot_ids(rep.get('ok') or []))
             for it in star_lots:
-                it['active'] = bool(desired)
+                if int(it.get('lot_id') or 0) in ok_ids:
+                    it['active'] = bool(desired)
             known_ids = _merge_lot_ids(known_ids, [x.get('lot_id') for x in star_lots], _ids_from_report(rep))
         else:
             rep = _apply_category_state(_CARDINAL_REF, FNP_STARS_CATEGORY_ID, desired, known_lot_ids=known_ids)
@@ -4359,14 +5003,24 @@ def _toggle_lots(bot, call):
                 bot.answer_callback_query(call.id, 'Не нашёл лоты для включения. Запустите «Автодобавление лотов» в настройке лотов или добавьте LOT вручную.', show_alert=True)
                 _open_settings(bot, call)
                 return
-    updates = {'lots_active': desired, 'managed_lot_ids': known_ids, 'last_lot_toggle_report': f'settings_toggle enabled={desired}: {_lot_report_short(rep)}', 'last_lot_toggle_ts': int(time.time())}
+    effective_state = any((bool(x.get('active')) for x in star_lots)) if star_lots else desired
+    if _CARDINAL_REF is not None and (rep.get('skip') or rep.get('err')) and not (rep.get('ok')):
+        effective_state = current
+    updates = {'lots_active': effective_state, 'managed_lot_ids': known_ids, 'last_lot_toggle_report': f'settings_toggle enabled={desired}: {_lot_report_short(rep)}', 'last_lot_toggle_ts': int(time.time())}
     if star_lots:
         updates['star_lots'] = star_lots
     if desired:
         updates['last_auto_deact_reason'] = None
     _set_cfg(chat_id, **updates)
     suffix = f' ({_lot_report_short(rep)})' if _CARDINAL_REF is not None else ''
-    bot.answer_callback_query(call.id, ('Лоты включены.' if desired else 'Лоты выключены.') + suffix, show_alert=False)
+    has_failures = bool((rep.get('skip') or []) or (rep.get('err') or []))
+    if not has_failures:
+        answer = 'Лоты включены.' if desired else 'Лоты выключены.'
+    else:
+        failed_ids = _merge_lot_ids(rep.get('skip') or [], rep.get('err') or [])
+        answer = _lot_failure_user_text(failed_ids, 'Не все лоты удалось изменить.')
+        suffix = ''
+    bot.answer_callback_query(call.id, answer + suffix, show_alert=has_failures)
     _open_settings(bot, call)
 def _toggle_refund(bot, call):
     chat_id = call.message.chat.id
@@ -4433,7 +5087,7 @@ def _ask_set_min_balance(bot, call):
     bot.send_message(chat_id, f'Введите новый порог баланса в {label} (сейчас {cur}). Можно с точкой или запятой. Пример: 5.5\n(или /cancel)', reply_markup=_kb_cancel_fsm())
 def _cancel_cmd(cardinal, chat_id):
     st = _fsm.get(chat_id) or {}
-    if st.get('step') in {'set_jwt', 'saves_import'}:
+    if st.get('step') in {'set_jwt', 'saves_import', 'local_plugin_update'}:
         _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, st)
     _fsm.pop(chat_id, None)
     if _has_queue(chat_id):
@@ -4877,6 +5531,88 @@ def _handle_fsm(message, cardinal):
         cardinal.telegram.bot.send_message(chat_id, f'✅ Порог сохранён: {val} {label}')
         _log('info', f'MIN BALANCE set to {val} {label}')
         return
+    if state.get('step') == 'local_plugin_update':
+        _track_fsm_mid(state, getattr(message, 'message_id', None))
+        if text.lower() in ('/cancel', 'cancel', 'отмена'):
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                '❌ Локальное обновление отменено.',
+                reply_markup=_update_menu_kb()
+            )
+            return
+        document = getattr(message, 'document', None)
+        if document is None:
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                '⚠️ Пришлите файл плагина как документ с расширением <code>.py</code>, либо /cancel.',
+                parse_mode='HTML'
+            )
+            return
+        filename = str(getattr(document, 'file_name', '') or '').strip()
+        if not filename.lower().endswith('.py'):
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                '⚠️ Нужен Python-файл с расширением <code>.py</code>. Архивы и текстовые файлы не устанавливаются.',
+                parse_mode='HTML'
+            )
+            return
+        file_size = int(getattr(document, 'file_size', 0) or 0)
+        if file_size > 5 * 1024 * 1024:
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
+            cardinal.telegram.bot.send_message(chat_id, '⚠️ Файл слишком большой (>5MB). Пришлите другой .py или /cancel.')
+            return
+        try:
+            f_info = cardinal.telegram.bot.get_file(document.file_id)
+            payload = cardinal.telegram.bot.download_file(f_info.file_path)
+        except Exception as e:
+            _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
+            cardinal.telegram.bot.send_message(chat_id, f'⚠️ Не удалось скачать файл из Telegram: {_h(e)}', parse_mode='HTML')
+            return
+        progress_msg = cardinal.telegram.bot.send_message(
+            chat_id,
+            '⏬ Проверяю файл и устанавливаю локальное обновление…',
+        )
+        _track_fsm_mid(state, getattr(progress_msg, 'message_id', None))
+        _fsm[chat_id] = state
+        result = _install_local_plugin_update(payload, filename)
+        if result.get('ok'):
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            if result.get('changed'):
+                text_result = (
+                    '✅ <b>Локальное обновление установлено.</b>\n\n'
+                    f"Файл: <code>{_h(filename)}</code>\n"
+                    f"Версия: <code>{_h(result.get('current_version'))}</code> → "
+                    f"<code>{_h(result.get('remote_version'))}</code>\n"
+                    f"🛟 Резервная копия: <code>{_h(os.path.basename(str(result.get('backup_file') or '')))}</code>\n"
+                    '💾 Настройки сохранены.\n\n'
+                    '🔁 Для загрузки новой версии выполните: <code>/restart</code>'
+                )
+            else:
+                text_result = (
+                    '✅ <b>Этот файл уже установлен.</b>\n\n'
+                    f"Версия: <code>{_h(result.get('remote_version') or VERSION)}</code>\n"
+                    'Текущий файл плагина не изменён.'
+                )
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                text_result,
+                parse_mode='HTML',
+                reply_markup=_update_menu_kb()
+            )
+            return
+        cardinal.telegram.bot.send_message(
+            chat_id,
+            '❌ <b>Локальное обновление не установлено.</b>\n\n'
+            f"Ошибка: <code>{_h(result.get('error') or 'неизвестная ошибка')}</code>\n\n"
+            'Текущий файл и настройки не изменены. Пришлите другой <code>.py</code> или /cancel.',
+            parse_mode='HTML'
+        )
+        return
     if state.get('step') == 'saves_import':
         _track_fsm_mid(state, getattr(message, 'message_id', None))
         if text.lower() in ('/cancel', 'cancel', 'отмена'):
@@ -4980,7 +5716,7 @@ def _handle_fsm(message, cardinal):
             pass
         return
 def _reset_settings_confirm_text():
-    return '⚠️ <b>Сброс сохранений</b>\n\nЭто действие очистит файл <code>settings.json</code>.\nВсе сохранения и настройки плагина будут сброшены к значениям по умолчанию.\n\n<b>Точно хотите сбросить сохранения?</b>'
+    return '⚠️ <b>Сброс настроек</b>\n\nЭто действие очистит только <code>settings.json</code>.\nНастройки и JWT будут сброшены, но база <code>orders.json</code> и история заказов сохранятся.\n\n<b>Точно хотите сбросить настройки?</b>'
 def _reset_settings_confirm_kb():
     kb = K()
     kb.row(B('✅ Да, сбросить', callback_data=CBT_RESET_SETTINGS_YES), B('❌ Отмена', callback_data=CBT_RESET_SETTINGS_NO))
@@ -5002,7 +5738,7 @@ def _clear_settings_json_file():
             except Exception:
                 pass
             _atomic_write_json(SETTINGS_FILE, {})
-        return (True, '✅ Сохранения сброшены (settings.json очищен).')
+        return (True, '✅ Настройки сброшены. База orders.json сохранена.')
     except Exception as e:
         logger.error(f'Reset settings error: {e}')
         return (False, f'❌ Не удалось сбросить настройки: {e}')
@@ -5099,18 +5835,14 @@ def _seen_order_event(order_id, chat_id, qty):
         return False
 def _hydrate_order_state_from_settings():
     try:
-        data = _load_settings()
-        for cid, cfg in list(data.items()):
-            if cid in (SETTINGS_META_KEY, LEGACY_SETTINGS_KEY) or not isinstance(cfg, dict):
+        for oid, rec in _get_order_records().items():
+            if not oid or not isinstance(rec, dict):
                 continue
-            for oid, rec in dict(cfg.get('order_records') or {}).items():
-                if not oid or not isinstance(rec, dict):
-                    continue
-                st = str(rec.get('status') or '').lower()
-                if st in {'sent', 'sent_pending'}:
-                    _done_oids.add(str(oid))
-                elif st in {'failed', 'refunded', 'cancelled', 'canceled'}:
-                    _blocked_oids.add(str(oid))
+            st = str(rec.get('status') or '').lower()
+            if st in {'sent', 'sent_pending'}:
+                _done_oids.add(str(oid))
+            elif st in {'failed', 'refunded', 'cancelled', 'canceled'}:
+                _blocked_oids.add(str(oid))
     except Exception as e:
         logger.debug(f'hydrate order state skipped: {e}')
 def _finalize_order(oid, chat_id, *, ok, reason=''):
@@ -5118,7 +5850,7 @@ def _finalize_order(oid, chat_id, *, ok, reason=''):
     if ok:
         _done_oids.add(oid)
         try:
-            rec = (_get_cfg(chat_id).get('order_records') or {}).get(oid, {})
+            rec = _get_order_record(oid)
             status = 'sent_pending' if str((rec or {}).get('status') or '').lower() == 'sent_pending' else 'sent'
         except Exception:
             status = 'sent'
@@ -5366,8 +6098,10 @@ def _send_html_chunks(bot, chat_id, text, kb=None):
 def _safe_send(c, chat_id, text):
     try:
         c.send_message(chat_id, text)
+        return True
     except Exception as e:
         logger.warning(f'send_message failed: {e}')
+        return False
 def _is_auto_reply(msg):
     try:
         if getattr(msg, 'is_autoreply', False):
@@ -5508,52 +6242,33 @@ GROUP_URL = _IMMUTABLE_META['GROUP_URL']
 CHANNEL_URL = _IMMUTABLE_META['CHANNEL_URL']
 GITHUB_URL = _IMMUTABLE_META['GITHUB_URL']
 INSTRUCTION_URL = _IMMUTABLE_META['INSTRUCTION_URL']
-def _do_confirm_send(cardinal, chat_id):
-    pend = _active_item_for_chat(chat_id)
-    for _ in range(3):
-        if not _maybe_rotate_queue_head(cardinal, chat_id):
-            break
-    if not pend:
-        _safe_send(cardinal, chat_id, 'Нет активного заказа. Если нужно — дождитесь нового сообщения о заказе.')
-        return
-    if FTS_GLOBAL_QUEUE:
-        mode = _queue_mode(chat_id)
-        head = _current(chat_id)
-        if mode in (1, 3) and (not head or pend is not head):
-            pend['preconfirmed'] = True
-            pos = _queue_pos_of(pend)
-            _safe_send(cardinal, chat_id, f'✅ Подтверждение принято. Сейчас ещё не ваша очередь (позиция {pos}). Когда очередь дойдёт — отправлю автоматически.')
-            return
-    oid = pend.get('order_id')
+def _send_pending_item(cardinal, chat_id, item):
+    oid = item.get('order_id')
     if oid and str(oid) in _done_oids:
-        if not FTS_GLOBAL_QUEUE or pend is _current(chat_id):
-            _pop_current(chat_id, keep_prompted=False)
+        _remove_order_everywhere(oid)
         return
-    qty = int(pend.get('qty', 50))
-    username = (pend.get('candidate') or '').strip()
-    _order_log('info', 'confirm_start', oid=oid or 'noid', chat_id=chat_id, qty=qty, username=username or None, stage=pend.get('stage'))
+    qty = int(item.get('qty') or 50)
+    username = (item.get('candidate') or '').lstrip('@').strip()
     cfg = _get_cfg_for_orders(chat_id)
     jwt = cfg.get('fragment_jwt')
+    _order_log('info', 'confirm_start', oid=oid or 'noid', chat_id=chat_id, qty=qty, username=username or None, stage=item.get('stage'))
     if not jwt:
         _safe_send(cardinal, chat_id, '⚠️ Токен Fragment не привязан. Покупка невозможна.')
         _order_log('warn', 'confirm_abort_no_jwt', oid=oid or 'noid', chat_id=chat_id, qty=qty, username=username or None)
-        _log('warn', 'SEND aborted: no JWT')
         return
     if not username or not _validate_username(username):
-        _safe_send(cardinal, chat_id, '❌ Некорректный тег. Отправьте в формате @username (5–32, латиница/цифры/подчёркивание).')
-        pend.update(stage='await_username', candidate=None)
-        _log('warn', f"SEND aborted: invalid username '{username}'")
+        item.update(stage='await_username', candidate=None)
+        _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid', order_id=oid))
         return
     if qty < 50:
-        _safe_send(cardinal, chat_id, 'Минимум 50⭐. Уточните количество или лот.')
-        _log('warn', f'SEND aborted: qty {qty} < 50')
+        _safe_send(cardinal, chat_id, f'Минимум 50⭐. Заказ #{oid or "—"}.')
         return
-    if not _check_username_exists_throttled(username, jwt, chat_id):
-        _safe_send(cardinal, chat_id, f'❌ Ник "{username}" не найден. Пришлите верный тег в формате @username.')
-        _log('warn', f'USERNAME not found (confirm): @{username}')
+    if not _skip_username_check(chat_id) and not _check_username_exists_throttled(username, jwt, chat_id):
+        item.update(stage='await_username', finalized=False, candidate=None)
+        _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid', order_id=oid))
         return
-    _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=qty, username=username.lstrip('@')))
-    oid = pend.get('order_id')
+    _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=qty, username=username))
+    was_head = item is _current(chat_id)
     _set_sending(chat_id, True)
     try:
         resp = _send_stars_with_currency_fallback(cardinal, chat_id, cfg, jwt, username=username, quantity=qty, show_sender=False)
@@ -5561,7 +6276,7 @@ def _do_confirm_send(cardinal, chat_id):
         _set_sending(chat_id, False)
     if _resp_indicates_delivery(resp):
         order_url = f'https://funpay.com/orders/{oid}/' if oid else ''
-        _send_order_result_message(cardinal, chat_id, qty, username.lstrip('@'), order_url, resp)
+        _send_order_result_message(cardinal, chat_id, qty, username, order_url, resp)
         _order_log('info', 'send_ok', oid=oid or 'noid', chat_id=chat_id, qty=qty, username=username, status=(resp or {}).get('status'), currency=(resp or {}).get('currency'), fragment_id=(resp or {}).get('fragment_order_id'))
         _mark_order_sent_record(chat_id, oid, qty, username, resp)
         _log('info', f'SEND OK {qty}⭐ -> @{username}')
@@ -5569,15 +6284,15 @@ def _do_confirm_send(cardinal, chat_id):
             _finalize_order(oid, chat_id, ok=True)
         else:
             _pop_current(chat_id, keep_prompted=False)
-        if _has_queue(chat_id):
+        if was_head and _has_queue(chat_id):
             _notify_next_turn(cardinal, chat_id)
         return
-    kind, human = _classify_send_failure((resp or {}).get('text', ''), (resp or {}).get('status', 0), username.lstrip('@'), jwt)
+    kind, human = _classify_send_failure((resp or {}).get('text', ''), (resp or {}).get('status', 0), username, jwt)
     if kind == 'username':
-        pend.update(stage='await_username', finalized=False, candidate=None)
-        _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid'))
+        item.update(stage='await_username', finalized=False, candidate=None)
+        _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid', order_id=oid))
         return
-    pend.update(finalized=True)
+    item.update(finalized=True)
     _safe_send(cardinal, chat_id, _tpl(chat_id, 'failed', reason=human))
     _order_log('error', 'send_fail', oid=oid or 'noid', chat_id=chat_id, qty=qty, username=username, status=(resp or {}).get('status'), reason=human)
     _log('error', f"SEND FAIL {qty}⭐ -> @{username}: {human} | status={(resp or {}).get('status')}")
@@ -5588,8 +6303,21 @@ def _do_confirm_send(cardinal, chat_id):
         ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
         _log('info' if ok_ref else 'error', f"REFUND #{oid} -> {('OK' if ok_ref else 'FAIL')}")
     _maybe_auto_deactivate(cardinal, cfg, chat_id)
-    if _has_queue(chat_id):
+    if was_head and _has_queue(chat_id):
         _notify_next_turn(cardinal, chat_id)
+def _do_confirm_send(cardinal, chat_id):
+    for _ in range(3):
+        if not _maybe_rotate_queue_head(cardinal, chat_id):
+            break
+    item = _active_item_for_chat(chat_id)
+    if not item:
+        _safe_send(cardinal, chat_id, 'Нет активного заказа. Если нужно — дождитесь нового сообщения о заказе.')
+        return
+    if FTS_GLOBAL_QUEUE and _queue_mode(chat_id) in (1, 3) and item is not _current(chat_id):
+        item['preconfirmed'] = True
+        _safe_send(cardinal, chat_id, f'✅ Подтверждение принято. Сейчас ещё не ваша очередь (позиция {_queue_pos_of(item)}). Когда очередь дойдёт — отправлю автоматически.')
+        return
+    _send_pending_item(cardinal, chat_id, item)
 def _cb_confirm_send(cardinal, call):
     try:
         cardinal.telegram.bot.answer_callback_query(call.id)
@@ -5661,69 +6389,15 @@ def _do_confirm_send_for_oid(cardinal, chat_id, oid):
         _safe_send(cardinal, chat_id, f'Заказ #{oid} уже выполнен.')
         _remove_order_everywhere(oid)
         return
-    head = _current(chat_id)
-    if head and str(head.get('order_id')) == str(oid):
-        _schedule_confirm_send(cardinal, chat_id)
-        return
     item = _pending_by_oid(chat_id, oid)
     if not item:
         _safe_send(cardinal, chat_id, f'Не нашёл активный заказ #{oid} для подтверждения.')
         return
-    if FTS_GLOBAL_QUEUE and _queue_mode(chat_id) in (1, 3):
-        head = _current(chat_id)
-        if not head or str(head.get('order_id')) != str(oid):
-            item['preconfirmed'] = True
-            pos = _queue_pos_of(item)
-            _safe_send(cardinal, chat_id, f'✅ Подтверждение принято. Сейчас ещё не ваша очередь (позиция {pos}). Когда очередь дойдёт — отправлю автоматически.')
-            return
-    cfg = _get_cfg_for_orders(chat_id)
-    jwt = cfg.get('fragment_jwt')
-    qty = int(item.get('qty') or 50)
-    username = (item.get('candidate') or '').strip()
-    if not jwt:
-        _safe_send(cardinal, chat_id, '⚠️ Токен Fragment не привязан. Покупка невозможна.')
+    if FTS_GLOBAL_QUEUE and _queue_mode(chat_id) in (1, 3) and item is not _current(chat_id):
+        item['preconfirmed'] = True
+        _safe_send(cardinal, chat_id, f'✅ Подтверждение принято. Сейчас ещё не ваша очередь (позиция {_queue_pos_of(item)}). Когда очередь дойдёт — отправлю автоматически.')
         return
-    if not username or not _validate_username(username):
-        _safe_send(cardinal, chat_id, f'❌ Для #{oid} не указан корректный @username.')
-        item.update(stage='await_username')
-        return
-    if qty < 50:
-        _safe_send(cardinal, chat_id, f'Минимум 50⭐. Заказ #{oid}.')
-        return
-    _order_log('info', 'confirm_start', oid=oid, chat_id=chat_id, qty=qty, username=username, stage=item.get('stage'))
-    if not _check_username_exists_throttled(username, jwt, chat_id):
-        _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid', order_id=oid))
-        item.update(stage='await_username', finalized=False, candidate=None)
-        return
-    _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=qty, username=username))
-    _set_sending(chat_id, True)
-    resp = None
-    try:
-        resp = _send_stars_with_currency_fallback(cardinal, chat_id, cfg, jwt, username=username, quantity=qty, show_sender=False)
-    finally:
-        _set_sending(chat_id, False)
-        if _resp_indicates_delivery(resp):
-            order_url = f'https://funpay.com/orders/{oid}/'
-            _send_order_result_message(cardinal, chat_id, qty, username, order_url, resp)
-            _order_log('info', 'send_ok', oid=oid, chat_id=chat_id, qty=qty, username=username, status=(resp or {}).get('status'), currency=(resp or {}).get('currency'), fragment_id=(resp or {}).get('fragment_order_id'))
-            _mark_order_sent_record(chat_id, oid, qty, username, resp)
-            _finalize_order(oid, chat_id, ok=True)
-            return
-        kind, human = _classify_send_failure((resp or {}).get('text', ''), (resp or {}).get('status', 0), username.lstrip('@'), jwt)
-        if kind == 'username':
-            item.update(stage='await_username', finalized=False, candidate=None)
-            _safe_send(cardinal, chat_id, _tpl(chat_id, 'username_invalid', order_id=oid))
-            return
-        item.update(finalized=True)
-        _safe_send(cardinal, chat_id, _tpl(chat_id, 'failed', reason=human))
-        _order_log('error', 'send_fail', oid=oid, chat_id=chat_id, qty=qty, username=username, status=(resp or {}).get('status'), reason=human)
-        _finalize_order(oid, chat_id, ok=False, reason=human)
-        if _should_auto_refund(cfg, oid, resp, human):
-            _safe_send(cardinal, chat_id, '🔁 Пытаюсь оформить возврат…')
-            ok_ref = _auto_refund_order(cardinal, oid, chat_id, reason=human)
-            _log('info' if ok_ref else 'error', f"REFUND #{oid} -> {('OK' if ok_ref else 'FAIL')}")
-        _maybe_auto_deactivate(cardinal, cfg, chat_id)
-        return
+    _send_pending_item(cardinal, chat_id, item)
 def _list_pending_oids(chat_id):
     return [str(x.get('order_id')) for x in _q(chat_id) if _allowed_stages(x) and x.get('order_id')]
 _INVIS_RE = _re.compile('[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\uFEFF\\u00AD\\u034F\\u061C\\u180E\\uFE00-\\uFE0F]', _re.UNICODE)
@@ -5762,7 +6436,7 @@ def new_message_handler(cardinal, event):
                 chat_id = _event_chat_id(event)
             except Exception:
                 chat_id = None
-            cur = _current(chat_id) or {}
+            cur = _active_item_for_chat(chat_id) or {}
             oid = cur.get('order_id')
             suffix = []
             if chat_id is not None:
@@ -5783,7 +6457,7 @@ def new_message_handler(cardinal, event):
         except Exception:
             user_mid = None
         if CLEAN_USER_MSGS:
-            stage = (_current(chat_id) or {}).get('stage')
+            stage = (_active_item_for_chat(chat_id) or {}).get('stage')
             waiting_input = stage in {'await_username', 'await_confirm'}
             if text and author not in {'funpay'} and (not waiting_input):
                 _safe_delete(cardinal.telegram.bot, chat_id, user_mid)
@@ -5853,10 +6527,8 @@ def new_message_handler(cardinal, event):
             if uname and jwt and use_pre:
                 item = pending or _ensure_pending(chat_id, oid, real_qty)
                 item.update(qty=int(real_qty), candidate=str(uname).lstrip('@'), stage='await_confirm', finalized=False, confirmed=False, prompted=True, stage_ts=time.time())
-                _update_current(chat_id, prompted=True)
                 _mark_prompted(chat_id, oid)
                 _order_record_update(chat_id, oid, status='await_confirm', qty=real_qty, username=uname)
-                _safe_send(cardinal, chat_id, _tpl(chat_id, 'sending', qty=real_qty, username=str(uname).lstrip('@')))
                 if oid:
                     _schedule_confirm_send(cardinal, chat_id, str(oid))
                 else:
