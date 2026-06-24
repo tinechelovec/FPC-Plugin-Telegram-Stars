@@ -32,6 +32,8 @@ _last_username_check_ts = {}
 LITESERVER_RETRY_DEFAULT = bool(int(os.getenv('FTS_Plugin_RETRY_LITESERVER', '1')))
 LITESERVER_RETRY_SLEEP_MIN = float(os.getenv('FTS_Plugin_RETRY_LITESERVER_SLEEP_MIN', '0.8'))
 LITESERVER_RETRY_SLEEP_MAX = float(os.getenv('FTS_Plugin_RETRY_LITESERVER_SLEEP_MAX', '1.8'))
+FRAGMENT_CONNECT_TIMEOUT = float(os.getenv('FTS_FRAGMENT_CONNECT_TIMEOUT_SEC', '15'))
+FRAGMENT_READ_TIMEOUT = float(os.getenv('FTS_FRAGMENT_READ_TIMEOUT_SEC', '180'))
 QUEUE_TIMEOUT_DEFAULT = int(os.getenv('FTS_QUEUE_TIMEOUT_SEC', '300'))
 ORDER_WATCH_INTERVAL_DEFAULT = int(os.getenv('FTS_ORDER_WATCH_INTERVAL_SEC', '300'))
 ORDER_WAIT_REMINDER_DEFAULT = int(os.getenv('FTS_ORDER_WAIT_REMINDER_SEC', '900'))
@@ -69,30 +71,24 @@ class _HumanLog:
                 break
         text = text.replace('[FTS-Plugin]', '').strip()
         color = _Ansi.C
-        if record.levelno >= logging.ERROR:
-            color = _Ansi.R
-        elif record.levelno == logging.WARNING:
-            color = _Ansi.Y
-        elif record.levelno == logging.DEBUG:
-            color = _Ansi.DIM
+        if record.levelno >= logging.ERROR: color = _Ansi.R
+        elif record.levelno == logging.WARNING: color = _Ansi.Y
+        elif record.levelno == logging.DEBUG: color = _Ansi.DIM
         if HUMAN_DEDUP and text.startswith('Автоответ найден') and oid_for_dedup:
             key = f'auto:{oid_for_dedup}'
-            if key in cls.SEEN_AUTOREPLY_BY_OID:
-                return ('', True)
+            if key in cls.SEEN_AUTOREPLY_BY_OID: return ('', True)
             cls.SEEN_AUTOREPLY_BY_OID.add(key)
         return (cls._fmt_like_classic(record, text, color), False)
 class _HumanFilter(logging.Filter):
     def filter(self, record):
         msg, suppressed = _HumanLog.humanize(record)
-        if suppressed:
-            return False
+        if suppressed: return False
         record._humanized = msg
         return True
 class _HumanFormatter(logging.Formatter):
     def format(self, record):
         msg = getattr(record, '_humanized', None)
-        if msg is None:
-            msg, _ = _HumanLog.humanize(record)
+        if msg is None: msg, _ = _HumanLog.humanize(record)
         return msg
 def _h(x):
     return _html.escape(str(x), quote=False)
@@ -126,31 +122,27 @@ _ACTIVE_JOBS_LOCK = threading.Lock()
 def _schedule_job(key, fn, *args, **kwargs):
     with _ACTIVE_JOBS_LOCK:
         old = _ACTIVE_JOBS.get(key)
-        if old is not None and (not old.done()):
-            return False
+        if old is not None and (not old.done()): return False
         fut = _SEND_EXECUTOR.submit(fn, *args, **kwargs)
         _ACTIVE_JOBS[key] = fut
         def _cleanup(_f):
             with _ACTIVE_JOBS_LOCK:
                 cur = _ACTIVE_JOBS.get(key)
-                if cur is _f:
-                    _ACTIVE_JOBS.pop(key, None)
+                if cur is _f: _ACTIVE_JOBS.pop(key, None)
         fut.add_done_callback(_cleanup)
         return True
 def _schedule_confirm_send(cardinal, chat_id, oid=None, *, notify_busy=True):
     requested_oid = oid
     try:
         active = _active_item_for_chat(chat_id)
-        if not requested_oid and active:
-            requested_oid = active.get('order_id')
+        if not requested_oid and active: requested_oid = active.get('order_id')
     except Exception:
         requested_oid = oid
     job_key = f"send_oid:{requested_oid}" if requested_oid else f"send:{chat_id}:cur"
     def _run():
         _set_sending(chat_id, True)
         try:
-            if oid:
-                _do_confirm_send_for_oid(cardinal, chat_id, oid)
+            if oid: _do_confirm_send_for_oid(cardinal, chat_id, oid)
             else:
                 _do_confirm_send(cardinal, chat_id)
         except Exception as e:
@@ -158,16 +150,12 @@ def _schedule_confirm_send(cardinal, chat_id, oid=None, *, notify_busy=True):
         finally:
             _set_sending(chat_id, False)
     scheduled = _schedule_job(job_key, _run)
-    if not scheduled:
-        _order_log('debug', 'send_job_busy', oid=requested_oid or 'noid', chat_id=chat_id)
+    if not scheduled: _order_log('debug', 'send_job_busy', oid=requested_oid or 'noid', chat_id=chat_id)
     return scheduled
 def _log(level, msg):
-    if level == 'info':
-        logger.info(f'{msg}')
-    elif level == 'warn':
-        logger.warning(f'{msg}')
-    elif level == 'error':
-        logger.error(f'{msg}')
+    if level == 'info': logger.info(f'{msg}')
+    elif level == 'warn': logger.warning(f'{msg}')
+    elif level == 'error': logger.error(f'{msg}')
     else:
         logger.debug(f'{msg}')
 def _short_log_value(v, limit=140):
@@ -176,28 +164,22 @@ def _short_log_value(v, limit=140):
     except Exception:
         s = repr(v)
     s = s.replace('\n', ' ').replace('\r', ' ').strip()
-    if len(s) > limit:
-        return s[:limit - 1] + '…'
+    if len(s) > limit: return s[:limit - 1] + '…'
     return s
 def _order_log(level, action, oid=None, chat_id=None, qty=None, username=None, **extra):
     parts = [f'ORDER EVENT action={action}']
-    if oid is not None:
-        parts.append(f'oid={_short_log_value(oid, 64)}')
-    if chat_id is not None:
-        parts.append(f'chat_id={_short_log_value(chat_id, 64)}')
-    if qty is not None:
-        parts.append(f'qty={_short_log_value(qty, 32)}')
-    if username:
-        parts.append(f"username=@{_short_log_value(str(username).lstrip('@'), 40)}")
+    if oid is not None: parts.append(f'oid={_short_log_value(oid, 64)}')
+    if chat_id is not None: parts.append(f'chat_id={_short_log_value(chat_id, 64)}')
+    if qty is not None: parts.append(f'qty={_short_log_value(qty, 32)}')
+    if username: parts.append(f"username=@{_short_log_value(str(username).lstrip('@'), 40)}")
     for k, v in extra.items():
-        if v is None:
-            continue
+        if v is None: continue
         parts.append(f'{k}={_short_log_value(v)}')
     _log(level, ' '.join(parts))
 def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
 NAME = 'FTS-Plugin'
-VERSION = '1.7.4' # v2 вторая верссия, так как какой то человек написал о баге через секунду после выхода обновления :)
+VERSION = '1.7.5'
 DESCRIPTION = 'Плагин по продаже звезд.'
 CREDITS = _s64('QHRpbmVjaGVsb3ZlYw==')
 UUID = _s64('ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1')
@@ -218,6 +200,8 @@ TONAPI_TON_TOKEN = os.getenv('FTS_TONAPI_TON_TOKEN', 'ton')
 TONAPI_USDT_TOKEN = os.getenv('FTS_TONAPI_USDT_TOKEN', 'usdt')
 FRAGMENT_USER_URLS = [os.getenv('FNP_FRAGMENT_USER_URL', f'{FRAGMENT_BASE}/misc/user/user/'), f'{FRAGMENT_BASE}/misc/user/']
 FRAGMENT_ORDER_STARS = os.getenv('FRAGMENT_ORDER_STARS', f'{FRAGMENT_BASE}/order/stars/')
+FTS_BRIDGE_URL = os.getenv('FTS_BRIDGE_URL', 'https://fts-transfer-token.vercel.app').strip().rstrip('/')
+FTS_BRIDGE_REDEEM_URL = os.getenv('FTS_BRIDGE_REDEEM_URL', f'{FTS_BRIDGE_URL}/api/redeem').strip()
 FNP_STARS_CATEGORY_ID = int(os.getenv('FTS_Plugin_CATEGORY_ID', '2418'))
 FNP_MIN_BALANCE_TON = float(os.getenv('FTS_Plugin_MIN_BALANCE_TON', '5.0'))
 FNP_MIN_BALANCE_USDT = float(os.getenv('FTS_Plugin_MIN_BALANCE_USDT', '5.0'))
@@ -231,8 +215,7 @@ FTS_CURRENCY_TON = 'ton'
 FTS_CURRENCY_USDT_TON = 'usdt_ton'
 FTS_SUPPORTED_CURRENCIES = {FTS_CURRENCY_TON, FTS_CURRENCY_USDT_TON}
 FTS_DEFAULT_CURRENCY = os.getenv('FTS_DEFAULT_CURRENCY', FTS_CURRENCY_TON).strip().lower()
-if FTS_DEFAULT_CURRENCY not in FTS_SUPPORTED_CURRENCIES:
-    FTS_DEFAULT_CURRENCY = FTS_CURRENCY_TON
+if FTS_DEFAULT_CURRENCY not in FTS_SUPPORTED_CURRENCIES: FTS_DEFAULT_CURRENCY = FTS_CURRENCY_TON
 PLUGIN_FOLDER = 'storage/plugins/FTS-Plugin'
 SETTINGS_FILE = os.path.join(PLUGIN_FOLDER, 'settings.json')
 SETTINGS_BAK = SETTINGS_FILE + '.bak'
@@ -244,6 +227,7 @@ LEGACY_SETTINGS_KEY = '__legacy__'
 SETTINGS_META_KEY = '__meta__'
 _CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
 _CFG_TOKEN_ALIASES = ('jwt', 'token', 'fragment_token', 'fragmentApiToken', 'fragment_api_token')
+FTS_BRIDGE_PLUGIN_SECRET = os.getenv('FTS_TRANSFER_TOKEN_PLUGIN_SECRET', os.getenv('FTS_BRIDGE_PLUGIN_SECRET', os.getenv('PLUGIN_API_SECRET', 'fa6db024bd75b3ff33ef46bfae67185d0c343ec47c09f18c2ac594bc276cde1ab887dff104545cd9d5ce955d9db4f7d3'))).strip()
 _SETTINGS_IO_LOCK = threading.RLock()
 _ORDERS_IO_LOCK = threading.RLock()
 _REMINDER_LOCK = threading.RLock()
@@ -257,11 +241,9 @@ def _atomic_write_json(path, data):
         os.fsync(f.fileno())
     os.replace(tmp, path)
 def _try_parse_settings_text(txt):
-    if txt is None:
-        return None
+    if txt is None: return None
     s = txt.lstrip('\ufeff').strip()
-    if not s:
-        return {}
+    if not s: return {}
     try:
         obj = json.loads(s)
         return obj if isinstance(obj, dict) else {}
@@ -269,8 +251,7 @@ def _try_parse_settings_text(txt):
         try:
             dec = json.JSONDecoder()
             obj, idx = dec.raw_decode(s)
-            if isinstance(obj, dict):
-                return obj
+            if isinstance(obj, dict): return obj
         except Exception:
             return None
     except Exception:
@@ -281,8 +262,7 @@ def _load_settings():
         loaded_from = None
         for path, label in ((SETTINGS_FILE, 'settings.json'), (SETTINGS_BAK, 'settings.json.bak')):
             try:
-                if not os.path.exists(path):
-                    continue
+                if not os.path.exists(path): continue
                 with open(path, 'r', encoding='utf-8') as f:
                     txt = f.read()
                 obj = _try_parse_settings_text(txt)
@@ -300,8 +280,7 @@ def _load_settings():
                     loaded_from = label
                     return data
             except Exception as e:
-                if label == 'settings.json':
-                    logger.error(f'Load settings error: {e}')
+                if label == 'settings.json': logger.error(f'Load settings error: {e}')
                 else:
                     logger.warning(f'Load settings backup error: {e}')
         try:
@@ -314,15 +293,13 @@ def _load_settings():
             pass
         return {}
 def _save_settings(data):
-    if not isinstance(data, dict):
-        return
+    if not isinstance(data, dict): return
     with _SETTINGS_IO_LOCK:
         try:
             data, _, _ = _migrate_settings_data(data)
             json.dumps(data, ensure_ascii=False)
             try:
-                if os.path.exists(SETTINGS_FILE):
-                    shutil.copy2(SETTINGS_FILE, SETTINGS_BAK)
+                if os.path.exists(SETTINGS_FILE): shutil.copy2(SETTINGS_FILE, SETTINGS_BAK)
             except Exception:
                 pass
             _atomic_write_json(SETTINGS_FILE, data)
@@ -344,51 +321,39 @@ except Exception as e:
     logger.debug(f'Local file logging init failed: {e}')
 def _cfg_bool(cfg, key, default=False):
     v = cfg.get(key, default)
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(int(v))
+    if isinstance(v, bool): return v
+    if isinstance(v, (int, float)): return bool(int(v))
     if isinstance(v, str):
         s = v.strip().lower()
-        if s in ('1', 'true', 'yes', 'on'):
-            return True
-        if s in ('0', 'false', 'no', 'off', ''):
-            return False
+        if s in ('1', 'true', 'yes', 'on'): return True
+        if s in ('0', 'false', 'no', 'off', ''): return False
     return default
 def _as_int(v, default, min_value=None, max_value=None):
     try:
-        if isinstance(v, bool):
-            raise ValueError()
+        if isinstance(v, bool): raise ValueError()
         if isinstance(v, str):
             m = _re.search('-?\\d+', v.strip())
-            if not m:
-                raise ValueError()
+            if not m: raise ValueError()
             n = int(m.group(0))
         else:
             n = int(float(v))
     except Exception:
         n = int(default)
-    if min_value is not None:
-        n = max(int(min_value), n)
-    if max_value is not None:
-        n = min(int(max_value), n)
+    if min_value is not None: n = max(int(min_value), n)
+    if max_value is not None: n = min(int(max_value), n)
     return n
 def _as_float_cfg(v, default=None, min_value=None):
     try:
-        if isinstance(v, bool) or v is None:
-            return default
+        if isinstance(v, bool) or v is None: return default
         if isinstance(v, str):
             s = v.strip().replace(',', '.')
-            if not s:
-                return default
+            if not s: return default
             m = _re.search('-?\\d+(?:\\.\\d+)?', s)
-            if not m:
-                return default
+            if not m: return default
             f = float(m.group(0))
         else:
             f = float(v)
-        if min_value is not None:
-            f = max(float(min_value), f)
+        if min_value is not None: f = max(float(min_value), f)
         return f
     except Exception:
         return default
@@ -398,8 +363,7 @@ def _sanitize_templates(tpls):
     base = _default_templates().copy()
     if isinstance(tpls, dict):
         for k, v in tpls.items():
-            if k in base and isinstance(v, str) and v.strip():
-                base[k] = v
+            if k in base and isinstance(v, str) and v.strip(): base[k] = v
     return base
 def _sanitize_star_lots(items):
     result = []
@@ -407,84 +371,62 @@ def _sanitize_star_lots(items):
     def add(qty, lot_id, active=True, extra=None):
         q = _as_int(qty, 0, 0)
         lid = _as_int(lot_id, 0, 0)
-        if q <= 0 or lid <= 0:
-            return
+        if q <= 0 or lid <= 0: return
         key = (q, lid)
-        if key in seen:
-            return
+        if key in seen: return
         seen.add(key)
         row = dict(extra or {})
         row['qty'] = q
         row['lot_id'] = lid
         row['active'] = _cfg_bool({'v': active}, 'v', True)
         for num_key in ('price', 'floor_price', 'autodump_floor', 'autodump_floor_rub'):
-            if num_key in row:
-                row[num_key] = _as_float_cfg(row.get(num_key), None, 0.0)
+            if num_key in row: row[num_key] = _as_float_cfg(row.get(num_key), None, 0.0)
         result.append(row)
     if isinstance(items, dict):
         for k, v in items.items():
-            if isinstance(v, dict):
-                add(v.get('qty', k), v.get('lot_id') or v.get('id') or v.get('lot'), v.get('active', True), v)
+            if isinstance(v, dict): add(v.get('qty', k), v.get('lot_id') or v.get('id') or v.get('lot'), v.get('active', True), v)
             else:
                 add(k, v, True, {})
     elif isinstance(items, (list, tuple, set)):
         for it in items:
-            if isinstance(it, dict):
-                add(it.get('qty') or it.get('stars') or it.get('count'), it.get('lot_id') or it.get('id') or it.get('lot'), it.get('active', True), it)
-            elif isinstance(it, (list, tuple)) and len(it) >= 2:
-                add(it[0], it[1], True, {})
+            if isinstance(it, dict): add(it.get('qty') or it.get('stars') or it.get('count'), it.get('lot_id') or it.get('id') or it.get('lot'), it.get('active', True), it)
+            elif isinstance(it, (list, tuple)) and len(it) >= 2: add(it[0], it[1], True, {})
     return sorted(result, key=lambda x: (int(x.get('qty', 0)), int(x.get('lot_id', 0))))
 def _sanitize_lot_ids(items):
     ids = set()
     def add(v):
         try:
             lid = _as_int(v, 0, 1)
-            if lid > 0:
-                ids.add(int(lid))
+            if lid > 0: ids.add(int(lid))
         except Exception:
             pass
     if isinstance(items, dict):
         for k, v in items.items():
-            if isinstance(v, dict):
-                add(v.get('lot_id') or v.get('id') or v.get('lot') or k)
+            if isinstance(v, dict): add(v.get('lot_id') or v.get('id') or v.get('lot') or k)
             else:
                 add(v if not str(k).isdigit() else k)
     elif isinstance(items, (list, tuple, set)):
         for it in items:
-            if isinstance(it, dict):
-                add(it.get('lot_id') or it.get('id') or it.get('lot'))
-            elif isinstance(it, (list, tuple)) and it:
-                add(it[0])
+            if isinstance(it, dict): add(it.get('lot_id') or it.get('id') or it.get('lot'))
+            elif isinstance(it, (list, tuple)) and it: add(it[0])
             else:
                 add(it)
-    elif items is not None:
-        add(items)
+    elif items is not None: add(items)
     return sorted(ids)
 def _sanitize_order_records(items):
-    if not isinstance(items, dict):
-        return {}
+    if not isinstance(items, dict): return {}
     out = {}
     for oid, rec in list(items.items())[-ORDER_RECORDS_LIMIT:]:
-        if oid is None or not isinstance(rec, dict):
-            continue
+        if oid is None or not isinstance(rec, dict): continue
         r = dict(rec)
         r['oid'] = str(r.get('oid') or oid)
         for k in ('created_ts', 'sent_ts', 'updated_ts', 'last_wait_reminder_ts', 'review_reminder_ts', 'finalized_ts'):
-            if k in r:
-                r[k] = _as_int(r.get(k), 0, 0)
-        if 'qty' in r:
-            r['qty'] = _as_int(r.get('qty'), 0, 0)
+            if k in r: r[k] = _as_int(r.get(k), 0, 0)
+        if 'qty' in r: r['qty'] = _as_int(r.get('qty'), 0, 0)
         out[str(oid)] = r
     return out
 def _orders_db_default():
-    return {
-        '__meta__': {
-            'schema': ORDERS_SCHEMA_VERSION,
-            'plugin': NAME,
-            'updated_at': int(time.time())
-        },
-        'records': {}
-    }
+    return {         '__meta__': {             'schema': ORDERS_SCHEMA_VERSION,             'plugin': NAME,             'updated_at': int(time.time())         },         'records': {}     }
 def _merge_order_records(base, incoming):
     out = dict(base or {})
     for oid, raw in _sanitize_order_records(incoming).items():
@@ -495,52 +437,34 @@ def _merge_order_records(base, incoming):
         new_ts = _as_int(new.get('updated_ts'), 0, 0)
         merged = ({**old, **new} if new_ts >= old_ts else {**new, **old})
         chats = []
-        for value in (
-            old.get('chat_id'), new.get('chat_id'),
-            *(old.get('chat_history') or []),
-            *(new.get('chat_history') or [])
-        ):
-            if value is None:
-                continue
+        for value in (             old.get('chat_id'), new.get('chat_id'),             *(old.get('chat_history') or []),             *(new.get('chat_history') or [])         ):
+            if value is None: continue
             value = str(value)
-            if value and value not in chats:
-                chats.append(value)
+            if value and value not in chats: chats.append(value)
         if chats:
             merged['chat_history'] = chats[-8:]
             merged['chat_id'] = str((new if new_ts >= old_ts else old).get('chat_id') or chats[-1])
         merged['oid'] = str(merged.get('oid') or oid_s)
         out[oid_s] = merged
     if len(out) > ORDER_RECORDS_LIMIT:
-        rows = sorted(
-            out.items(),
-            key=lambda kv: _as_int((kv[1] or {}).get('updated_ts'), 0, 0)
-        )
+        rows = sorted(             out.items(),             key=lambda kv: _as_int((kv[1] or {}).get('updated_ts'), 0, 0)         )
         out = dict(rows[-ORDER_RECORDS_LIMIT:])
     return out
 def _normalize_orders_db(data):
     data = data if isinstance(data, dict) else {}
     raw_records = data.get('records')
-    if not isinstance(raw_records, dict):
-        raw_records = {
-            k: v for k, v in data.items()
-            if k != '__meta__' and isinstance(v, dict)
-        }
+    if not isinstance(raw_records, dict): raw_records = {             k: v for k, v in data.items()             if k != '__meta__' and isinstance(v, dict)         }
     result = _orders_db_default()
     result['records'] = _merge_order_records({}, raw_records)
     meta = data.get('__meta__') if isinstance(data.get('__meta__'), dict) else {}
     result['__meta__'].update(meta)
-    result['__meta__'].update({
-        'schema': ORDERS_SCHEMA_VERSION,
-        'plugin': NAME,
-        'updated_at': int(time.time())
-    })
+    result['__meta__'].update({         'schema': ORDERS_SCHEMA_VERSION,         'plugin': NAME,         'updated_at': int(time.time())     })
     return result
 def _load_orders_db():
     with _ORDERS_IO_LOCK:
         for path, label in ((ORDERS_FILE, 'orders.json'), (ORDERS_BAK, 'orders.json.bak')):
             try:
-                if not os.path.exists(path):
-                    continue
+                if not os.path.exists(path): continue
                 with open(path, 'r', encoding='utf-8') as f:
                     obj = _try_parse_settings_text(f.read())
                 if isinstance(obj, dict):
@@ -557,8 +481,7 @@ def _save_orders_db(data):
         try:
             normalized = _normalize_orders_db(data)
             try:
-                if os.path.exists(ORDERS_FILE):
-                    shutil.copy2(ORDERS_FILE, ORDERS_BAK)
+                if os.path.exists(ORDERS_FILE): shutil.copy2(ORDERS_FILE, ORDERS_BAK)
             except Exception:
                 pass
             _atomic_write_json(ORDERS_FILE, normalized)
@@ -569,74 +492,59 @@ def _save_orders_db(data):
 def _get_order_records():
     return dict((_load_orders_db().get('records') or {}))
 def _get_order_record(oid):
-    if not oid:
-        return {}
+    if not oid: return {}
     return dict(_get_order_records().get(str(oid)) or {})
 def _profile_is_runtime_default(raw):
-    if not isinstance(raw, dict) or raw.get('fragment_jwt'):
-        return False
+    if not isinstance(raw, dict) or raw.get('fragment_jwt'): return False
     probe = dict(raw)
     probe.pop('order_records', None)
     default = _sanitize_cfg({})
     for key, value in probe.items():
-        if key == 'config_version':
-            continue
-        if key not in default or value != default.get(key):
-            return False
+        if key == 'config_version': continue
+        if key not in default or value != default.get(key): return False
     return True
 def _read_raw_settings_for_migration():
     for path in (SETTINGS_FILE, SETTINGS_BAK):
         try:
-            if not os.path.exists(path):
-                continue
+            if not os.path.exists(path): continue
             with open(path, 'r', encoding='utf-8') as f:
                 obj = _try_parse_settings_text(f.read())
-            if isinstance(obj, dict):
-                return obj
+            if isinstance(obj, dict): return obj
         except Exception:
             continue
     return {}
 def _migrate_orders_storage():
     raw = _read_raw_settings_for_migration()
-    if not isinstance(raw, dict):
-        return (0, 0)
+    if not isinstance(raw, dict): return (0, 0)
     db = _load_orders_db()
     records = dict(db.get('records') or {})
     moved = 0
     removed_profiles = 0
     cleaned = dict(raw)
     for key, value in list(cleaned.items()):
-        if not isinstance(value, dict) or key == SETTINGS_META_KEY:
-            continue
+        if not isinstance(value, dict) or key == SETTINGS_META_KEY: continue
         profile = dict(value)
         embedded = profile.pop('order_records', None)
         if isinstance(embedded, dict) and embedded:
             before = len(records)
             records = _merge_order_records(records, embedded)
             moved += max(0, len(records) - before)
-        delete_runtime = (
-            key in _RUNTIME_PROFILE_KEYS
-            or str(key).startswith('users-')
-            or (isinstance(embedded, dict) and _profile_is_runtime_default(value))
-        )
+        delete_runtime = (             key in _RUNTIME_PROFILE_KEYS             or str(key).startswith('users-')             or (isinstance(embedded, dict) and _profile_is_runtime_default(value))         )
         if delete_runtime:
             cleaned.pop(key, None)
             removed_profiles += 1
         else:
             cleaned[key] = profile
     db['records'] = records
-    if moved or not os.path.exists(ORDERS_FILE):
-        _save_orders_db(db)
+    if moved or not os.path.exists(ORDERS_FILE): _save_orders_db(db)
     normalized, _, _ = _migrate_settings_data(cleaned)
-    if normalized != raw:
-        _save_settings(normalized)
+    if normalized != raw: _save_settings(normalized)
     return (moved, removed_profiles)
 def _sanitize_cfg(raw, chat_id=None):
     raw = raw if isinstance(raw, dict) else {}
     cfg = dict(raw)
     for alias in _CFG_TOKEN_ALIASES:
-        if not cfg.get('fragment_jwt') and cfg.get(alias):
-            cfg['fragment_jwt'] = cfg.get(alias)
+        if not cfg.get('fragment_jwt') and cfg.get(alias): cfg['fragment_jwt'] = cfg.get(alias)
     cfg['plugin_enabled'] = _cfg_bool(cfg, 'plugin_enabled', True)
     cfg['lots_active'] = _cfg_bool(cfg, 'lots_active', False)
     cfg['auto_refund'] = _cfg_bool(cfg, 'auto_refund', False)
@@ -680,8 +588,7 @@ def _sanitize_cfg(raw, chat_id=None):
 def _migrate_settings_data(data):
     notes = []
     changed = False
-    if not isinstance(data, dict):
-        return ({}, True, ['settings root was not an object'])
+    if not isinstance(data, dict): return ({}, True, ['settings root was not an object'])
     data = dict(data)
     if isinstance(data.get('settings'), dict) and (not any((str(k).lstrip('-').isdigit() for k in data.keys()))):
         data = dict(data['settings'])
@@ -696,8 +603,7 @@ def _migrate_settings_data(data):
         changed = True
         notes.append('old flat config moved to legacy profile')
     for k, v in list(data.items()):
-        if k == SETTINGS_META_KEY:
-            continue
+        if k == SETTINGS_META_KEY: continue
         if isinstance(v, dict) and (k == LEGACY_SETTINGS_KEY or _is_cfg_like_dict(v) or str(k).lstrip('-').isdigit()):
             fixed = _sanitize_cfg(v, chat_id=k)
             if fixed != v:
@@ -710,8 +616,7 @@ def _migrate_settings_data(data):
         changed = True
     return (data, changed, notes)
 def _attach_legacy_cfg_if_needed(data, key, cfg):
-    if isinstance(cfg, dict) and cfg:
-        return (cfg, False)
+    if isinstance(cfg, dict) and cfg: return (cfg, False)
     legacy = data.get(LEGACY_SETTINGS_KEY)
     if isinstance(legacy, dict) and legacy:
         logger.warning(f'Settings legacy profile attached to chat_id={key}; users from <=1.7.0 do not need to delete config')
@@ -732,8 +637,7 @@ def _should_prompt_once(chat_id, order_id, qty, window_sec=20):
     key = f"{chat_id}:{order_id or 'noid'}:{int(qty)}"
     now = time.time()
     last = _anti_dup_prompts.get(key, 0.0)
-    if now - last < window_sec:
-        return False
+    if now - last < window_sec: return False
     _anti_dup_prompts[key] = now
     return True
 def _default_templates():
@@ -746,8 +650,7 @@ def _fmt_tpl(tpl, **kw):
 def _tpl(chat_id, key, **kw):
     cfg_owner = _get_cfg_for_orders(chat_id)
     tpls = (cfg_owner.get('templates') if isinstance(cfg_owner, dict) else None) or {}
-    if not tpls:
-        tpls = _default_templates()
+    if not tpls: tpls = _default_templates()
     default = _default_templates().get(key, '')
     raw = tpls.get(key, default)
     return _fmt_tpl(raw, **kw)
@@ -758,21 +661,17 @@ def _get_cfg(chat_id):
     cfg = _sanitize_cfg(raw_cfg, chat_id=key)
     changed = attached or data.get(key) != cfg
     data[key] = cfg
-    if changed:
-        _save_settings(data)
+    if changed: _save_settings(data)
     return cfg
 def _owner_cfg_entry(data, chat_id=None):
     data = data if isinstance(data, dict) else {}
     key = str(chat_id) if chat_id is not None else None
     if key:
         cfg = data.get(key)
-        if isinstance(cfg, dict) and cfg.get('fragment_jwt'):
-            return (key, cfg)
+        if isinstance(cfg, dict) and cfg.get('fragment_jwt'): return (key, cfg)
     for k, value in data.items():
-        if k in {SETTINGS_META_KEY, LEGACY_SETTINGS_KEY} or k in _RUNTIME_PROFILE_KEYS:
-            continue
-        if isinstance(value, dict) and value.get('fragment_jwt'):
-            return (str(k), value)
+        if k in {SETTINGS_META_KEY, LEGACY_SETTINGS_KEY} or k in _RUNTIME_PROFILE_KEYS: continue
+        if isinstance(value, dict) and value.get('fragment_jwt'): return (str(k), value)
     legacy = data.get(LEGACY_SETTINGS_KEY)
     return (LEGACY_SETTINGS_KEY, legacy) if isinstance(legacy, dict) and legacy.get('fragment_jwt') else (None, None)
 def _cfg_key_for_orders(chat_id):
@@ -784,8 +683,7 @@ def _cfg_key_for_orders(chat_id):
 def _get_cfg_for_orders(chat_id):
     try:
         _key, cfg = _owner_cfg_entry(_load_settings(), chat_id)
-        if isinstance(cfg, dict):
-            return _sanitize_cfg(cfg, chat_id=_key)
+        if isinstance(cfg, dict): return _sanitize_cfg(cfg, chat_id=_key)
     except Exception as e:
         logger.warning(f'_get_cfg_for_orders failed: {e}')
     return _sanitize_cfg({})
@@ -817,16 +715,14 @@ def _state_on(v):
     return '🟢 Включено' if v else '🔴 Выключено'
 def _normalize_stars_currency(v):
     s = str(v or FTS_CURRENCY_TON).strip().lower()
-    if s in {'usdt', 'usd', 'usdt-ton', 'usdt_ton', 'usdt ton'}:
-        return FTS_CURRENCY_USDT_TON
+    if s in {'usdt', 'usd', 'usdt-ton', 'usdt_ton', 'usdt ton'}: return FTS_CURRENCY_USDT_TON
     return FTS_CURRENCY_TON
 def _stars_currency_label(v):
     return 'USDT (TON)' if _normalize_stars_currency(v) == FTS_CURRENCY_USDT_TON else 'TON'
 def _stars_currency_emoji(v):
     return '💲' if _normalize_stars_currency(v) == FTS_CURRENCY_USDT_TON else '💎'
 def _fmt_amount(v, suffix):
-    if isinstance(v, (int, float)):
-        return f'{float(v):.6f}'.rstrip('0').rstrip('.') + f' {suffix}'
+    if isinstance(v, (int, float)): return f'{float(v):.6f}'.rstrip('0').rstrip('.') + f' {suffix}'
     return f'— {suffix}'
 def _wallet_balance_text(cfg):
     return f"{_fmt_amount(cfg.get('balance_ton'), 'TON')} / {_fmt_amount(cfg.get('balance_usdt'), 'USDT')}"
@@ -860,8 +756,7 @@ def _safe_send_tg(bot, chat_id, text, kb=None):
     return None
 def _safe_delete(bot, chat_id, msg_id):
     try:
-        if msg_id:
-            bot.delete_message(chat_id, msg_id)
+        if msg_id: bot.delete_message(chat_id, msg_id)
     except ApiTelegramException as e:
         low = str(e).lower()
         if 'message to delete not found' in low or 'chat not found' in low or 'bot was blocked' in low:
@@ -871,33 +766,29 @@ def _safe_delete(bot, chat_id, msg_id):
     except Exception as e:
         logger.debug(f'delete_message failed: {e}')
 def _about_text():
-    if not _meta_guard():
-        return _tamper_text()
+    if not _meta_guard(): return _tamper_text()
     return f'🧩 <b>Плагин:</b> FTS Plugin\n📦 <b>Версия:</b> <code>{VERSION}</code>\n👤 <b>Автор:</b> <a href="{CREATOR_URL}">{CREDITS}</a>\n\nВыберите раздел ниже.'
 def _settings_text(chat_id):
-    if not _meta_guard():
-        return _tamper_text()
+    if not _meta_guard(): return _tamper_text()
     cfg = _get_cfg(chat_id)
     token_state = 'привязан ✅' if cfg.get('fragment_jwt') else 'не добавлен ❌'
     lot_count = len(cfg.get('star_lots') or [])
     reason = cfg.get('last_auto_deact_reason')
     state_txt, _ = _lots_state_summary(cfg)
     lots_line = f'• Лоты: <b>{state_txt}</b>'
-    if state_txt != '🟢 Включены' and reason:
-        lots_line += f' <i>(авто-выкл: {reason})</i>'
+    if state_txt != '🟢 Включены' and reason: lots_line += f' <i>(авто-выкл: {reason})</i>'
     currency = _normalize_stars_currency(cfg.get('stars_currency'))
     fallback_line = ''
-    if currency == FTS_CURRENCY_USDT_TON:
-        fallback_line = f"• Автопереход USDT → TON: <b>{_state_on(cfg.get('usdt_fallback_to_ton', False))}</b>\n"
+    if currency == FTS_CURRENCY_USDT_TON: fallback_line = f"• Автопереход USDT → TON: <b>{_state_on(cfg.get('usdt_fallback_to_ton', False))}</b>\n"
     min_bal_line = f"• Порог баланса USDT: <code>{cfg.get('min_balance_usdt', FNP_MIN_BALANCE_USDT)}</code>\n" if currency == FTS_CURRENCY_USDT_TON else f"• Порог баланса TON: <code>{cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)}</code>\n"
     return f"<b>Текущие настройки</b>\n\n• Плагин: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n{lots_line}\n• Автовозврат: <b>{_state_on(cfg.get('auto_refund', False))}</b>\n• Автодеактивация: <b>{_state_on(cfg.get('auto_deactivate', True))}</b>\n• Ник из заказа: <b>{_state_on(cfg.get('preorder_username', False))}</b> (<i>без проверки существования</i>)\n• Валюта отправки звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n{fallback_line}• Наценка на звёзды: <code>{cfg.get('markup_percent', 0.0)}%</code>\n• Фильтр лотов по балансу: <b>{_state_on(cfg.get('balance_lot_filter_enabled', True))}</b>\n{min_bal_line}• Токен (JWT): <b>{token_state}</b>\n• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n• ⭐ Звёздных лотов: <b>{lot_count}</b>\n\nВыберите действие:"
 def _token_text(chat_id):
-    if not _meta_guard():
-        return _tamper_text()
+    if not _meta_guard(): return _tamper_text()
     cfg = _get_cfg(chat_id)
     token_state = 'Токен привязан ✅' if cfg.get('fragment_jwt') else 'Токен не импортирован ❌'
     currency = _normalize_stars_currency(cfg.get('stars_currency'))
-    return f'<b>Токен Fragment</b>\n\n• Состояние: <b>{token_state}</b>\n• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n• Валюта звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n\nСоздание токена внутри плагина отключено: старый способ авторизации удалён. Импортируйте готовый JWT из внешнего кабинета/инструмента.\n\nUSDT работает в сети TON, поэтому для оплаты комиссии сети всё равно нужен небольшой запас TON.'
+    bridge_link = _h(FTS_BRIDGE_URL + '/')
+    return (         f'<b>Токен Fragment</b>\n\n'         f'• Состояние: <b>{token_state}</b>\n'         f'• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n'         f'• Валюта звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n\n'         f'🔐 <b>Короткий код вместо длинного JWT</b>\n'         f'1. Откройте сайт <a href="{bridge_link}">FTS Transfer Token</a>.\n'         f'2. Вставьте туда JWT, полученный в Fragment API.\n'         f'3. Скопируйте созданный короткий код.\n'         f'4. Вернитесь сюда и отправьте код одним сообщением.\n\n'         f'Также можно импортировать полный JWT файлом <code>.txt</code> или <code>.json</code>.\n\n'         f'🔗 <a href="https://teletype.in/@tinechelovec/Fragment-API#ByXd">Инструкция по созданию JWT</a>\n\n'         f'⚠️ Временно баланс в USDT может не отображаться.\n\n'         f'USDT работает в сети TON, поэтому для оплаты комиссии сети всё равно нужен небольшой запас TON.'     )
 def _toggle_plugin(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -924,8 +815,7 @@ def _stars_text(chat_id):
     unit = cfg.get('unit_star_price')
     unit_txt = f'{unit}' if isinstance(unit, (int, float)) else '—'
     header = f"<b>⚙️ Настройка лотов</b>\n\nТекущая наценка: <b>{cfg.get('markup_percent', 0.0)}%</b>\nЦена за 1⭐: <b>{unit_txt}</b>\n\n"
-    if not items:
-        body = 'Пока нет лотов со звёздами.\nНажмите «➕ Добавить лот».'
+    if not items: body = 'Пока нет лотов со звёздами.\nНажмите «➕ Добавить лот».'
     else:
         rows = []
         for it in sorted(items, key=lambda x: (int(x.get('qty', 0)), int(x.get('lot_id', 0)))):
@@ -933,8 +823,7 @@ def _stars_text(chat_id):
         body = '\n'.join(rows)
     return header + body
 def _extract_qty_from_title(title):
-    if not title:
-        return None
+    if not title: return None
     s = (title or '').strip()
     m = _re.search('(\\d{1,7})\\s*(?:зв[её]зд\\w*|stars?)\\b', s, _re.I)
     if m:
@@ -970,133 +859,106 @@ def _is_sending(chat_id):
 def _set_sending(chat_id, v):
     k = str(chat_id)
     with _STATE_LOCK:
-        if v:
-            _sending_chats.add(k)
+        if v: _sending_chats.add(k)
         else:
             _sending_chats.discard(k)
 def _extract_username_from_text(text):
-    if not text:
-        return None
+    if not text: return None
     s = _strip_invisible(str(text))
     m = _re.search('(?i)(?:по|by)\\s*username\\s*[,:\\-]?\\s*@?([A-Za-z0-9_]{5,32})', s)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = _re.search('(?i)\\b(?:ник|username)\\s*[:=]\\s*@?([A-Za-z0-9_]{5,32})', s)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     s2 = _re.sub('(?i)покупатель\\s+[A-Za-z0-9_]{5,32}\\s+оплатил(?:\\s+заказ)?[^.\\n]*\\.?', ' ', s)
     m = _re.search('@([A-Za-z0-9_]{5,32})', s2)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     return None
 def _extract_username_from_order_text(text):
-    if not text:
-        return None
+    if not text: return None
     s = _strip_invisible(str(text))
     u = _extract_username_from_text(s)
-    if u:
-        return u
+    if u: return u
     m = _re.search('(?i)(?:https?://)?t\\.me/(?:@)?([A-Za-z0-9_]{5,32})', s)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = _re.search('(?i)\\b(?:tg|тг|telegram|телеграм|телега)\\b\\s*[,:\\-=]?\\s*@?([A-Za-z0-9_]{5,32})', s)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = _re.search('(?i)\\b(?:для|to)\\b\\s*@?([A-Za-z0-9_]{5,32})\\b', s)
     if m:
         cand = m.group(1)
-        if _validate_username(cand) and _re.search('[A-Za-z]', cand):
-            return cand
+        if _validate_username(cand) and _re.search('[A-Za-z]', cand): return cand
     m = _re.fullmatch('\\s*@?([A-Za-z0-9_]{5,32})\\s*[.!?,;:]*\\s*', s)
     if m:
         cand = m.group(1)
-        if _re.search('[A-Za-z]', cand):
-            return cand
+        if _re.search('[A-Za-z]', cand): return cand
     return None
 def _extract_explicit_handle(text):
-    if not text:
-        return None
+    if not text: return None
     m = _re.search('@([A-Za-z0-9_]{5,32})', text)
     return m.group(1) if m else None
 def _extract_username_from_any(x, depth=0):
-    if depth > 2 or x is None:
-        return None
+    if depth > 2 or x is None: return None
     if isinstance(x, str):
         s = str(x)
         m = _re.search('@([A-Za-z0-9_]{4,32})', s)
-        if m:
-            return m.group(1)
+        if m: return m.group(1)
         m = _re.search('(?i)(?:по|by)\\s*username\\s*[,:\\-]?\\s*@?([A-Za-z0-9_]{4,32})', s)
-        if m:
-            return m.group(1)
+        if m: return m.group(1)
         m = _re.search('(?i)\\b(?:ник|username)\\s*[:=]\\s*@?([A-Za-z0-9_]{4,32})', s)
-        if m:
-            return m.group(1)
+        if m: return m.group(1)
         return None
     if isinstance(x, dict):
         for k, v in x.items():
-            if not isinstance(v, str):
-                continue
+            if not isinstance(v, str): continue
             key_l = str(k).lower()
             if any((t in key_l for t in ('telegram', 'tg', 'ник', 'handle', 'stars', 'звезд', 'звезда'))):
                 cand = _extract_username_from_any(v, depth + 1)
-                if cand:
-                    return cand
+                if cand: return cand
         for v in x.values():
             u = _extract_username_from_any(v, depth + 1)
-            if u:
-                return u
+            if u: return u
         return None
     if isinstance(x, (list, tuple, set)):
         for v in x:
             u = _extract_username_from_any(v, depth + 1)
-            if u:
-                return u
+            if u: return u
         return None
     try:
         for name in dir(x):
-            if name.startswith('_'):
-                continue
+            if name.startswith('_'): continue
             try:
                 v = getattr(x, name)
             except Exception:
                 continue
             if isinstance(v, (str, dict, list, tuple, set)):
                 u = _extract_username_from_any(v, depth + 1)
-                if u:
-                    return u
+                if u: return u
     except Exception:
         pass
     return None
 def _check_username_exists(username, jwt):
-    if not username:
-        return False
+    if not username: return False
     uname = username.lstrip('@').strip()
     urls = []
     for base in FRAGMENT_USER_URLS:
         base = (base or '').rstrip('/')
-        if base:
-            urls.append(f'{base}/{uname}/')
+        if base: urls.append(f'{base}/{uname}/')
     urls.append(f'{FRAGMENT_BASE}/misc/user/{uname}/')
     headers_with_jwt = {'Accept': 'application/json'}
-    if jwt:
-        headers_with_jwt['Authorization'] = f'JWT {jwt}'
+    if jwt: headers_with_jwt['Authorization'] = f'JWT {jwt}'
     for url in urls:
         try:
             r = _HTTP.get(url, headers=headers_with_jwt, timeout=8)
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    if isinstance(data, dict) and (data.get('username') or data.get('user') or data.get('id')):
-                        return True
+                    if isinstance(data, dict) and (data.get('username') or data.get('user') or data.get('id')): return True
                 except Exception:
                     pass
             r2 = _HTTP.get(url, headers={'Accept': 'application/json'}, timeout=8)
             if r2.status_code == 200:
                 try:
                     data = r2.json()
-                    if isinstance(data, dict) and (data.get('username') or data.get('user') or data.get('id')):
-                        return True
+                    if isinstance(data, dict) and (data.get('username') or data.get('user') or data.get('id')): return True
                 except Exception:
                     pass
         except Exception as e:
@@ -1107,16 +969,13 @@ def _check_username_exists_throttled(username, jwt, chat_id=None):
     now = time.time()
     last = _last_username_check_ts.get(key, 0.0)
     wait = last + _USERNAME_CHECK_GAP - now
-    if wait > 0:
-        time.sleep(min(wait + random.random() * _USERNAME_CHECK_JITTER, _USERNAME_CHECK_GAP + _USERNAME_CHECK_JITTER))
+    if wait > 0: time.sleep(min(wait + random.random() * _USERNAME_CHECK_JITTER, _USERNAME_CHECK_GAP + _USERNAME_CHECK_JITTER))
     _last_username_check_ts[key] = time.time()
     return _check_username_exists(username, jwt)
 def _as_balance_float(v):
     try:
-        if isinstance(v, bool) or v is None:
-            return None
-        if isinstance(v, (int, float)):
-            return float(v)
+        if isinstance(v, bool) or v is None: return None
+        if isinstance(v, (int, float)): return float(v)
         if isinstance(v, str):
             s = v.strip().replace(',', '.')
             m = _re.search('-?\\d+(?:\\.\\d+)?', s)
@@ -1128,12 +987,10 @@ def _balance_from_node(node):
     if isinstance(node, dict):
         for key in ('balance', 'amount', 'value', 'available', 'free'):
             val = _as_balance_float(node.get(key))
-            if val is not None:
-                return val
+            if val is not None: return val
     return _as_balance_float(node)
 def _extract_wallet_info(data):
-    if not isinstance(data, dict):
-        return (None, None, None)
+    if not isinstance(data, dict): return (None, None, None)
     ver = None
     bal_ton = None
     bal_usdt = None
@@ -1144,33 +1001,25 @@ def _extract_wallet_info(data):
     for key in ('balance_ton', 'balanceTon', 'ton_balance', 'tonBalance', 'balance'):
         if key in data:
             bal_ton = _balance_from_node(data.get(key))
-            if bal_ton is not None:
-                break
+            if bal_ton is not None: break
     for key in ('balance_usdt', 'balanceUsdt', 'usdt_balance', 'usdtBalance', 'usdt_ton_balance', 'usdtTonBalance'):
         if key in data:
             bal_usdt = _balance_from_node(data.get(key))
-            if bal_usdt is not None:
-                break
+            if bal_usdt is not None: break
     for outer in ('wallet', 'ton'):
         node = data.get(outer)
-        if isinstance(node, dict) and bal_ton is None:
-            bal_ton = _balance_from_node(node)
+        if isinstance(node, dict) and bal_ton is None: bal_ton = _balance_from_node(node)
     for outer in ('usdt', 'usdt_ton', 'tether'):
         node = data.get(outer)
-        if bal_usdt is None:
-            bal_usdt = _balance_from_node(node)
+        if bal_usdt is None: bal_usdt = _balance_from_node(node)
     if isinstance(data.get('balances'), (list, tuple)):
         for item in data.get('balances') or []:
-            if not isinstance(item, dict):
-                continue
+            if not isinstance(item, dict): continue
             name = str(item.get('currency') or item.get('symbol') or item.get('asset') or item.get('coin') or '').lower()
             val = _balance_from_node(item)
-            if val is None:
-                continue
-            if 'usdt' in name and bal_usdt is None:
-                bal_usdt = val
-            elif name in {'ton', 'toncoin'} and bal_ton is None:
-                bal_ton = val
+            if val is None: continue
+            if 'usdt' in name and bal_usdt is None: bal_usdt = val
+            elif name in {'ton', 'toncoin'} and bal_ton is None: bal_ton = val
     if bal_ton is None:
         for key in ('nanoton', 'nanoTon', 'nanotons', 'balance_nano', 'balanceNano'):
             if key in data:
@@ -1184,39 +1033,55 @@ def _extract_wallet_info(data):
                 lk = str(k).lower()
                 if 'usdt' in lk:
                     val = _balance_from_node(v)
-                    if val is not None:
-                        return val
+                    if val is not None: return val
                     if isinstance(v, dict):
                         val = walk_usdt(v)
-                        if val is not None:
-                            return val
+                        if val is not None: return val
             for v in x.values():
                 if isinstance(v, (dict, list, tuple)):
                     val = walk_usdt(v)
-                    if val is not None:
-                        return val
+                    if val is not None: return val
         elif isinstance(x, (list, tuple)):
             for v in x:
                 val = walk_usdt(v)
-                if val is not None:
-                    return val
+                if val is not None: return val
         return None
-    if bal_usdt is None:
-        bal_usdt = walk_usdt(data)
+    if bal_usdt is None: bal_usdt = walk_usdt(data)
     return (ver, bal_ton, bal_usdt)
+_FRAGMENT_AUTH_ERRORS = (     'authentication credentials were not provided',     'invalid token', 'token is invalid', 'token not valid',     'given token not valid', 'token has expired', 'expired token',     'signature has expired', 'authentication failed', 'not authenticated' )
+def _fragment_error_detail(data, text=''):
+    if isinstance(data, dict):
+        for key in ('detail', 'error', 'message'):
+            value = data.get(key)
+            if value: return str(value).strip()
+    return str(text or '').strip()[:500]
+def _is_fragment_auth_error(status, data=None, text=''):
+    detail = _fragment_error_detail(data, text).lower()
+    return status in (401, 403) or any(marker in detail for marker in _FRAGMENT_AUTH_ERRORS)
 def _check_fragment_wallet(jwt):
-    last_err = None
+    headers = {'Accept': 'application/json', 'Authorization': f'JWT {jwt}'}
+    last_result = None
     for url in FRAGMENT_WALLET_URLS:
         try:
-            r = _HTTP.get(url, headers={'Accept': 'application/json', 'Authorization': f'JWT {jwt}'}, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            ver, bal_ton, bal_usdt = _extract_wallet_info(data if isinstance(data, dict) else {})
-            return (ver, bal_ton, bal_usdt, data if isinstance(data, dict) else {'raw': data})
+            r = _HTTP.get(url, headers=headers, timeout=20)
+            try:
+                data = r.json()
+            except Exception:
+                data = None
+            raw = dict(data) if isinstance(data, dict) else {'raw': data if data is not None else (r.text or '')[:500]}
+            raw.update({'_http_status': r.status_code, '_url': url})
+            if _is_fragment_auth_error(r.status_code, data, r.text):
+                raw['_auth_error'] = True
+                logger.warning(f'Fragment JWT rejected: HTTP {r.status_code}')
+                return (None, None, None, raw)
+            if r.ok:
+                ver, bal_ton, bal_usdt = _extract_wallet_info(data if isinstance(data, dict) else {})
+                return (ver, bal_ton, bal_usdt, raw)
+            last_result = raw
         except Exception as e:
-            last_err = e
-    logger.warning(f'Fragment wallet check failed: {last_err}')
-    return (None, None, None, None)
+            last_result = {'_network_error': str(e), '_url': url}
+    logger.warning(f'Fragment wallet check failed: {_fragment_error_detail(last_result)}')
+    return (None, None, None, last_result)
 _LS_RE = _re.compile('(?:\\blite\\s*server\\b|liteserver)', _re.I)
 def _is_liteserver_transient_failure(resp_text, status=0, resp_json=None):
     txt = resp_text or ''
@@ -1224,43 +1089,34 @@ def _is_liteserver_transient_failure(resp_text, status=0, resp_json=None):
     if not _LS_RE.search(txt):
         if isinstance(resp_json, dict):
             dump = json.dumps(resp_json, ensure_ascii=False)
-            if not _LS_RE.search(dump):
-                return False
+            if not _LS_RE.search(dump): return False
             low = dump.lower()
         else:
             return False
-    if 'seqno' in low:
-        return False
-    if any((w in low for w in ('not enough', 'insufficient', 'balance', 'username', 'user not found', 'invalid', 'too many requests', '429', 'version'))):
-        return False
-    if status and status not in (0, 408, 500, 502, 503, 504):
-        return False
+    if 'seqno' in low: return False
+    if any((w in low for w in ('not enough', 'insufficient', 'balance', 'username', 'user not found', 'invalid', 'too many requests', '429', 'version'))): return False
+    if status and status not in (0, 408, 500, 502, 503, 504): return False
     return True
 def _fragment_order_status(resp_json):
     if isinstance(resp_json, dict):
         for key in ('status', 'state', 'order_status'):
             val = resp_json.get(key)
-            if val:
-                return str(val).upper()
+            if val: return str(val).upper()
     return ''
 def _fragment_order_id(resp_json):
-    if not isinstance(resp_json, dict):
-        return None
+    if not isinstance(resp_json, dict): return None
     for key in ('id', 'order_id', 'orderId', 'transaction_id', 'transactionId', 'request_id', 'requestId'):
         val = resp_json.get(key)
-        if val:
-            return str(val)
+        if val: return str(val)
     for subkey in ('data', 'result', 'payload'):
         sub = resp_json.get(subkey)
         if isinstance(sub, dict):
             val = _fragment_order_id(sub)
-            if val:
-                return val
+            if val: return val
     return None
 def _is_balance_failure_resp(resp):
     try:
-        if not isinstance(resp, dict):
-            return False
+        if not isinstance(resp, dict): return False
         raw = resp.get('json')
         text = resp.get('text') or ''
         dump = json.dumps(raw, ensure_ascii=False) if isinstance(raw, (dict, list)) else str(raw or '')
@@ -1270,8 +1126,15 @@ def _is_balance_failure_resp(resp):
         return False
 def _order_stars_with_retry(jwt, username, quantity, show_sender=False, webhook_url=None, retry_enabled=False, currency=None, response_url=None):
     resp = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url)
-    if resp.get('ok') or not retry_enabled:
-        return resp
+    if resp.get('ok') or not retry_enabled: return resp
+    if resp.get('safe_to_retry'):
+        delay = random.uniform(LITESERVER_RETRY_SLEEP_MIN, LITESERVER_RETRY_SLEEP_MAX)
+        _log('warn', f'SEND retry: connection was not established, attempt=2, sleep={delay:.2f}s')
+        time.sleep(delay)
+        resp2 = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url)
+        resp2['_retried'] = True
+        return resp2
+    if resp.get('uncertain'): return resp
     if _is_liteserver_transient_failure(resp.get('text', ''), int(resp.get('status') or 0), resp.get('json')):
         delay = random.uniform(LITESERVER_RETRY_SLEEP_MIN, LITESERVER_RETRY_SLEEP_MAX)
         _log('warn', f'SEND retry: liteserver transient error, attempt=2, sleep={delay:.2f}s')
@@ -1281,18 +1144,15 @@ def _order_stars_with_retry(jwt, username, quantity, show_sender=False, webhook_
         return resp2
     return resp
 def _order_stars(jwt, username, quantity, show_sender=False, webhook_url=None, currency=None, response_url=None):
+    u = username.lstrip('@').strip()
+    cur = _normalize_stars_currency(currency)
     try:
-        u = username.lstrip('@').strip()
-        cur = _normalize_stars_currency(currency)
         payload = {'username': u, 'quantity': quantity, 'show_sender': bool(show_sender)}
-        if cur == FTS_CURRENCY_USDT_TON:
-            payload['currency'] = FTS_CURRENCY_USDT_TON
-        if response_url:
-            payload['response_url'] = response_url
-        elif webhook_url:
-            payload['response_url'] = webhook_url
+        if cur == FTS_CURRENCY_USDT_TON: payload['currency'] = FTS_CURRENCY_USDT_TON
+        if response_url: payload['response_url'] = response_url
+        elif webhook_url: payload['response_url'] = webhook_url
         _log('info', f'SEND start: {quantity}⭐ → @{u} currency={cur}')
-        r = _HTTP.post(FRAGMENT_ORDER_STARS, json=payload, headers={'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': f'JWT {jwt}'}, timeout=120)
+        r = _HTTP.post(             FRAGMENT_ORDER_STARS,             json=payload,             headers={                 'Content-Type': 'application/json',                 'Accept': 'application/json',                 'Authorization': f'JWT {jwt}'             },             timeout=(FRAGMENT_CONNECT_TIMEOUT, FRAGMENT_READ_TIMEOUT)         )
         resp_json = None
         ct = (r.headers.get('Content-Type') or '').lower()
         if 'application/json' in ct:
@@ -1305,19 +1165,26 @@ def _order_stars(jwt, username, quantity, show_sender=False, webhook_url=None, c
         if isinstance(resp_json, dict):
             for k in ('ok', 'success', 'sent', 'purchased', 'done'):
                 v = resp_json.get(k)
-                if isinstance(v, bool) and v:
-                    ok_flags.add(k)
-            if status_val in {'ok', 'success', 'completed', 'complete', 'done', 'pending', 'blockchain_sent'}:
-                ok_flags.add('status')
-            if any((k in resp_json for k in ('tx', 'transaction', 'order_id', 'orderId', 'id', 'transaction_id', 'request_id'))):
-                ok_flags.add('tx')
+                if isinstance(v, bool) and v: ok_flags.add(k)
+            if status_val in {'ok', 'success', 'completed', 'complete', 'done', 'pending', 'blockchain_sent'}: ok_flags.add('status')
+            if any((k in resp_json for k in ('tx', 'transaction', 'order_id', 'orderId', 'id', 'transaction_id', 'request_id'))): ok_flags.add('tx')
         ok = bool(ok_flags) and resp_json is not None
         body_text = (r.text or '')[:400]
         _log('info' if ok else 'error', f"SEND result: ok={ok} status={r.status_code} currency={cur} order_status={status_val or '-'} flags={','.join(sorted(ok_flags)) or '-'} body={body_text}")
-        return {'ok': ok, 'status': r.status_code, 'text': r.text, 'json': resp_json, 'currency': cur, 'order_status': status_val.upper() if status_val else None, 'fragment_order_id': _fragment_order_id(resp_json)}
+        return {             'ok': ok,             'status': r.status_code,             'text': r.text,             'json': resp_json,             'currency': cur,             'order_status': status_val.upper() if status_val else None,             'fragment_order_id': _fragment_order_id(resp_json)         }
+    except requests.exceptions.ConnectTimeout as e:
+        _log('error', f'SEND connect timeout: {e}')
+        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'connect_timeout',             'safe_to_retry': True,             'uncertain': False         }
+    except requests.exceptions.ReadTimeout as e:
+        _log('error', f'SEND read timeout, delivery status unknown: {e}')
+        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'read_timeout',             'safe_to_retry': False,             'uncertain': True         }
+    except requests.exceptions.ConnectionError as e:
+        _log('error', f'SEND connection error, delivery status unknown: {e}')
+        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'connection_error',             'safe_to_retry': False,             'uncertain': True         }
     except Exception as e:
         _log('error', f'SEND exception: {e}')
-        return {'ok': False, 'status': 0, 'text': str(e), 'json': None, 'currency': _normalize_stars_currency(currency)}
+        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'unexpected_error',             'safe_to_retry': False,             'uncertain': False         }
+
 def _send_stars_with_currency_fallback(cardinal, chat_id, cfg, jwt, username, quantity, show_sender=False):
     cur = _normalize_stars_currency(cfg.get('stars_currency'))
     resp = _order_stars_with_retry(jwt, username=username, quantity=quantity, show_sender=show_sender, retry_enabled=bool(cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT)), currency=cur)
@@ -1353,33 +1220,24 @@ def _queue_timeout_sec(chat_id):
     except Exception:
         return int(os.getenv('FTS_QUEUE_TIMEOUT_SEC', '300'))
 def _queue_mode_label(mode, timeout_sec):
-    if mode == 1:
-        return 'СТРОГАЯ'
-    if mode == 2:
-        return 'ПРОПУСК ГОТОВЫХ'
-    if mode == 3:
-        return f'ТАЙМАУТ→В КОНЕЦ ({timeout_sec // 60}М)'
+    if mode == 1: return 'СТРОГАЯ'
+    if mode == 2: return 'ПРОПУСК ГОТОВЫХ'
+    if mode == 3: return f'ТАЙМАУТ→В КОНЕЦ ({timeout_sec // 60}М)'
     return 'СТРОГАЯ'
 def _maybe_rotate_queue_head(cardinal, any_chat_id):
     try:
-        if _queue_mode(any_chat_id) != 3:
-            return False
+        if _queue_mode(any_chat_id) != 3: return False
         q = _q(any_chat_id)
-        if not q:
-            return False
+        if not q: return False
         head = q[0]
-        if head.get('finalized') or not _allowed_stages(head):
-            return False
+        if head.get('finalized') or not _allowed_stages(head): return False
         stage = str(head.get('stage'))
-        if stage not in {'await_username', 'await_confirm'}:
-            return False
+        if stage not in {'await_username', 'await_confirm'}: return False
         ts = head.get('turn_ts')
         if not ts:
-            if head.get('prompted') or _was_prompted(head.get('chat_id'), head.get('order_id')):
-                head['turn_ts'] = time.time()
+            if head.get('prompted') or _was_prompted(head.get('chat_id'), head.get('order_id')): head['turn_ts'] = time.time()
             return False
-        if time.time() - float(ts) < float(_queue_timeout_sec(any_chat_id)):
-            return False
+        if time.time() - float(ts) < float(_queue_timeout_sec(any_chat_id)): return False
         moved = q.pop(0)
         oid = moved.get('order_id')
         cid = moved.get('chat_id')
@@ -1388,12 +1246,10 @@ def _maybe_rotate_queue_head(cardinal, any_chat_id):
         moved['preconfirmed'] = False
         moved['auto_attempted_for'] = None
         moved['queue_notified'] = False
-        if oid:
-            _unmark_prompted(cid, oid, everywhere=True)
+        if oid: _unmark_prompted(cid, oid, everywhere=True)
         q.append(moved)
         try:
-            if cid is not None:
-                _safe_send(cardinal, cid, '⏳ Вы не ответили — перенёс заказ в конец очереди. Напишите @username/«+», когда будете готовы.')
+            if cid is not None: _safe_send(cardinal, cid, '⏳ Вы не ответили — перенёс заказ в конец очереди. Напишите @username/«+», когда будете готовы.')
         except Exception:
             pass
         logger.info(f'[QUEUE] timeout move to end: OID={oid} CID={cid}')
@@ -1523,11 +1379,7 @@ def _order_is_stars(order):
 FTS_LOT_SAVE_VERIFY_DELAY_SEC = float(os.getenv('FTS_LOT_SAVE_VERIFY_DELAY_SEC', '1.0'))
 FTS_LOT_SAVE_RETRIES = max(1, min(3, int(os.getenv('FTS_LOT_SAVE_RETRIES', '3'))))
 FTS_LOT_SAVE_LOCATION = os.getenv('FTS_LOT_SAVE_LOCATION', 'trade').strip() or 'trade'
-FTS_LOT_FALLBACK_UA = os.getenv(
-    'FTS_LOT_FALLBACK_UA',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-).strip()
+FTS_LOT_FALLBACK_UA = os.getenv(     'FTS_LOT_FALLBACK_UA',     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '     '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' ).strip()
 _LOT_UA_WARNING_SHOWN = False
 _LOT_SAVE_FAILURES = {}
 def _remember_lot_save_failure(lot_id, code=None, message=None):
@@ -1536,11 +1388,7 @@ def _remember_lot_save_failure(lot_id, code=None, message=None):
         if not code and not message:
             _LOT_SAVE_FAILURES.pop(key, None)
             return
-        _LOT_SAVE_FAILURES[key] = {
-            'code': str(code or 'save_failed'),
-            'message': str(message or 'FunPay не сохранил изменение лота.'),
-            'ts': int(time.time())
-        }
+        _LOT_SAVE_FAILURES[key] = {             'code': str(code or 'save_failed'),             'message': str(message or 'FunPay не сохранил изменение лота.'),             'ts': int(time.time())         }
 def _lot_save_failure(lot_id):
     try:
         key = int(lot_id)
@@ -1555,15 +1403,13 @@ def _lot_failure_user_text(lot_ids=None, fallback='Не удалось изме�
         if not item:
             continue
         if item.get('code') == 'premium_limit':
-            return ('FunPay не включил лот: достигнут лимит активных лотов. '
-                    'Выключите другой активный лот или увеличьте лимит на странице Premium.')
+            return ('FunPay не включил лот: достигнут лимит активных лотов. '                     'Выключите другой активный лот или увеличьте лимит на странице Premium.')
         if item.get('message'):
             return _short_log_value(item.get('message'), 190)
     return fallback
 def _is_terminal_lot_save_error(value):
     low = str(value or '').lower()
-    return ('funpay_premium_limit' in low or '/premium/limit' in low or
-            'достигнут лимит активных лотов' in low)
+    return ('funpay_premium_limit' in low or '/premium/limit' in low or             'достигнут лимит активных лотов' in low)
 def _lot_raw_fields(fields):
     if fields is None:
         return None
@@ -1580,10 +1426,7 @@ def _lot_fields_diag(fields):
     raw = _lot_raw_fields(fields)
     raw_active = raw.get('active') if isinstance(raw, dict) else None
     raw_amount = raw.get('amount') if isinstance(raw, dict) else None
-    return (f"active={bool(getattr(fields, 'active', False))} "
-            f"raw_active={_short_log_value(raw_active, 32)} "
-            f"amount={_short_log_value(getattr(fields, 'amount', raw_amount), 32)} "
-            f"raw_amount={_short_log_value(raw_amount, 32)}")
+    return (f"active={bool(getattr(fields, 'active', False))} "             f"raw_active={_short_log_value(raw_active, 32)} "             f"amount={_short_log_value(getattr(fields, 'amount', raw_amount), 32)} "             f"raw_amount={_short_log_value(raw_amount, 32)}")
 def _response_diag(response, limit=350):
     if response is None:
         return 'response=None'
@@ -1611,8 +1454,7 @@ def _funpay_save_error(response):
     if isinstance(data, dict):
         redirect_url = str(data.get('url') or data.get('redirect') or data.get('redirect_url') or '')
         if '/premium/limit' in redirect_url.lower():
-            return ('FUNPAY_PREMIUM_LIMIT: достигнут лимит активных лотов FunPay; '
-                    'выключите другой активный лот или увеличьте лимит на странице Premium')
+            return ('FUNPAY_PREMIUM_LIMIT: достигнут лимит активных лотов FunPay; '                     'выключите другой активный лот или увеличьте лимит на странице Premium')
         errors = data.get('errors')
         error = data.get('error')
         if error or errors:
@@ -1688,13 +1530,7 @@ def _lot_payload(fields, account=None, target=None):
 def _save_lot_raw(account, fields, target=None):
     fields, payload = _lot_payload(fields, account, target=target)
     lot_id = int(getattr(fields, 'lot_id', payload.get('offer_id') or 0))
-    headers = {
-        'accept': '*/*',
-        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'x-requested-with': 'XMLHttpRequest',
-        'origin': 'https://funpay.com',
-        'referer': f'https://funpay.com/lots/offerEdit?offer={lot_id}'
-    }
+    headers = {         'accept': '*/*',         'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',         'x-requested-with': 'XMLHttpRequest',         'origin': 'https://funpay.com',         'referer': f'https://funpay.com/lots/offerEdit?offer={lot_id}'     }
     method = getattr(account, 'method', None)
     if not callable(method):
         raise RuntimeError('FunPayAPI Account.method is unavailable')
@@ -1810,17 +1646,12 @@ def _set_lot_active_verified(cardinal, lot_id, enabled):
                 _remember_lot_save_failure(lot_id)
                 logger.info(f"[LOTS] {'activated' if target else 'deactivated'} lot={lot_id} verified=True mode={save_mode} attempt={attempt} via={verify_diag}")
                 return True
-            last_error = (f"state mismatch after {save_mode}: expected={target} actual={actual}; "
-                          f"verify={verify_diag}; response={_response_diag(result)}")
+            last_error = (f"state mismatch after {save_mode}: expected={target} actual={actual}; "                           f"verify={verify_diag}; response={_response_diag(result)}")
             logger.warning(f'[LOTS] lot={lot_id} {last_error}')
         except Exception as e:
             last_error = str(e)
             if _is_terminal_lot_save_error(last_error):
-                _remember_lot_save_failure(
-                    lot_id,
-                    'premium_limit',
-                    'Достигнут лимит активных лотов FunPay. Выключите другой лот или увеличьте лимит Premium.'
-                )
+                _remember_lot_save_failure(                     lot_id,                     'premium_limit',                     'Достигнут лимит активных лотов FunPay. Выключите другой лот или увеличьте лимит Premium.'                 )
                 logger.error(f'[LOTS] lot={lot_id} activation blocked by FunPay premium active-lot limit; no more retries')
                 break
             logger.warning(f'[LOTS] lot={lot_id} save attempt={attempt}/{FTS_LOT_SAVE_RETRIES} failed: {e}')
@@ -2401,13 +2232,7 @@ def _ask_import_saves(bot, call):
 def _download_saves(bot, call):
     chat_id = call.message.chat.id
     try:
-        backup = {
-            'format': 'FTS-Plugin-backup',
-            'backup_version': 2,
-            'created_at': int(time.time()),
-            'settings': _load_settings(),
-            'orders': _load_orders_db()
-        }
+        backup = {             'format': 'FTS-Plugin-backup',             'backup_version': 2,             'created_at': int(time.time()),             'settings': _load_settings(),             'orders': _load_orders_db()         }
         payload = json.dumps(backup, indent=4, ensure_ascii=False).encode('utf-8')
         fname = f"FTS-Plugin-backup-{time.strftime('%Y%m%d-%H%M%S')}.json"
         bot.send_document(chat_id, (fname, payload), caption='💾 Резервная копия настроек и базы заказов FTS-Plugin. Файл может содержать JWT-токен.')
@@ -2449,7 +2274,8 @@ def _import_settings_payload(raw_text):
         return (False, f'Не удалось импортировать сохранения: {e}')
 def _token_kb():
     kb = K()
-    kb.add(B('📥 Импорт токена', callback_data=CBT_SET_JWT))
+    kb.add(B('🌐 Получить короткий код', url=FTS_BRIDGE_URL + '/'))
+    kb.add(B('🔑 Подключить токен или код', callback_data=CBT_SET_JWT))
     kb.add(B('🗑 Удалить токен', callback_data=CBT_DEL_JWT))
     kb.add(B('◀️ Назад', callback_data=CBT_SETTINGS))
     return kb
@@ -3707,6 +3533,9 @@ def _should_auto_refund(cfg, oid, resp=None, reason=''):
     if str(oid) in _done_oids:
         logger.warning(f'[REFUND] skip #{oid}: order already marked as sent')
         return False
+    if (resp or {}).get('uncertain'):
+        logger.warning(f'[REFUND] skip #{oid}: delivery status is unknown after network timeout')
+        return False
     if _resp_indicates_delivery(resp):
         logger.warning(f'[REFUND] skip #{oid}: Fragment response looks delivered/pending')
         return False
@@ -3982,12 +3811,7 @@ def _open_settings(bot, call):
         except Exception:
             pass
 def _update_menu_text():
-    return (f'<b>⬆️ Обновление FTS-Plugin</b>\n\n'
-            f'Текущая версия: <code>{_h(VERSION)}</code>\n\n'
-            '• <b>Обновить локально</b> — пришлите новый файл плагина <code>.py</code> в этот чат. '
-            'Он будет проверен и установлен вместо текущего файла.\n'
-            '• <b>Обновить онлайн</b> — проверить новую версию и скачать её с GitHub.\n\n'
-            'Перед заменой автоматически создаётся резервная копия текущего плагина и настроек.')
+    return (f'<b>⬆️ Обновление FTS-Plugin</b>\n\n'             f'Текущая версия: <code>{_h(VERSION)}</code>\n\n'             '• <b>Обновить локально</b> — пришлите новый файл плагина <code>.py</code> в этот чат. '             'Он будет проверен и установлен вместо текущего файла.\n'             '• <b>Обновить онлайн</b> — проверить новую версию и скачать её с GitHub.\n\n'             'Перед заменой автоматически создаётся резервная копия текущего плагина и настроек.')
 def _update_menu_kb():
     kb = K()
     kb.row(B('📥 Обновить локально', callback_data=CBT_UPDATE_PLUGIN_LOCAL))
@@ -4012,15 +3836,7 @@ def _ask_local_plugin_update(bot, call):
         bot.answer_callback_query(call.id, 'Пришлите файл плагина .py')
     except Exception:
         pass
-    msg = bot.send_message(
-        chat_id,
-        '📥 <b>Локальное обновление</b>\n\n'
-        'Пришлите новый файл FTS-Plugin с расширением <code>.py</code>.\n'
-        'После проверки файл сразу заменит текущий плагин. Старый файл и настройки будут сохранены в резервных копиях.\n\n'
-        'Для отмены: <code>/cancel</code>',
-        parse_mode='HTML',
-        reply_markup=_kb_cancel_fsm()
-    )
+    msg = bot.send_message(         chat_id,         '📥 <b>Локальное обновление</b>\n\n'         'Пришлите новый файл FTS-Plugin с расширением <code>.py</code>.\n'         'После проверки файл сразу заменит текущий плагин. Старый файл и настройки будут сохранены в резервных копиях.\n\n'         'Для отмены: <code>/cancel</code>',         parse_mode='HTML',         reply_markup=_kb_cancel_fsm()     )
     state = _fsm.get(chat_id) or state
     _track_fsm_mid(state, getattr(msg, 'message_id', None))
     _fsm[chat_id] = state
@@ -4080,15 +3896,7 @@ def _install_local_plugin_update(payload, original_name=None):
     plugin_file = os.path.abspath(__file__)
     stamp = time.strftime('%Y%m%d-%H%M%S')
     backup_file = plugin_file + f'.pre-local-update.{stamp}.bak'
-    result = {
-        'ok': False,
-        'changed': False,
-        'current_version': VERSION,
-        'remote_version': None,
-        'backup_file': backup_file,
-        'source_name': original_name,
-        'error': None,
-    }
+    result = {         'ok': False,         'changed': False,         'current_version': VERSION,         'remote_version': None,         'backup_file': backup_file,         'source_name': original_name,         'error': None,     }
     tmp_file = plugin_file + '.local-update.tmp'
     try:
         source, remote_version = _validate_plugin_update_payload(payload, plugin_file, allow_same_version=True)
@@ -4116,10 +3924,7 @@ def _install_local_plugin_update(payload, original_name=None):
         os.replace(tmp_file, plugin_file)
         _cleanup_plugin_bytecode(plugin_file)
         result.update(ok=True, changed=True)
-        logger.warning(
-            f'Plugin updated from local Telegram file: {VERSION} -> {remote_version}; '
-            f'source={original_name or "unknown"}; backup={backup_file}'
-        )
+        logger.warning(             f'Plugin updated from local Telegram file: {VERSION} -> {remote_version}; '             f'source={original_name or "unknown"}; backup={backup_file}'         )
         return result
     except Exception as e:
         result['error'] = str(e)
@@ -4569,9 +4374,7 @@ def _star_act_all(bot, call):
     managed_ids = _merge_lot_ids(_managed_lot_ids_from_cfg(cfg), [x.get('lot_id') for x in items])
     _set_cfg(chat_id, star_lots=items, lots_active=lots_active, managed_lot_ids=managed_ids, last_auto_deact_reason=None if lots_active else cfg.get('last_auto_deact_reason'), last_lot_toggle_report=f'star_act_all: {_lot_report_short(rep)}', last_lot_toggle_ts=int(time.time()))
     try:
-        text = ('Лоты включены.' if len(ok_ids) == len(items) else
-                _lot_failure_user_text([x.get('lot_id') for x in items if int(x.get('lot_id') or 0) not in ok_ids],
-                                       f'Включено {len(ok_ids)} из {len(items)}. Подробности находятся в логе.'))
+        text = ('Лоты включены.' if len(ok_ids) == len(items) else                 _lot_failure_user_text([x.get('lot_id') for x in items if int(x.get('lot_id') or 0) not in ok_ids],                                        f'Включено {len(ok_ids)} из {len(items)}. Подробности находятся в логе.'))
         bot.answer_callback_query(call.id, text, show_alert=len(ok_ids) != len(items))
     except Exception:
         pass
@@ -4623,8 +4426,7 @@ def _star_toggle(bot, call):
     managed_ids = _merge_lot_ids(_managed_lot_ids_from_cfg(cfg), [lot_id])
     _set_cfg(chat_id, star_lots=items, lots_active=any((bool(x.get('active')) for x in items)), managed_lot_ids=managed_ids, last_auto_deact_reason=None if enabled and ok else cfg.get('last_auto_deact_reason'), last_lot_toggle_report=f'star_toggle lot={lot_id} enabled={enabled} ok={ok}', last_lot_toggle_ts=int(time.time()))
     try:
-        text = ('Лот включён.' if enabled and ok else 'Лот выключен.' if ok else
-                _lot_failure_user_text([lot_id]))
+        text = ('Лот включён.' if enabled and ok else 'Лот выключен.' if ok else                 _lot_failure_user_text([lot_id]))
         bot.answer_callback_query(call.id, text, show_alert=not ok)
     except Exception:
         pass
@@ -5172,7 +4974,8 @@ def _ask_set_jwt(bot, call):
         bot.answer_callback_query(call.id)
     except Exception:
         pass
-    m = bot.send_message(chat_id, 'Пришлите готовый JWT текстом или файлом (.txt / .json). В JSON токен может лежать в ключах token/jwt/access/authorization. (или /cancel)', reply_markup=_kb_cancel_fsm())
+    bridge_link = _h(FTS_BRIDGE_URL + '/')
+    m = bot.send_message(         chat_id,         (             f'<b>Подключение токена Fragment</b>\n\n'             f'Удобный способ — использовать короткий код:\n'             f'1. Откройте <a href="{bridge_link}">FTS Transfer Token</a>.\n'             f'2. Вставьте на сайте свой JWT.\n'             f'3. Скопируйте полученный короткий код.\n'             f'4. Отправьте этот код сюда одним сообщением.\n\n'             f'Либо сохраните полный JWT в файл <code>.txt</code> или '             f'<code>.json</code> и пришлите файл сюда.\n\n'             f'Для отмены: /cancel'         ),         parse_mode='HTML',         reply_markup=_kb_cancel_fsm(),         disable_web_page_preview=True     )
     st = _fsm.get(chat_id) or st
     _track_fsm_mid(st, getattr(m, 'message_id', None))
     _fsm[chat_id] = st
@@ -5184,44 +4987,94 @@ def _del_jwt(bot, call):
     except Exception:
         pass
     _open_token(bot, call)
+_JWT_RE = _re.compile(r'[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+')
+_JWT_JSON_KEYS = {'token', 'jwt', 'access', 'access_token', 'authorization', 'auth', 'fragment_jwt'}
 def _clean_jwt_text(s):
-    try:
-        s = (s or '').strip().strip('"').strip("'")
-        s = _re.sub('^(?:JWT|Bearer)\\s+', '', s, flags=_re.I)
-        s = _re.sub('\\s+', '', s)
-        return s
-    except Exception:
-        return s or ''
+    s = str(s or '').strip().strip('"').strip("'")
+    return _re.sub(r'\s+', '', _re.sub(r'^(?:JWT|Bearer)\s+', '', s, flags=_re.I))
 def _is_jwt_like(s):
-    if not s or s.count('.') < 2:
-        return False
-    return bool(_re.fullmatch('[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+', s))
+    return bool(_JWT_RE.fullmatch(_clean_jwt_text(s)))
+def _jwt_from_text(s):
+    match = _JWT_RE.search(_clean_jwt_text(s))
+    return match.group(0) if match else None
 def _find_jwt_in_json(obj):
-    CAND_KEYS = {'token', 'jwt', 'access', 'authorization', 'Authorization', 'auth', 'detail'}
-    try:
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k in CAND_KEYS and isinstance(v, str):
-                    cand = _clean_jwt_text(v)
-                    if _is_jwt_like(cand) or len(cand) > 16:
-                        return cand
-            for subk in ('data', 'result', 'payload'):
-                if subk in obj:
-                    v = _find_jwt_in_json(obj[subk])
-                    if v:
-                        return v
-            for v in obj.values():
-                vv = _find_jwt_in_json(v)
-                if vv:
-                    return vv
-        elif isinstance(obj, list):
-            for v in obj:
-                vv = _find_jwt_in_json(v)
-                if vv:
-                    return vv
-    except Exception:
-        pass
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if str(key).lower() in _JWT_JSON_KEYS and isinstance(value, str):
+                token = _jwt_from_text(value)
+                if token:
+                    return token
+        for value in obj.values():
+            token = _find_jwt_in_json(value)
+            if token:
+                return token
+    elif isinstance(obj, list):
+        for value in obj:
+            token = _find_jwt_in_json(value)
+            if token:
+                return token
     return None
+_FTS_BRIDGE_CODE_RE = _re.compile(     r'FTS-[A-HJ-NP-Z2-9]{4}(?:-[A-HJ-NP-Z2-9]{4}){3}',     _re.I )
+def _normalize_bridge_code(value):
+    return _re.sub(r'\s+', '', str(value or '')).strip().upper()
+def _bridge_code_from_text(value):
+    match = _FTS_BRIDGE_CODE_RE.search(_normalize_bridge_code(value))
+    return match.group(0).upper() if match else None
+def _bridge_plugin_secret():
+    if FTS_BRIDGE_PLUGIN_SECRET:
+        return FTS_BRIDGE_PLUGIN_SECRET
+    try:
+        secret_path = os.path.join(PLUGIN_FOLDER, 'bridge_secret.txt')
+        if os.path.isfile(secret_path):
+            with open(secret_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+    except Exception as e:
+        logger.debug(f'Bridge secret file read failed: {e}')
+    return ''
+def _redeem_bridge_code(code):
+    normalized = _bridge_code_from_text(code)
+    if not normalized:
+        return (False, 'format', None)
+    bridge_secret = _bridge_plugin_secret()
+    if not bridge_secret:
+        return (False, 'not_configured', None)
+    headers = {         'Accept': 'application/json',         'Content-Type': 'application/json',         'Authorization': f'Bearer {bridge_secret}'     }
+    try:
+        response = _HTTP.post(             FTS_BRIDGE_REDEEM_URL,             json={'code': normalized},             headers=headers,             timeout=25         )
+    except requests.RequestException as e:
+        logger.warning(f'FTS Transfer Token request failed: {_short_log_value(e)}')
+        return (False, 'unavailable', {'error': str(e)})
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+    if response.status_code in (401, 403):
+        logger.warning('FTS Transfer Token rejected plugin authorization')
+        return (False, 'unauthorized', payload)
+    if response.status_code in (400, 404):
+        return (False, 'invalid', payload)
+    if not response.ok:
+        logger.warning(f'FTS Transfer Token HTTP {response.status_code}')
+        return (False, 'unavailable', payload)
+    token = _clean_jwt_text(payload.get('token') if isinstance(payload, dict) else '')
+    if not _is_jwt_like(token):
+        logger.warning('FTS Transfer Token returned response without a valid JWT')
+        return (False, 'bad_response', payload)
+    result = dict(payload) if isinstance(payload, dict) else {}
+    result['token'] = token
+    result['code'] = normalized
+    return (True, 'ok', result)
+def _validate_fragment_jwt(jwt):
+    if not _is_jwt_like(jwt):
+        return (False, 'format', None, None, None, None)
+    ver, bal_ton, bal_usdt, raw = _check_fragment_wallet(jwt)
+    if isinstance(raw, dict) and raw.get('_auth_error'):
+        return (False, 'auth', ver, bal_ton, bal_usdt, raw)
+    if isinstance(bal_ton, (int, float)) or isinstance(bal_usdt, (int, float)):
+        return (True, 'ok', ver, bal_ton, bal_usdt, raw)
+    status = int((raw or {}).get('_http_status') or 0) if isinstance(raw, dict) else 0
+    reason = 'no_balance' if 200 <= status < 300 else 'unavailable'
+    return (False, reason, ver, bal_ton, bal_usdt, raw)
 def _handle_fsm(message, cardinal):
     chat_id = message.chat.id
     text = (message.text or '').strip()
@@ -5546,29 +5399,17 @@ def _handle_fsm(message, cardinal):
         if text.lower() in ('/cancel', 'cancel', 'отмена'):
             _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
             _fsm.pop(chat_id, None)
-            cardinal.telegram.bot.send_message(
-                chat_id,
-                '❌ Локальное обновление отменено.',
-                reply_markup=_update_menu_kb()
-            )
+            cardinal.telegram.bot.send_message(                 chat_id,                 '❌ Локальное обновление отменено.',                 reply_markup=_update_menu_kb()             )
             return
         document = getattr(message, 'document', None)
         if document is None:
             _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
-            cardinal.telegram.bot.send_message(
-                chat_id,
-                '⚠️ Пришлите файл плагина как документ с расширением <code>.py</code>, либо /cancel.',
-                parse_mode='HTML'
-            )
+            cardinal.telegram.bot.send_message(                 chat_id,                 '⚠️ Пришлите файл плагина как документ с расширением <code>.py</code>, либо /cancel.',                 parse_mode='HTML'             )
             return
         filename = str(getattr(document, 'file_name', '') or '').strip()
         if not filename.lower().endswith('.py'):
             _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
-            cardinal.telegram.bot.send_message(
-                chat_id,
-                '⚠️ Нужен Python-файл с расширением <code>.py</code>. Архивы и текстовые файлы не устанавливаются.',
-                parse_mode='HTML'
-            )
+            cardinal.telegram.bot.send_message(                 chat_id,                 '⚠️ Нужен Python-файл с расширением <code>.py</code>. Архивы и текстовые файлы не устанавливаются.',                 parse_mode='HTML'             )
             return
         file_size = int(getattr(document, 'file_size', 0) or 0)
         if file_size > 5 * 1024 * 1024:
@@ -5582,10 +5423,7 @@ def _handle_fsm(message, cardinal):
             _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
             cardinal.telegram.bot.send_message(chat_id, f'⚠️ Не удалось скачать файл из Telegram: {_h(e)}', parse_mode='HTML')
             return
-        progress_msg = cardinal.telegram.bot.send_message(
-            chat_id,
-            '⏬ Проверяю файл и устанавливаю локальное обновление…',
-        )
+        progress_msg = cardinal.telegram.bot.send_message(             chat_id,             '⏬ Проверяю файл и устанавливаю локальное обновление…',         )
         _track_fsm_mid(state, getattr(progress_msg, 'message_id', None))
         _fsm[chat_id] = state
         result = _install_local_plugin_update(payload, filename)
@@ -5593,35 +5431,12 @@ def _handle_fsm(message, cardinal):
             _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
             _fsm.pop(chat_id, None)
             if result.get('changed'):
-                text_result = (
-                    '✅ <b>Локальное обновление установлено.</b>\n\n'
-                    f"Файл: <code>{_h(filename)}</code>\n"
-                    f"Версия: <code>{_h(result.get('current_version'))}</code> → "
-                    f"<code>{_h(result.get('remote_version'))}</code>\n"
-                    f"🛟 Резервная копия: <code>{_h(os.path.basename(str(result.get('backup_file') or '')))}</code>\n"
-                    '💾 Настройки сохранены.\n\n'
-                    '🔁 Для загрузки новой версии выполните: <code>/restart</code>'
-                )
+                text_result = (                     '✅ <b>Локальное обновление установлено.</b>\n\n'                     f"Файл: <code>{_h(filename)}</code>\n"                     f"Версия: <code>{_h(result.get('current_version'))}</code> → "                     f"<code>{_h(result.get('remote_version'))}</code>\n"                     f"🛟 Резервная копия: <code>{_h(os.path.basename(str(result.get('backup_file') or '')))}</code>\n"                     '💾 Настройки сохранены.\n\n'                     '🔁 Для загрузки новой версии выполните: <code>/restart</code>'                 )
             else:
-                text_result = (
-                    '✅ <b>Этот файл уже установлен.</b>\n\n'
-                    f"Версия: <code>{_h(result.get('remote_version') or VERSION)}</code>\n"
-                    'Текущий файл плагина не изменён.'
-                )
-            cardinal.telegram.bot.send_message(
-                chat_id,
-                text_result,
-                parse_mode='HTML',
-                reply_markup=_update_menu_kb()
-            )
+                text_result = (                     '✅ <b>Этот файл уже установлен.</b>\n\n'                     f"Версия: <code>{_h(result.get('remote_version') or VERSION)}</code>\n"                     'Текущий файл плагина не изменён.'                 )
+            cardinal.telegram.bot.send_message(                 chat_id,                 text_result,                 parse_mode='HTML',                 reply_markup=_update_menu_kb()             )
             return
-        cardinal.telegram.bot.send_message(
-            chat_id,
-            '❌ <b>Локальное обновление не установлено.</b>\n\n'
-            f"Ошибка: <code>{_h(result.get('error') or 'неизвестная ошибка')}</code>\n\n"
-            'Текущий файл и настройки не изменены. Пришлите другой <code>.py</code> или /cancel.',
-            parse_mode='HTML'
-        )
+        cardinal.telegram.bot.send_message(             chat_id,             '❌ <b>Локальное обновление не установлено.</b>\n\n'             f"Ошибка: <code>{_h(result.get('error') or 'неизвестная ошибка')}</code>\n\n"             'Текущий файл и настройки не изменены. Пришлите другой <code>.py</code> или /cancel.',             parse_mode='HTML'         )
         return
     if state.get('step') == 'saves_import':
         _track_fsm_mid(state, getattr(message, 'message_id', None))
@@ -5661,10 +5476,13 @@ def _handle_fsm(message, cardinal):
         return
     if state.get('step') == 'set_jwt':
         if (message.text or '').strip().lower() in ('/cancel', 'cancel', 'отмена'):
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
             _fsm.pop(chat_id, None)
             cardinal.telegram.bot.send_message(chat_id, '❌ Отменено.')
             return
         jwt_val = None
+        bridge_code = None
+        bridge_payload = None
         file_bytes = None
         filename = None
         mime = None
@@ -5674,13 +5492,13 @@ def _handle_fsm(message, cardinal):
                 mime = (message.document.mime_type or '').lower()
                 if message.document.file_size and message.document.file_size > 2000000:
                     _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
-                    cardinal.telegram.bot.send_message(chat_id, '⚠️ Файл слишком большой (>2MB). Пришлите меньший или вставьте токен текстом.')
+                    cardinal.telegram.bot.send_message(                         chat_id,                         '⚠️ Файл слишком большой (>2MB). Пришлите меньший файл или короткий код одним сообщением.'                     )
                     return
                 f_info = cardinal.telegram.bot.get_file(message.document.file_id)
                 file_bytes = cardinal.telegram.bot.download_file(f_info.file_path)
             except Exception as e:
                 _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
-                cardinal.telegram.bot.send_message(chat_id, f'⚠️ Не удалось прочитать файл: {e}')
+                cardinal.telegram.bot.send_message(chat_id, f'⚠️ Не удалось прочитать файл: {_h(e)}', parse_mode='HTML')
                 return
         if file_bytes is not None:
             try:
@@ -5688,40 +5506,67 @@ def _handle_fsm(message, cardinal):
             except Exception:
                 text_data = file_bytes.decode('utf-8', errors='ignore')
             content = (text_data or '').strip()
-            is_json = (filename or '').endswith('.json') or (mime or '').endswith('json') or content[:1] in '{['
-            if is_json:
-                try:
-                    obj = json.loads(content)
-                    jwt_val = _find_jwt_in_json(obj)
-                except Exception:
-                    jwt_val = None
-            if not jwt_val:
-                cleaned = _clean_jwt_text(content)
-                parts = _re.findall('[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+', cleaned)
-                jwt_val = parts[0] if parts else cleaned
+            bridge_code = _bridge_code_from_text(content)
+            if not bridge_code:
+                is_json = (filename or '').endswith('.json') or (mime or '').endswith('json') or content[:1] in '{['
+                if is_json:
+                    try:
+                        obj = json.loads(content)
+                        jwt_val = _find_jwt_in_json(obj)
+                    except Exception:
+                        jwt_val = None
+                if not jwt_val:
+                    jwt_val = _jwt_from_text(content)
         else:
-            part = _clean_jwt_text(message.text or '')
-            acc = _clean_jwt_text((state.get('jwt_acc') or '') + part)
-            if not _is_jwt_like(acc) and len(acc) < 16:
-                state['jwt_acc'] = acc
-                _fsm[chat_id] = state
-                cardinal.telegram.bot.send_message(chat_id, 'Принял часть токена. Пришлите оставшиеся части (или /cancel).')
+            raw_input = message.text or ''
+            bridge_code = _bridge_code_from_text(raw_input)
+            if not bridge_code:
+                part = _clean_jwt_text(raw_input)
+                acc = _clean_jwt_text((state.get('jwt_acc') or '') + part)
+                if not _is_jwt_like(acc) and len(acc) < 16:
+                    state['jwt_acc'] = acc
+                    _fsm[chat_id] = state
+                    cardinal.telegram.bot.send_message(                         chat_id,                         'Принял часть токена. Пришлите оставшиеся части, короткий код или /cancel.'                     )
+                    return
+                jwt_val = acc
+        source_is_code = bool(bridge_code)
+        if bridge_code:
+            bridge_ok, bridge_reason, bridge_payload = _redeem_bridge_code(bridge_code)
+            if not bridge_ok:
+                if bridge_reason == 'not_configured':
+                    msg = (                         '⚠️ Подключение к FTS Transfer Token ещё не настроено администратором плагина. '                         'Пока можно импортировать полный JWT файлом <code>.txt</code> или <code>.json</code>.'                     )
+                elif bridge_reason == 'unauthorized':
+                    msg = (                         '⚠️ Плагин не прошёл авторизацию в FTS Transfer Token. '                         'Обратитесь к администратору сервиса или импортируйте JWT файлом.'                     )
+                elif bridge_reason == 'invalid':
+                    msg = (                         '❌ Код не найден или срок его действия закончился.\n'                         f'Создайте код заново на сайте '                         f'<a href="{_h(FTS_BRIDGE_URL + "/")}">FTS Transfer Token</a> '                         f'и отправьте его одним сообщением.'                     )
+                elif bridge_reason == 'bad_response':
+                    msg = '⚠️ Сайт коротких кодов вернул некорректный ответ. Попробуйте создать код заново.'
+                else:
+                    msg = (                         '⚠️ Не удалось связаться с сайтом коротких кодов. '                         'Попробуйте ещё раз немного позже или импортируйте JWT файлом.'                     )
+                cardinal.telegram.bot.send_message(                     chat_id,                     msg,                     parse_mode='HTML',                     disable_web_page_preview=True                 )
                 return
-            jwt_val = acc
+            jwt_val = _clean_jwt_text((bridge_payload or {}).get('token'))
         jwt_val = _clean_jwt_text(jwt_val or '')
-        if not jwt_val or len(jwt_val) < 16:
-            if getattr(message, 'document', None):
-                _safe_delete(cardinal.telegram.bot, chat_id, getattr(message, 'message_id', None))
-            cardinal.telegram.bot.send_message(chat_id, '⚠️ Похоже на некорректный токен. Пришлите валидный JWT текстом или файлом .txt/.json, либо /cancel.')
+        ok, reason, ver, bal, usdt, resp = _validate_fragment_jwt(jwt_val)
+        if not ok:
+            if reason == 'auth':
+                detail = _fragment_error_detail(resp) or 'Authentication credentials were not provided.'
+                msg = (                     f'❌ Токен не прошёл проверку. API вернул: <code>{_h(detail)}</code>\n'                     f'Создайте новый короткий код или пришлите другой JWT.'                 )
+            elif reason == 'format':
+                msg = (                     f'Не удалось распознать токен или короткий код.\n\n'                     f'Отправьте код с сайта '                     f'<a href="{_h(FTS_BRIDGE_URL + "/")}">FTS Transfer Token</a> '                     f'одним сообщением либо пришлите JWT в файле <code>.txt</code> или <code>.json</code>.'                 )
+            elif reason == 'no_balance':
+                msg = (                     '⚠️ Fragment API ответил, но не вернул баланс. Данные не сохранены.\n'                     'Попробуйте создать код заново или пришлите JWT ещё раз.'                 )
+            else:
+                msg = (                     '⚠️ Не удалось проверить токен через Fragment API. Данные не сохранены.\n'                     'Попробуйте ещё раз немного позже.'                 )
+            cardinal.telegram.bot.send_message(                 chat_id,                 msg,                 parse_mode='HTML',                 disable_web_page_preview=True             )
             return
-        _set_cfg(chat_id, fragment_jwt=jwt_val)
-        ver, bal, usdt, resp = _check_fragment_wallet(jwt_val)
-        _set_cfg(chat_id, wallet_version=ver, balance_ton=round(bal, 6) if isinstance(bal, (int, float)) else None, balance_usdt=round(usdt, 6) if isinstance(usdt, (int, float)) else None, last_wallet_raw=resp)
+        _set_cfg(             chat_id,             fragment_jwt=jwt_val,             wallet_version=ver,             balance_ton=round(bal, 6) if isinstance(bal, (int, float)) else None,             balance_usdt=round(usdt, 6) if isinstance(usdt, (int, float)) else None,             last_wallet_raw=resp         )
         _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
         _fsm.pop(chat_id, None)
-        cardinal.telegram.bot.send_message(chat_id, '✅ Токен сохранён.')
+        success_text = (             '✅ Короткий код принят. JWT получен, проверен по балансу и сохранён.'             if source_is_code             else '✅ Токен проверен по балансу и сохранён.'         )
+        cardinal.telegram.bot.send_message(chat_id, success_text)
         try:
-            cardinal.telegram.bot.send_message(chat_id, _token_text(chat_id), parse_mode='HTML', reply_markup=_token_kb())
+            cardinal.telegram.bot.send_message(                 chat_id,                 _token_text(chat_id),                 parse_mode='HTML',                 reply_markup=_token_kb(),                 disable_web_page_preview=True             )
         except Exception:
             pass
         return
@@ -5870,6 +5715,18 @@ def _finalize_order(oid, chat_id, *, ok, reason=''):
         _failed_orders[oid] = {'chat_id': chat_id, 'reason': reason, 'ts': time.time()}
         _order_record_update(chat_id, oid, status='failed', failed_reason=reason, finalized_ts=int(time.time()))
     _remove_order_everywhere(oid)
+
+def _finalize_order_uncertain(oid, chat_id, qty, username, reason=''):
+    """Stops automatic processing without treating the order as definitely failed."""
+    if not oid:
+        _pop_current(chat_id, keep_prompted=False)
+        return
+    oid = str(oid)
+    _blocked_oids.add(oid)
+    _failed_orders[oid] = {         'chat_id': chat_id,         'reason': reason,         'status': 'delivery_unknown',         'ts': time.time()     }
+    _order_record_update(         chat_id,         oid,         status='delivery_unknown',         qty=int(qty or 0),         username=str(username or '').lstrip('@'),         stars_sent=None,         failed_reason=reason,         finalized_ts=int(time.time())     )
+    _remove_order_everywhere(oid)
+
 def _set_order_qty(chat_id, order_id, qty):
     if not order_id or not qty or qty < 50:
         return
@@ -6284,6 +6141,20 @@ def _send_pending_item(cardinal, chat_id, item):
         resp = _send_stars_with_currency_fallback(cardinal, chat_id, cfg, jwt, username=username, quantity=qty, show_sender=False)
     finally:
         _set_sending(chat_id, False)
+    if (resp or {}).get('uncertain'):
+        net_error = str((resp or {}).get('network_error') or 'network_error')
+        human = (             f'Fragment API не подтвердил результат отправки ({net_error}). '             'Автоматический повтор остановлен, чтобы не отправить звёзды дважды.'         )
+        item.update(stage='delivery_unknown', finalized=True)
+        _safe_send(             cardinal,             chat_id,             '⚠️ <b>Статус отправки не подтверждён.</b>\n\n'             f'API Fragment не ответил за {int(FRAGMENT_READ_TIMEOUT)} сек. '             'Запрос мог быть выполнен, поэтому повторная отправка и автоматический возврат отключены.\n'             'Проверьте операцию вручную в Fragment/по балансу и у получателя.'         )
+        _order_log(             'error',             'send_uncertain',             oid=oid or 'noid',             chat_id=chat_id,             qty=qty,             username=username,             status=(resp or {}).get('status'),             network_error=net_error,             reason=human         )
+        _log('error', f'SEND UNCERTAIN {qty}⭐ -> @{username}: {human}')
+        if oid:
+            _finalize_order_uncertain(oid, chat_id, qty, username, reason=human)
+        else:
+            _pop_current(chat_id, keep_prompted=False)
+        if was_head and _has_queue(chat_id):
+            _notify_next_turn(cardinal, chat_id)
+        return
     if _resp_indicates_delivery(resp):
         order_url = f'https://funpay.com/orders/{oid}/' if oid else ''
         _send_order_result_message(cardinal, chat_id, qty, username, order_url, resp)
