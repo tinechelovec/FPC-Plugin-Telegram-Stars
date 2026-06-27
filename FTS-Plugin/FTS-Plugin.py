@@ -179,7 +179,7 @@ def _order_log(level, action, oid=None, chat_id=None, qty=None, username=None, *
 def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
 NAME = 'FTS-Plugin'
-VERSION = '1.7.5'
+VERSION = '1.7.6'
 DESCRIPTION = 'Плагин по продаже звезд.'
 CREDITS = _s64('QHRpbmVjaGVsb3ZlYw==')
 UUID = _s64('ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1')
@@ -221,11 +221,11 @@ SETTINGS_FILE = os.path.join(PLUGIN_FOLDER, 'settings.json')
 SETTINGS_BAK = SETTINGS_FILE + '.bak'
 ORDERS_FILE = os.path.join(PLUGIN_FOLDER, 'orders.json')
 ORDERS_BAK = ORDERS_FILE + '.bak'
-SETTINGS_SCHEMA_VERSION = 5
+SETTINGS_SCHEMA_VERSION = 6
 ORDERS_SCHEMA_VERSION = 1
 LEGACY_SETTINGS_KEY = '__legacy__'
 SETTINGS_META_KEY = '__meta__'
-_CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
+_CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'instruction_acknowledged', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
 _CFG_TOKEN_ALIASES = ('jwt', 'token', 'fragment_token', 'fragmentApiToken', 'fragment_api_token')
 FTS_BRIDGE_PLUGIN_SECRET = os.getenv('FTS_TRANSFER_TOKEN_PLUGIN_SECRET', os.getenv('FTS_BRIDGE_PLUGIN_SECRET', os.getenv('PLUGIN_API_SECRET', 'fa6db024bd75b3ff33ef46bfae67185d0c343ec47c09f18c2ac594bc276cde1ab887dff104545cd9d5ce955d9db4f7d3'))).strip()
 _SETTINGS_IO_LOCK = threading.RLock()
@@ -550,6 +550,7 @@ def _sanitize_cfg(raw, chat_id=None):
     cfg['auto_refund'] = _cfg_bool(cfg, 'auto_refund', False)
     cfg['auto_deactivate'] = _cfg_bool(cfg, 'auto_deactivate', True)
     cfg['preorder_username'] = _cfg_bool(cfg, 'preorder_username', False)
+    cfg['instruction_acknowledged'] = _cfg_bool(cfg, 'instruction_acknowledged', False)
     cfg['fragment_jwt'] = str(cfg.get('fragment_jwt')).strip() if cfg.get('fragment_jwt') else None
     cfg['unit_star_price'] = _as_float_cfg(cfg.get('unit_star_price'), None, 0.0)
     cfg['markup_percent'] = _as_float_cfg(cfg.get('markup_percent'), 0.0) or 0.0
@@ -615,6 +616,265 @@ def _migrate_settings_data(data):
         data[SETTINGS_META_KEY] = meta
         changed = True
     return (data, changed, notes)
+def _clean_config_string(value, max_len=None):
+    if value is None:
+        return None
+    try:
+        s = str(value)
+    except Exception:
+        s = repr(value)
+    s = s.encode('utf-8', 'replace').decode('utf-8')
+    s = ''.join(ch for ch in s if ch in ('\n', '\r', '\t') or ord(ch) >= 32)
+    if max_len is not None and len(s) > int(max_len):
+        s = s[:int(max_len)]
+    return s
+
+def _repair_json_tree(value, depth=0):
+    if depth > 40:
+        return (None, 1)
+    if value is None or isinstance(value, bool) or isinstance(value, int):
+        return (value, 0)
+    if isinstance(value, float):
+        if value != value or value in (float('inf'), float('-inf')):
+            return (None, 1)
+        return (value, 0)
+    if isinstance(value, str):
+        fixed = _clean_config_string(value)
+        return (fixed, int(fixed != value))
+    if isinstance(value, dict):
+        out = {}
+        changes = 0
+        for raw_key, raw_value in value.items():
+            key = _clean_config_string(raw_key)
+            if not isinstance(raw_key, str) or key != raw_key:
+                changes += 1
+            fixed_value, fixed_count = _repair_json_tree(raw_value, depth + 1)
+            changes += fixed_count
+            if key in out:
+                changes += 1
+            out[key] = fixed_value
+        return (out, changes)
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        changes = 0 if isinstance(value, list) else 1
+        for item in value:
+            fixed_item, fixed_count = _repair_json_tree(item, depth + 1)
+            out.append(fixed_item)
+            changes += fixed_count
+        return (out, changes)
+    return (_clean_config_string(value), 1)
+
+def _parse_settings_candidate_text(txt):
+    if txt is None:
+        return (None, False)
+    s = txt.lstrip('\ufeff').strip()
+    if not s:
+        return ({}, False)
+    try:
+        obj = json.loads(s)
+        return (obj if isinstance(obj, dict) else None, False)
+    except Exception:
+        try:
+            obj, idx = json.JSONDecoder().raw_decode(s)
+            if isinstance(obj, dict):
+                return (obj, bool(s[idx:].strip()))
+        except Exception:
+            pass
+    return (None, False)
+
+def _repair_settings_file(chat_id=None):
+    report = {
+        'ok': False,
+        'source': 'new',
+        'backup_file': None,
+        'tree_repairs': 0,
+        'profiles_repaired': 0,
+        'orders_moved': 0,
+        'runtime_profiles_removed': 0,
+        'notes': [],
+    }
+    chat_key = str(chat_id) if chat_id is not None else None
+    with _SETTINGS_IO_LOCK:
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        if os.path.exists(SETTINGS_FILE):
+            backup_path = SETTINGS_FILE + f'.fix_fts.{ts}.bak'
+            try:
+                shutil.copy2(SETTINGS_FILE, backup_path)
+                report['backup_file'] = backup_path
+            except Exception as e:
+                report['notes'].append(f'backup failed: {e}')
+
+        raw = None
+        for path, label in ((SETTINGS_FILE, 'settings.json'), (SETTINGS_BAK, 'settings.json.bak')):
+            try:
+                if not os.path.exists(path):
+                    continue
+                with open(path, 'r', encoding='utf-8') as f:
+                    candidate, had_trailing_data = _parse_settings_candidate_text(f.read())
+                if isinstance(candidate, dict):
+                    raw = candidate
+                    report['source'] = label
+                    if had_trailing_data:
+                        report['notes'].append('removed trailing data after JSON object')
+                    break
+            except Exception as e:
+                report['notes'].append(f'{label}: {e}')
+        if raw is None:
+            raw = {}
+            report['notes'].append('valid settings object was not found; created a safe config')
+
+        if raw.get('format') == 'FTS-Plugin-backup' and isinstance(raw.get('settings'), dict):
+            raw = dict(raw.get('settings') or {})
+            report['notes'].append('unwrapped full FTS backup')
+        elif isinstance(raw.get('settings'), dict) and not any(str(k).lstrip('-').isdigit() for k in raw):
+            raw = dict(raw.get('settings') or {})
+            report['notes'].append('unwrapped settings wrapper')
+
+        raw, tree_repairs = _repair_json_tree(raw)
+        report['tree_repairs'] = tree_repairs
+        fixed, _changed, migration_notes = _migrate_settings_data(raw)
+        report['notes'].extend(migration_notes)
+
+        db = _load_orders_db()
+        records = dict(db.get('records') or {})
+        for key, value in list(fixed.items()):
+            if key == SETTINGS_META_KEY or not isinstance(value, dict):
+                continue
+            embedded = value.get('order_records')
+            if isinstance(embedded, dict) and embedded:
+                before = len(records)
+                records = _merge_order_records(records, embedded)
+                report['orders_moved'] += max(0, len(records) - before)
+
+        for key, value in list(fixed.items()):
+            if key == SETTINGS_META_KEY:
+                continue
+            is_profile_key = (
+                key == LEGACY_SETTINGS_KEY
+                or key in _RUNTIME_PROFILE_KEYS
+                or str(key).startswith('users-')
+                or str(key).lstrip('-').isdigit()
+                or (isinstance(value, dict) and _is_cfg_like_dict(value))
+                or (chat_key is not None and str(key) == chat_key)
+            )
+            if not is_profile_key:
+                continue
+            if key in _RUNTIME_PROFILE_KEYS or str(key).startswith('users-'):
+                fixed.pop(key, None)
+                report['runtime_profiles_removed'] += 1
+                continue
+            before = value if isinstance(value, dict) else {}
+            after = _sanitize_cfg(before, chat_id=key)
+            for text_key in ('last_auto_deact_reason', 'last_lot_toggle_report', 'last_usdt_fallback_reason'):
+                if after.get(text_key) is not None:
+                    after[text_key] = _clean_config_string(after.get(text_key), 500)
+            fixed[key] = after
+            if after != value:
+                report['profiles_repaired'] += 1
+
+        if chat_key is not None:
+            current = fixed.get(chat_key)
+            if not isinstance(current, dict):
+                donor = fixed.get(LEGACY_SETTINGS_KEY)
+                if not isinstance(donor, dict):
+                    donor = None
+                    for key, value in fixed.items():
+                        if key == SETTINGS_META_KEY or not isinstance(value, dict):
+                            continue
+                        if value.get('fragment_jwt') or _is_cfg_like_dict(value):
+                            donor = value
+                            break
+                fixed[chat_key] = _sanitize_cfg(donor or {}, chat_id=chat_key)
+                report['profiles_repaired'] += 1
+                report['notes'].append('created/rebound current chat profile')
+            else:
+                fixed[chat_key] = _sanitize_cfg(current, chat_id=chat_key)
+
+        meta = fixed.get(SETTINGS_META_KEY) if isinstance(fixed.get(SETTINGS_META_KEY), dict) else {}
+        meta.update({
+            'schema': SETTINGS_SCHEMA_VERSION,
+            'plugin': NAME,
+            'updated_at': int(time.time()),
+            'last_fix_fts_at': int(time.time()),
+            'last_fix_fts_source': report['source'],
+        })
+        fixed[SETTINGS_META_KEY] = meta
+
+        db['records'] = records
+        if report['orders_moved'] or not os.path.exists(ORDERS_FILE):
+            _save_orders_db(db)
+
+        json.dumps(fixed, ensure_ascii=False, allow_nan=False)
+        _atomic_write_json(SETTINGS_FILE, fixed)
+        try:
+            _atomic_write_json(SETTINGS_BAK, fixed)
+        except Exception as e:
+            report['notes'].append(f'standard backup refresh failed: {e}')
+
+    try:
+        if chat_id is not None:
+            _settings_text(chat_id)
+            _settings_kb(chat_id)
+        report['ok'] = True
+    except Exception as e:
+        report['notes'].append(f'settings render test failed: {e}')
+        logger.exception(f'fix_fts render test failed: {e}')
+    return report
+
+def _fix_fts_command(cardinal, message):
+    bot = cardinal.telegram.bot
+    chat_id = message.chat.id
+    try:
+        _fsm.pop(chat_id, None)
+    except Exception:
+        pass
+    try:
+        report = _repair_settings_file(chat_id)
+    except Exception as e:
+        logger.exception(f'/fix_fts failed: {e}')
+        return bot.send_message(
+            chat_id,
+            '❌ <b>Не удалось починить конфиг FTS.</b>\n\n'
+            f'Ошибка: <code>{_h(e)}</code>\n'
+            'Исходный файл не удалён.',
+            parse_mode='HTML'
+        )
+
+    backup_name = os.path.basename(report.get('backup_file') or '') or 'не создавалась (файла не было)'
+    notes = report.get('notes') or []
+    notes_text = ''
+    if notes:
+        notes_text = '\n• ' + '\n• '.join(_h(x) for x in notes[:8])
+    status = '✅' if report.get('ok') else '⚠️'
+    text = (
+        f'{status} <b>Проверка и ремонт FTS завершены.</b>\n\n'
+        f'• Источник: <code>{_h(report.get("source"))}</code>\n'
+        f'• Исправлено профилей: <code>{int(report.get("profiles_repaired") or 0)}</code>\n'
+        f'• Исправлено повреждённых значений: <code>{int(report.get("tree_repairs") or 0)}</code>\n'
+        f'• Перенесено записей заказов: <code>{int(report.get("orders_moved") or 0)}</code>\n'
+        f'• Удалено служебных профилей: <code>{int(report.get("runtime_profiles_removed") or 0)}</code>\n'
+        f'• Резервная копия: <code>{_h(backup_name)}</code>'
+        f'{notes_text}\n\n'
+        'Настройки ниже открыты уже из восстановленного конфига.'
+    )
+    bot.send_message(chat_id, text, parse_mode='HTML', disable_web_page_preview=True)
+    try:
+        return bot.send_message(
+            chat_id,
+            _settings_text(chat_id),
+            parse_mode='HTML',
+            reply_markup=_settings_kb(chat_id),
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.exception(f'/fix_fts repaired config but settings send failed: {e}')
+        return bot.send_message(
+            chat_id,
+            '⚠️ Конфиг восстановлен, но Telegram не смог показать меню. '
+            f'Ошибка: <code>{_h(e)}</code>',
+            parse_mode='HTML'
+        )
+
 def _attach_legacy_cfg_if_needed(data, key, cfg):
     if isinstance(cfg, dict) and cfg: return (cfg, False)
     legacy = data.get(LEGACY_SETTINGS_KEY)
@@ -776,7 +1036,7 @@ def _settings_text(chat_id):
     reason = cfg.get('last_auto_deact_reason')
     state_txt, _ = _lots_state_summary(cfg)
     lots_line = f'• Лоты: <b>{state_txt}</b>'
-    if state_txt != '🟢 Включены' and reason: lots_line += f' <i>(авто-выкл: {reason})</i>'
+    if state_txt != '🟢 Включены' and reason: lots_line += f' <i>(авто-выкл: {_h(reason)})</i>'
     currency = _normalize_stars_currency(cfg.get('stars_currency'))
     fallback_line = ''
     if currency == FTS_CURRENCY_USDT_TON: fallback_line = f"• Автопереход USDT → TON: <b>{_state_on(cfg.get('usdt_fallback_to_ton', False))}</b>\n"
@@ -1979,6 +2239,8 @@ def _maybe_auto_deactivate(cardinal, cfg, chat_id=None):
         logger.warning(f'[AUTODEACT] Баланс {bal_ton} TON < {thr}. Выключены лоты категории {cat_id}. Managed={managed_ids}. Report={rep}')
 CBT_HOME = f'{UUID}:home'
 CBT_SETTINGS = f'{UUID}:settings'
+CBT_INFO = f'{UUID}:info'
+CBT_INSTRUCTION_ACK = f'{UUID}:instruction_ack'
 CBT_FSM_CANCEL = f'{UUID}:fsm_cancel'
 CBT_BACK_PLUGINS = getattr(CBT, 'BACK', f'{UUID}:back')
 CBT_TOGGLE_PLUGIN = f'{UUID}:toggle_plugin'
@@ -2073,9 +2335,40 @@ def _cleanup_fsm_msgs(bot, chat_id, state):
     state['cleanup_msg_ids'] = []
 def _home_kb():
     kb = K()
-    kb.row(B('⚙️ Настройки', callback_data=CBT_SETTINGS), B('📖 Инструкция', url=INSTRUCTION_URL))
+    kb.row(B('⚙️ Настройки', callback_data=CBT_SETTINGS), B('ℹ️ Информация', callback_data=CBT_INFO))
     kb.row(B('⬆️ Обновить плагин', callback_data=CBT_UPDATE_PLUGIN), B('🗑 Удалить', callback_data=CBT_DELETE_ASK))
     kb.add(B('🔙 К списку плагинов', callback_data=CBT_PLUGINS_LIST_OPEN))
+    return kb
+def _first_settings_notice_text():
+    return (
+        '⚠️ <b>Перед использованием плагина</b>\n\n'
+        'Сначала обязательно прочитайте инструкцию. В ней описаны получение токена, '
+        'настройка лотов, установка цены и правильный запуск плагина.\n\n'
+        'После ознакомления нажмите кнопку <b>«Прочитал»</b>. '
+    )
+def _first_settings_notice_kb():
+    kb = K()
+    kb.row(B('📖 Открыть инструкцию', url=INSTRUCTION_URL))
+    kb.row(B('✅ Прочитал', callback_data=CBT_INSTRUCTION_ACK))
+    kb.add(B('◀️ Назад', callback_data=CBT_HOME))
+    return kb
+def _info_text():
+    if not _meta_guard():
+        return _tamper_text()
+    return (
+        'ℹ️ <b>Информация</b>\n\n'
+        'Здесь находятся официальные ссылки FTS-Plugin.\n\n'
+        '• <b>Чат</b> - помощь и общение.\n'
+        '• <b>Канал</b> - новости и обновления.\n'
+        '• <b>Инструкция</b> - настройка и использование плагина.\n'
+        '• <b>Мой Telegram</b> - связь с автором. (100 звезд за сообщение)'
+    )
+def _info_kb():
+    kb = K()
+    kb.row(B('💬 Чат', url=GROUP_URL), B('📢 Канал', url=CHANNEL_URL))
+    kb.row(B('📖 Инструкция', url=INSTRUCTION_URL))
+    kb.row(B('👤 Мой Telegram', url=CREATOR_URL))
+    kb.add(B('◀️ Назад', callback_data=CBT_HOME))
     return kb
 def _settings_kb(chat_id):
     cfg = _get_cfg(chat_id)
@@ -3677,18 +3970,24 @@ def init_cardinal(cardinal):
     bot = tg.bot
     _start_auto_maintenance(cardinal)
     try:
-        cardinal.add_telegram_commands(UUID, [('fnp', 'Открыть панель FNP Stars', True), ('fnphelp', 'Инструкция FNP Stars', True), ('stars_thc', 'Открыть панель FNP Stars (прямая команда)', True)])
+        cardinal.add_telegram_commands(UUID, [('fnp', 'Открыть панель FNP Stars', True), ('fnphelp', 'Информация FNP Stars', True), ('stars_thc', 'Открыть панель FNP Stars (прямая команда)', True), ('fix_fts', 'Починить конфиг и настройки FTS', True)])
     except Exception:
         pass
     logger.info('🚀 Плагин по продаже звёзд запущен.')
     threading.Thread(target=_queue_watchdog, args=(cardinal,), daemon=True, name='FTS-QUEUE-WATCHDOG').start()
     def _send_home(m):
         return bot.send_message(m.chat.id, _about_text(), parse_mode='HTML', reply_markup=_home_kb(), disable_web_page_preview=True)
+    def _send_info(m):
+        return bot.send_message(m.chat.id, _info_text(), parse_mode='HTML', reply_markup=_info_kb(), disable_web_page_preview=True)
     tg.msg_handler(_send_home, commands=['fnp', 'stars_thc'])
+    tg.msg_handler(_send_info, commands=['fnphelp'])
+    tg.msg_handler(lambda m: _fix_fts_command(cardinal, m), commands=['fix_fts'])
     fsm_steps = {'set_min_balance', 'star_add_qty', 'star_add_lotid', 'msg_edit_value', 'unit_star_price_value', 'markup_percent', 'set_jwt', 'saves_import', 'local_plugin_update', 'star_price_value', 'autodump_floor_value', 'set_autodump_interval', 'set_order_watch_interval', 'set_order_wait_reminder', 'set_review_reminder_time'}
     tg.msg_handler(lambda m: _handle_fsm(m, cardinal), func=lambda m: m.chat.id in _fsm and _fsm[m.chat.id].get('step') in fsm_steps, content_types=['text', 'document'])
     tg.cbq_handler(lambda c: _open_home(bot, c), func=lambda c: c.data.startswith(f'{CBT.EDIT_PLUGIN}:{UUID}') or c.data.startswith(f'{CBT.PLUGIN_SETTINGS}:{UUID}') or c.data == f'{UUID}:0' or (c.data == CBT_HOME))
     tg.cbq_handler(lambda c: _open_settings(bot, c), func=lambda c: c.data == CBT_SETTINGS)
+    tg.cbq_handler(lambda c: _open_information(bot, c), func=lambda c: c.data == CBT_INFO)
+    tg.cbq_handler(lambda c: _acknowledge_instruction(bot, c), func=lambda c: c.data == CBT_INSTRUCTION_ACK)
     tg.cbq_handler(lambda c: _open_token(bot, c), func=lambda c: c.data == CBT_TOKEN)
     tg.cbq_handler(lambda c: _open_stars(bot, c), func=lambda c: c.data == CBT_STARS)
     tg.cbq_handler(lambda c: _fsm_cancel(cardinal, c), func=lambda c: c.data == CBT_FSM_CANCEL)
@@ -3773,6 +4072,25 @@ def _open_home(bot, call):
         bot.answer_callback_query(call.id)
     except Exception:
         pass
+def _open_information(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _info_text(), _info_kb())
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+def _acknowledge_instruction(bot, call):
+    chat_id = call.message.chat.id
+    try:
+        _set_cfg(chat_id, instruction_acknowledged=True)
+    except Exception as e:
+        logger.exception(f'instruction acknowledgement failed: {e}')
+        try:
+            bot.answer_callback_query(call.id, 'Не удалось сохранить отметку.', show_alert=True)
+        except Exception:
+            pass
+        return
+    _open_settings(bot, call)
 def _go_main_menu(cardinal, call):
     bot = cardinal.telegram.bot
     try:
@@ -3791,11 +4109,39 @@ def _go_main_menu(cardinal, call):
 def _open_settings(bot, call):
     chat_id = call.message.chat.id
     try:
+        cfg = _get_cfg(chat_id)
+        if not cfg.get('instruction_acknowledged', False):
+            ok = _safe_edit(
+                bot,
+                chat_id,
+                call.message.id,
+                _first_settings_notice_text(),
+                _first_settings_notice_kb()
+            )
+            if not ok:
+                _safe_send_tg(bot, chat_id, _first_settings_notice_text(), _first_settings_notice_kb())
+            try:
+                bot.answer_callback_query(call.id)
+            except Exception:
+                pass
+            return
         text = _settings_text(chat_id)
         kb = _settings_kb(chat_id)
         ok = _safe_edit(bot, chat_id, call.message.id, text, kb)
         if not ok:
-            _safe_send_tg(bot, chat_id, text, kb)
+            ok = bool(_safe_send_tg(bot, chat_id, text, kb))
+        if not ok:
+            report = _repair_settings_file(chat_id)
+            text = _settings_text(chat_id)
+            kb = _settings_kb(chat_id)
+            ok = bool(_safe_send_tg(bot, chat_id, text, kb))
+            if not ok:
+                raise RuntimeError('settings could not be sent after automatic repair')
+            logger.warning(
+                'Settings were repaired automatically: '
+                f'source={report.get("source")} profiles={report.get("profiles_repaired")} '
+                f'values={report.get("tree_repairs")}'
+            )
         try:
             bot.answer_callback_query(call.id)
         except Exception:
@@ -3803,11 +4149,11 @@ def _open_settings(bot, call):
     except Exception as e:
         logger.exception(f'open_settings failed: {e}')
         try:
-            bot.answer_callback_query(call.id, 'Не удалось открыть настройки. Проверьте лог плагина.', show_alert=True)
+            bot.answer_callback_query(call.id, 'Не удалось открыть настройки. Выполните /fix_fts.', show_alert=True)
         except Exception:
             pass
         try:
-            _safe_send_tg(bot, chat_id, '⚠️ Не удалось открыть настройки. Ошибка записана в лог плагина.')
+            _safe_send_tg(bot, chat_id, '⚠️ Не удалось открыть настройки. Выполните команду <code>/fix_fts</code>.')
         except Exception:
             pass
 def _update_menu_text():
