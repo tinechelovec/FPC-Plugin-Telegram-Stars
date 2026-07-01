@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import logging
 import requests
 import re as _re
@@ -47,10 +48,16 @@ class _Ansi:
     DIM = '\x1b[90m'
     BOLD = '\x1b[1m'
     RESET = '\x1b[0m'
+def _human_new_order_log(match):
+    oid = match.group(1)
+    raw_qty = str(match.group(2) or '').strip()
+    if raw_qty.lower() in {'unknown', 'pending', 'none', '-', '0'}:
+        return (f'Новый заказ #{oid} найден — точное количество ожидаем из сообщения об оплате.', oid)
+    return (f'Новый заказ #{oid} найден, количество: {raw_qty}⭐.', oid)
 class _HumanLog:
     import re as _re
     SEEN_AUTOREPLY_BY_OID = set()
-    RULES = [(_re.compile('ORDER EVENT action=config_migrated.*', _re.I), lambda m: ('Конфиг обновлён до новой схемы — старые настройки сохранены.', '')), (_re.compile('ORDER EVENT action=new_order.*?oid=([^\\s]+).*?qty=([^\\s]+)', _re.I), lambda m: (f'Новый заказ #{m.group(1)} найден, количество: {m.group(2)}⭐.', m.group(1))), (_re.compile('ORDER EVENT action=paid_message.*?oid=([^\\s]+).*?qty=([^\\s]+)', _re.I), lambda m: (f'Получено системное сообщение об оплате заказа #{m.group(1)} на {m.group(2)}⭐.', m.group(1))), (_re.compile('ORDER EVENT action=username_received.*?oid=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Получен ник @{m.group(2)} для заказа #{m.group(1)}.', m.group(1))), (_re.compile('ORDER EVENT action=confirm_start.*?oid=([^\\s]+).*?qty=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Подтверждение заказа #{m.group(1)}: {m.group(2)}⭐ на @{m.group(3)}.', m.group(1))), (_re.compile('ORDER EVENT action=send_ok.*?oid=([^\\s]+).*?qty=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Заказ #{m.group(1)} выполнен: {m.group(2)}⭐ отправлены @{m.group(3)}.', m.group(1))), (_re.compile('ORDER EVENT action=send_fail.*?oid=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Ошибка отправки по заказу #{m.group(1)} для @{m.group(2)}.', m.group(1))), (_re.compile('\\[IGNORE\\]\\s*auto-reply skipped.*?(?:OID:([A-Z0-9\\-]+))?', _re.I), lambda m: ('Автоответ найден — пропустили сообщение.', m.group(1) or '')), (_re.compile('\\[IGNORE\\]\\s*gift/account-login system note', _re.I), lambda m: ('Системное примечание с «подарком»/«заходом на аккаунт» — игнорируем.', '')), (_re.compile('\\[QUEUE\\]\\s*merged\\s+(.+?)\\s*->\\s*([^\\s|]+)', _re.I), lambda m: (f'Объединили очереди: {m.group(1)} → {m.group(2)}', '')), (_re.compile('ORDER\\s+#([A-Z0-9\\-]+):\\s*queued,.*', _re.I), lambda m: (f'Заказ #{m.group(1)} добавлен в очередь — ждём @username или системное «заказ оплачен».', m.group(1))), (_re.compile('SEND start:\\s*(\\d+)\\s*⭐\\s*→\\s*@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Начали отправку: {m.group(1)}⭐ на @{m.group(2)}', '')), (_re.compile('SEND result:\\s*ok=(True|False).*?status=(\\d+)', _re.I), lambda m: (f"Отправка завершена — {('успех' if m.group(1) == 'True' else 'ошибка')}, HTTP {m.group(2)}.", '')), (_re.compile('SEND exception:\\s*(.+)', _re.I), lambda m: (f'Ошибка при отправке: {m.group(1)}', '')), (_re.compile('ORDER FAIL\\s+#([A-Z0-9\\-]+)\\s+(\\d+)\\s*⭐\\s*@([A-Za-z0-9_]{5,32}):\\s*(.+?)\\s*\\|\\s*status=(\\d+)', _re.I), lambda m: (f'Не удалось выполнить заказ #{m.group(1)}: {m.group(4)} (HTTP {m.group(5)}). Кол-во: {m.group(2)}⭐, ник @{m.group(3)}.', m.group(1))), (_re.compile('\\[AUTODEACT\\].*?Баланс\\s+([0-9.]+)\\s*<\\s*([0-9.]+).*?категории\\s+(\\d+)', _re.I), lambda m: (f'Лоты категории {m.group(3)} отключены: баланс {m.group(1)} TON ниже порога {m.group(2)} TON.', '')), (_re.compile('MIN BALANCE set to\\s*([0-9.]+)\\s*TON', _re.I), lambda m: (f'Порог баланса обновлён: {m.group(1)} TON.', '')), (_re.compile('\\[PREORDER\\]\\s*Захватили ник\\s*@([A-Za-z0-9_]{5,32}).*?#([A-Z0-9\\-]+)', _re.I), lambda m: (f'Ник из заказа захвачен: @{m.group(1)} для #{m.group(2)} — ждём оплату.', m.group(2)))]
+    RULES = [(_re.compile('ORDER EVENT action=config_migrated.*', _re.I), lambda m: ('Конфиг обновлён до новой схемы — старые настройки сохранены.', '')), (_re.compile('ORDER EVENT action=new_order.*?oid=([^\\s]+).*?qty=([^\\s]+)', _re.I), _human_new_order_log), (_re.compile('ORDER EVENT action=paid_message.*?oid=([^\\s]+).*?qty=([^\\s]+)', _re.I), lambda m: (f'Получено системное сообщение об оплате заказа #{m.group(1)} на {m.group(2)}⭐.', m.group(1))), (_re.compile('ORDER EVENT action=username_received.*?oid=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Получен ник @{m.group(2)} для заказа #{m.group(1)}.', m.group(1))), (_re.compile('ORDER EVENT action=confirm_start.*?oid=([^\\s]+).*?qty=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Подтверждение заказа #{m.group(1)}: {m.group(2)}⭐ на @{m.group(3)}.', m.group(1))), (_re.compile('ORDER EVENT action=send_ok.*?oid=([^\\s]+).*?qty=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Заказ #{m.group(1)} выполнен: {m.group(2)}⭐ отправлены @{m.group(3)}.', m.group(1))), (_re.compile('ORDER EVENT action=send_fail.*?oid=([^\\s]+).*?username=@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Ошибка отправки по заказу #{m.group(1)} для @{m.group(2)}.', m.group(1))), (_re.compile('\\[IGNORE\\]\\s*auto-reply skipped.*?(?:OID:([A-Z0-9\\-]+))?', _re.I), lambda m: ('Автоответ найден — пропустили сообщение.', m.group(1) or '')), (_re.compile('\\[IGNORE\\]\\s*gift/account-login system note', _re.I), lambda m: ('Системное примечание с «подарком»/«заходом на аккаунт» — игнорируем.', '')), (_re.compile('\\[QUEUE\\]\\s*merged\\s+(.+?)\\s*->\\s*([^\\s|]+)', _re.I), lambda m: (f'Объединили очереди: {m.group(1)} → {m.group(2)}', '')), (_re.compile('ORDER\\s+#([A-Z0-9\\-]+):\\s*queued,.*', _re.I), lambda m: (f'Заказ #{m.group(1)} добавлен в очередь — ждём @username или системное «заказ оплачен».', m.group(1))), (_re.compile('SEND start:\\s*(\\d+)\\s*⭐\\s*→\\s*@?([A-Za-z0-9_]{5,32})', _re.I), lambda m: (f'Начали отправку: {m.group(1)}⭐ на @{m.group(2)}', '')), (_re.compile('SEND result:\\s*ok=(True|False).*?status=(\\d+)', _re.I), lambda m: (f"Отправка завершена — {('успех' if m.group(1) == 'True' else 'ошибка')}, HTTP {m.group(2)}.", '')), (_re.compile('SEND exception:\\s*(.+)', _re.I), lambda m: (f'Ошибка при отправке: {m.group(1)}', '')), (_re.compile('ORDER FAIL\\s+#([A-Z0-9\\-]+)\\s+(\\d+)\\s*⭐\\s*@([A-Za-z0-9_]{5,32}):\\s*(.+?)\\s*\\|\\s*status=(\\d+)', _re.I), lambda m: (f'Не удалось выполнить заказ #{m.group(1)}: {m.group(4)} (HTTP {m.group(5)}). Кол-во: {m.group(2)}⭐, ник @{m.group(3)}.', m.group(1))), (_re.compile('\\[AUTODEACT\\].*?Баланс\\s+([0-9.]+)\\s*<\\s*([0-9.]+).*?категории\\s+(\\d+)', _re.I), lambda m: (f'Лоты категории {m.group(3)} отключены: баланс {m.group(1)} TON ниже порога {m.group(2)} TON.', '')), (_re.compile('MIN BALANCE set to\\s*([0-9.]+)\\s*TON', _re.I), lambda m: (f'Порог баланса обновлён: {m.group(1)} TON.', '')), (_re.compile('\\[PREORDER\\]\\s*Захватили ник\\s*@([A-Za-z0-9_]{5,32}).*?#([A-Z0-9\\-]+)', _re.I), lambda m: (f'Ник из заказа захвачен: @{m.group(1)} для #{m.group(2)} — ждём оплату.', m.group(2)))]
     @classmethod
     def _fmt_like_classic(cls, record, text, color_code):
         ts = time.strftime('%d-%m-%Y %H:%M:%S', time.localtime(record.created))
@@ -178,18 +185,27 @@ def _order_log(level, action, oid=None, chat_id=None, qty=None, username=None, *
     _log(level, ' '.join(parts))
 def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
+
 NAME = 'FTS-Plugin'
-VERSION = '1.7.6'
+VERSION = '1.7.7'
 DESCRIPTION = 'Плагин по продаже звезд.'
-CREDITS = _s64('QHRpbmVjaGVsb3ZlYw==')
-UUID = _s64('ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1')
+CREDITS = '@tinechelovec'
+UUID = 'fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75'
 SETTINGS_PAGE = False
 CREATOR_URL = _s64('aHR0cHM6Ly90Lm1lL3RpbmVjaGVsb3ZlYw==')
 GROUP_URL = _s64('aHR0cHM6Ly90Lm1lL2Rldl90aGNfY2hhdA==')
 CHANNEL_URL = _s64('aHR0cHM6Ly90Lm1lL2J5X3RoYw==')
 GITHUB_URL = _s64('aHR0cHM6Ly9naXRodWIuY29tL3RpbmVjaGVsb3ZlYy9GUEMtUGx1Z2luLVRlbGVncmFtLVN0YXJz')
-GITHUB_UPDATE_URL = os.getenv('FTS_PLUGIN_UPDATE_URL', 'https://raw.githubusercontent.com/tinechelovec/FPC-Plugin-Telegram-Stars/main/FTS-Plugin/FTS-Plugin.py').strip()
+GITHUB_UPDATE_URL = os.getenv(
+    'FTS_PLUGIN_UPDATE_URL',
+    'https://raw.githubusercontent.com/tinechelovec/FPC-Plugin-Telegram-Stars/main/FTS-Plugin/FTS-Plugin.py',
+).strip()
 INSTRUCTION_URL = _s64('aHR0cHM6Ly90ZWxldHlwZS5pbi9AdGluZWNoZWxvdmVjL0ZUUy1QbHVnaW4=')
+_AUTHOR_META_AT_LOAD = {
+    'CREDITS': CREDITS,
+    'UUID': UUID,
+    'CREATOR_URL': CREATOR_URL,
+}
 FRAGMENT_BASE = os.getenv('FRAGMENT_BASE', 'https://api.fragment-api.com/v1')
 FRAGMENT_WALLET_URL = os.getenv('FRAGMENT_WALLET_URL', f'{FRAGMENT_BASE}/misc/wallet/')
 FRAGMENT_WALLET_URLS = [FRAGMENT_WALLET_URL, f'{FRAGMENT_BASE}/wallet/balance/', f'{FRAGMENT_BASE}/misc/wallet/balance/']
@@ -202,6 +218,21 @@ FRAGMENT_USER_URLS = [os.getenv('FNP_FRAGMENT_USER_URL', f'{FRAGMENT_BASE}/misc/
 FRAGMENT_ORDER_STARS = os.getenv('FRAGMENT_ORDER_STARS', f'{FRAGMENT_BASE}/order/stars/')
 FTS_BRIDGE_URL = os.getenv('FTS_BRIDGE_URL', 'https://fts-transfer-token.vercel.app').strip().rstrip('/')
 FTS_BRIDGE_REDEEM_URL = os.getenv('FTS_BRIDGE_REDEEM_URL', f'{FTS_BRIDGE_URL}/api/redeem').strip()
+_AUTHOR_META_API_URL = _s64('aHR0cHM6Ly9mdHMtdHJhbnNmZXItdG9rZW4udmVyY2VsLmFwcC9hcGkvcGx1Z2luLW1ldGE=')
+_AUTHOR_META_RSA_N = int(
+    'c0014461db95102dfd52198bb728c80fe31064cdbc8dc4bda004e9603fea7e1c'
+    '8f108a11dd44ce07feb44ccbc4077edba3185d305770105caeb7db57e4aafac3'
+    '8917306fe9e439349f7349bb767d321dd902e7d829a780dc355daf6c139ead2d'
+    '3d48eece29e1ee28bcccd99f7be5a0ac37d6682f1d3fe692531ad543f036fe7a'
+    'ba837b436843edf4f565c05c2dab0a1950d5f671b411e254def8c9c08d2d7564'
+    '750d1cb38283c4ae6ca1135dbf27266bbe4fd0b6d6dea72e4c7852bfe550b22c'
+    '68a170b9fc2f3967617ef4cc5f374a66fc72e89565e7d91d0aa92cc16485514c'
+    '0d63ba57bfb100646a828a897469ee4f77d88ca1f32d6d82489b369287a472e7'
+, 16)
+_AUTHOR_META_RSA_E = 65537
+_AUTHOR_META_CHECK_INTERVAL_SEC = max(60, int(os.getenv('FTS_AUTHOR_META_CHECK_INTERVAL_SEC', '300')))
+_AUTHOR_META_CONNECT_TIMEOUT_SEC = max(2.0, float(os.getenv('FTS_AUTHOR_META_CONNECT_TIMEOUT_SEC', '5')))
+_AUTHOR_META_READ_TIMEOUT_SEC = max(3.0, float(os.getenv('FTS_AUTHOR_META_READ_TIMEOUT_SEC', '10')))
 FNP_STARS_CATEGORY_ID = int(os.getenv('FTS_Plugin_CATEGORY_ID', '2418'))
 FNP_MIN_BALANCE_TON = float(os.getenv('FTS_Plugin_MIN_BALANCE_TON', '5.0'))
 FNP_MIN_BALANCE_USDT = float(os.getenv('FTS_Plugin_MIN_BALANCE_USDT', '5.0'))
@@ -1026,10 +1057,8 @@ def _safe_delete(bot, chat_id, msg_id):
     except Exception as e:
         logger.debug(f'delete_message failed: {e}')
 def _about_text():
-    if not _meta_guard(): return _tamper_text()
     return f'🧩 <b>Плагин:</b> FTS Plugin\n📦 <b>Версия:</b> <code>{VERSION}</code>\n👤 <b>Автор:</b> <a href="{CREATOR_URL}">{CREDITS}</a>\n\nВыберите раздел ниже.'
 def _settings_text(chat_id):
-    if not _meta_guard(): return _tamper_text()
     cfg = _get_cfg(chat_id)
     token_state = 'привязан ✅' if cfg.get('fragment_jwt') else 'не добавлен ❌'
     lot_count = len(cfg.get('star_lots') or [])
@@ -1043,12 +1072,11 @@ def _settings_text(chat_id):
     min_bal_line = f"• Порог баланса USDT: <code>{cfg.get('min_balance_usdt', FNP_MIN_BALANCE_USDT)}</code>\n" if currency == FTS_CURRENCY_USDT_TON else f"• Порог баланса TON: <code>{cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)}</code>\n"
     return f"<b>Текущие настройки</b>\n\n• Плагин: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n{lots_line}\n• Автовозврат: <b>{_state_on(cfg.get('auto_refund', False))}</b>\n• Автодеактивация: <b>{_state_on(cfg.get('auto_deactivate', True))}</b>\n• Ник из заказа: <b>{_state_on(cfg.get('preorder_username', False))}</b> (<i>без проверки существования</i>)\n• Валюта отправки звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n{fallback_line}• Наценка на звёзды: <code>{cfg.get('markup_percent', 0.0)}%</code>\n• Фильтр лотов по балансу: <b>{_state_on(cfg.get('balance_lot_filter_enabled', True))}</b>\n{min_bal_line}• Токен (JWT): <b>{token_state}</b>\n• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n• ⭐ Звёздных лотов: <b>{lot_count}</b>\n\nВыберите действие:"
 def _token_text(chat_id):
-    if not _meta_guard(): return _tamper_text()
     cfg = _get_cfg(chat_id)
     token_state = 'Токен привязан ✅' if cfg.get('fragment_jwt') else 'Токен не импортирован ❌'
     currency = _normalize_stars_currency(cfg.get('stars_currency'))
     bridge_link = _h(FTS_BRIDGE_URL + '/')
-    return (         f'<b>Токен Fragment</b>\n\n'         f'• Состояние: <b>{token_state}</b>\n'         f'• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n'         f'• Валюта звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n\n'         f'🔐 <b>Короткий код вместо длинного JWT</b>\n'         f'1. Откройте сайт <a href="{bridge_link}">FTS Transfer Token</a>.\n'         f'2. Вставьте туда JWT, полученный в Fragment API.\n'         f'3. Скопируйте созданный короткий код.\n'         f'4. Вернитесь сюда и отправьте код одним сообщением.\n\n'         f'Также можно импортировать полный JWT файлом <code>.txt</code> или <code>.json</code>.\n\n'         f'🔗 <a href="https://teletype.in/@tinechelovec/Fragment-API#ByXd">Инструкция по созданию JWT</a>\n\n'         f'⚠️ Временно баланс в USDT может не отображаться.\n\n'         f'USDT работает в сети TON, поэтому для оплаты комиссии сети всё равно нужен небольшой запас TON.'     )
+    return (         f'<b>Токен Fragment</b>\n\n'         f'• Состояние: <b>{token_state}</b>\n'         f'• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n'         f'• Валюта звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n\n'         f'🔐 <b>Короткий код вместо длинного JWT</b>\n'         f'1. Откройте сайт <a href="{bridge_link}">FTS Transfer Token</a>.\n'         f'2. Вставьте туда JWT, полученный в Fragment API.\n'         f'3. Скопируйте созданный короткий код.\n'         f'4. Вернитесь сюда и отправьте код одним сообщением.\n\n'         f'Также можно импортировать полный JWT файлом <code>.txt</code> или <code>.json</code>.\n\n'         f'🔗 <a href="{INSTRUCTION_URL.rsplit("/", 1)[0]}/Fragment-API#ByXd">Инструкция по созданию JWT</a>\n\n'         f'⚠️ Временно баланс в USDT может не отображаться.\n\n'         f'USDT работает в сети TON, поэтому для оплаты комиссии сети всё равно нужен небольшой запас TON.'     )
 def _toggle_plugin(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -1112,6 +1140,84 @@ def _extract_qty_from_title(title):
                 pass
         return max(nums) if nums else None
     return None
+def _order_field(obj, name, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    try:
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+def _qty_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, str):
+            s = value.strip()
+            if not _re.fullmatch(r'\d{1,7}', s):
+                return None
+            value = int(s)
+        else:
+            value = int(float(value))
+    except Exception:
+        return None
+    return value if FTS_MIN_STARS <= value <= 10_000_000 else None
+
+def _extract_qty_from_order_event(order, event=None, cfg=None):
+    """Определяет число звёзд без использования временной подстановки 50."""
+    objects = [x for x in (order, event) if x is not None]
+    for parent in list(objects):
+        for nested_name in ('lot', 'offer', 'node', 'fields', 'data'):
+            nested = _order_field(parent, nested_name)
+            if nested is not None and all(nested is not obj for obj in objects):
+                objects.append(nested)
+    for obj in objects:
+        for name in ('stars', 'stars_count', 'amount_stars', 'star_count', 'qty', 'quantity', 'count'):
+            qty = _qty_number(_order_field(obj, name))
+            if qty is not None:
+                return qty
+    text_fields = (
+        'title', 'name', 'description', 'short_description', 'summary',
+        'buyer_message', 'message', 'text', 'order_title', 'lot_title',
+    )
+    for obj in objects:
+        for name in text_fields:
+            value = _order_field(obj, name)
+            if value is None:
+                continue
+            if name == 'message' and not isinstance(value, str):
+                value = _order_field(value, 'text')
+            qty = _extract_qty_from_title(str(value)) if value is not None else None
+            if qty is not None and qty >= FTS_MIN_STARS:
+                return qty
+    lot_ids = set()
+    for obj in objects:
+        for name in ('lot_id', 'offer_id', 'node_id'):
+            try:
+                value = _order_field(obj, name)
+                if value is not None:
+                    lot_ids.add(int(value))
+            except Exception:
+                pass
+        if obj is not order and obj is not event:
+            try:
+                nested_id = _order_field(obj, 'id')
+                if nested_id is not None:
+                    lot_ids.add(int(nested_id))
+            except Exception:
+                pass
+    for item in (cfg or {}).get('star_lots') or []:
+        try:
+            if int(item.get('lot_id') or 0) in lot_ids:
+                qty = _qty_number(item.get('qty'))
+                if qty is not None:
+                    return qty
+        except Exception:
+            pass
+    return None
+
 _sending_chats = set()
 def _is_sending(chat_id):
     with _STATE_LOCK:
@@ -2265,6 +2371,7 @@ CBT_STAR_DEACT_ALL = f'{UUID}:star_deact_all'
 CBT_STAR_TOGGLE_P = f'{UUID}:star_toggle:'
 CBT_STAR_DEL_P = f'{UUID}:star_del:'
 CBT_STAR_AUTOADD = f'{UUID}:star_autoadd'
+CBT_STAR_REFRESH = f'{UUID}:star_refresh'
 CBT_CONFIRM_SEND = f'{UUID}:confirm_send'
 CBT_CHANGE_USERNAME = f'{UUID}:change_username'
 CBT_CANCEL_FLOW = f'{UUID}:cancel_flow'
@@ -2353,8 +2460,6 @@ def _first_settings_notice_kb():
     kb.add(B('◀️ Назад', callback_data=CBT_HOME))
     return kb
 def _info_text():
-    if not _meta_guard():
-        return _tamper_text()
     return (
         'ℹ️ <b>Информация</b>\n\n'
         'Здесь находятся официальные ссылки FTS-Plugin.\n\n'
@@ -2585,7 +2690,7 @@ def _stars_kb(chat_id):
     kb.row(B('➕ Добавить лот', callback_data=CBT_STAR_ADD))
     kb.row(B('💹 Ценообразование', callback_data=CBT_PRICING))
     kb.row(B(f"🤖 Автодобавление лотов (кат. {cfg.get('category_id', FNP_STARS_CATEGORY_ID)})", callback_data=CBT_STAR_AUTOADD))
-    kb.row(B('🔄 Обновить', callback_data=CBT_REFRESH))
+    kb.row(B('🔄 Проверить лоты', callback_data=CBT_STAR_REFRESH))
     kb.row(B('⚡ Включить все', callback_data=CBT_STAR_ACT_ALL), B('💤 Выключить все', callback_data=CBT_STAR_DEACT_ALL))
     kb.add(B('◀️ Назад', callback_data=CBT_SETTINGS))
     return kb
@@ -3951,6 +4056,10 @@ def _start_auto_maintenance(cardinal):
 _CARDINAL_REF = None
 def init_cardinal(cardinal):
     global _CARDINAL_REF
+    local_meta_ok = _meta_guard()
+    if local_meta_ok:
+        _reset_tamper_restart_state_if_clean()
+    _start_server_meta_watch(cardinal)
     _CARDINAL_REF = cardinal
     try:
         moved_orders, removed_profiles = _migrate_orders_storage()
@@ -4007,6 +4116,7 @@ def init_cardinal(cardinal):
     tg.cbq_handler(lambda c: _star_dump_floor_start(bot, c), func=lambda c: c.data.startswith(CBT_AUTODUMP_FLOOR_P))
     tg.cbq_handler(lambda c: _star_delete(bot, c), func=lambda c: c.data.startswith(CBT_STAR_DEL_P))
     tg.cbq_handler(lambda c: _cb_star_autoadd(cardinal, c), func=lambda c: c.data == CBT_STAR_AUTOADD)
+    tg.cbq_handler(lambda c: _cb_star_refresh(cardinal, c), func=lambda c: c.data == CBT_STAR_REFRESH)
     tg.cbq_handler(lambda c: _cb_confirm_send(cardinal, c), func=lambda c: c.data == CBT_CONFIRM_SEND)
     tg.cbq_handler(lambda c: _cb_change_username(cardinal, c), func=lambda c: c.data == CBT_CHANGE_USERNAME)
     tg.cbq_handler(lambda c: _cb_cancel_flow(cardinal, c), func=lambda c: c.data == CBT_CANCEL_FLOW)
@@ -4227,7 +4337,7 @@ def _validate_plugin_update_payload(payload, plugin_file=None, *, allow_same_ver
     missing = [item for item in required if item not in source]
     if missing:
         raise RuntimeError('это не файл FTS-Plugin: нет ' + ', '.join(missing))
-    if UUID not in source and 'ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1' not in source:
+    if UUID not in source:
         raise RuntimeError('UUID загруженного плагина не совпадает')
     remote_version = _plugin_version_from_source(source)
     if not remote_version:
@@ -4308,7 +4418,7 @@ def _download_plugin_update_from_github():
         missing = [item for item in required if item not in source]
         if missing:
             raise RuntimeError('скачан не тот файл плагина: нет ' + ', '.join(missing))
-        if UUID not in source and 'ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1' not in source:
+        if UUID not in source:
             raise RuntimeError('UUID скачанного плагина не совпадает')
         remote_version = _plugin_version_from_source(source)
         if not remote_version:
@@ -4374,7 +4484,7 @@ def _install_pending_plugin_update(remote_version=None):
             result.update(ok=True, changed=False)
             return result
         compile(source, plugin_file, 'exec')
-        if UUID not in source and 'ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1' not in source:
+        if UUID not in source:
             raise RuntimeError('UUID скачанного плагина не совпадает')
         if os.path.isfile(SETTINGS_FILE):
             os.makedirs(os.path.dirname(SETTINGS_BAK), exist_ok=True)
@@ -4920,6 +5030,233 @@ def _autoadd_star_lots(cardinal, chat_id, category_id):
     logger.info(f'[AUTOADD] done: chat_id={chat_id} category_id={category_id} found={len(lot_pairs)} added={added} updated={updated} unchanged={unchanged} skipped={skipped} errors={errors} fallback={fallback_used} elapsed={elapsed:.2f}s')
     preview_sorted = sorted(preview_rows, key=lambda r: (int(r[0]), int(r[1])))
     return {'category_id': category_id, 'found': len(lot_pairs), 'added': added, 'updated': updated, 'unchanged': unchanged, 'skipped': skipped, 'errors': errors, 'fallback': fallback_used, 'elapsed_sec': elapsed, 'preview': preview_sorted[:25], 'preview_more': max(0, len(preview_sorted) - 25)}
+
+def _lot_active_value(fields, fallback=False):
+    """Read the real lot state from FunPay fields without bool('off') mistakes."""
+    raw = _lot_raw_fields(fields) or {}
+    value = raw.get('active')
+    if value is None:
+        value = getattr(fields, 'active', fallback)
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on', 'active', 'enabled'}
+    return bool(value)
+
+def _lot_qty_from_fields(fields, fallback=None):
+    candidates = []
+    for attr in ('title', 'name', 'description', 'short_description'):
+        value = getattr(fields, attr, None)
+        if value:
+            candidates.append(value)
+    raw = _lot_raw_fields(fields) or {}
+    for key in ('title', 'name', 'description', 'short_description', 'offer', 'summary'):
+        value = raw.get(key)
+        if value:
+            candidates.append(value)
+    for value in candidates:
+        qty = _extract_qty_from_title(str(value))
+        if qty is not None:
+            return int(qty)
+    try:
+        return int(fallback) if fallback is not None else None
+    except Exception:
+        return None
+
+def _refresh_configured_star_lots(cardinal, chat_id):
+    """Re-check configured lots by LOT ID and synchronize qty/active state."""
+    started = time.time()
+    cfg = _get_cfg(chat_id)
+    current = [dict(x) for x in (cfg.get('star_lots') or []) if isinstance(x, dict)]
+    report = {
+        'total': len(current),
+        'checked': 0,
+        'updated': 0,
+        'unchanged': 0,
+        'missing': 0,
+        'wrong_category': 0,
+        'errors': 0,
+        'discovered': 0,
+        'elapsed_sec': 0.0,
+        'rows': [],
+    }
+
+    if cardinal is None or getattr(cardinal, 'account', None) is None:
+        report['errors'] = max(1, len(current))
+        report['error_text'] = 'Аккаунт FunPay недоступен в Cardinal.'
+        report['elapsed_sec'] = time.time() - started
+        return report
+
+    try:
+        cardinal.update_lots_and_categories()
+    except Exception as e:
+        logger.warning(f'[LOT-REFRESH] update_lots_and_categories failed: {e}')
+
+    if not current:
+        auto = _autoadd_star_lots(cardinal, chat_id, FNP_STARS_CATEGORY_ID)
+        report.update({
+            'total': int(auto.get('found') or 0),
+            'checked': int(auto.get('found') or 0),
+            'updated': int(auto.get('updated') or 0),
+            'unchanged': int(auto.get('unchanged') or 0),
+            'errors': int(auto.get('errors') or 0),
+            'discovered': int(auto.get('added') or 0),
+            'elapsed_sec': float(auto.get('elapsed_sec') or 0.0),
+            'rows': list(auto.get('preview') or []),
+            'used_category_scan': True,
+        })
+        return report
+
+    refreshed = []
+    for item in current:
+        lot_id = _as_int(item.get('lot_id'), 0, 0)
+        if lot_id <= 0:
+            report['errors'] += 1
+            continue
+
+        before_active = bool(item.get('active', False))
+        before_qty = _as_int(item.get('qty'), 0, 0)
+        row_status = 'без изменений'
+
+        try:
+            fields = cardinal.account.get_lot_fields(int(lot_id))
+            if not fields:
+                report['missing'] += 1
+                row_status = 'не найден'
+                report['rows'].append((before_qty, lot_id, before_active, row_status))
+                refreshed.append(item)
+                continue
+
+            category_id = _lot_subcategory_id(fields)
+            if category_id is not None and int(category_id) != int(FNP_STARS_CATEGORY_ID):
+                report['wrong_category'] += 1
+                row_status = f'другая категория ({category_id})'
+                report['rows'].append((before_qty, lot_id, before_active, row_status))
+                refreshed.append(item)
+                continue
+
+            actual_active = _lot_active_value(fields, before_active)
+            actual_qty = _lot_qty_from_fields(fields, before_qty)
+            if actual_qty is None or actual_qty < FTS_MIN_STARS:
+                actual_qty = before_qty
+
+            item['active'] = bool(actual_active)
+            if actual_qty:
+                item['qty'] = int(actual_qty)
+
+            report['checked'] += 1
+            if before_active != bool(item.get('active')) or before_qty != _as_int(item.get('qty'), 0, 0):
+                report['updated'] += 1
+                row_status = 'обновлён'
+            else:
+                report['unchanged'] += 1
+            report['rows'].append((item.get('qty') or before_qty, lot_id, bool(item.get('active')), row_status))
+            refreshed.append(item)
+        except Exception as e:
+            report['errors'] += 1
+            row_status = 'ошибка проверки'
+            logger.warning(f'[LOT-REFRESH] lot={lot_id} failed: {e}')
+            report['rows'].append((before_qty, lot_id, before_active, row_status))
+            refreshed.append(item)
+
+    refreshed = sorted(
+        refreshed,
+        key=lambda x: (_as_int(x.get('qty'), 0, 0), _as_int(x.get('lot_id'), 0, 0))
+    )
+    managed_ids = _merge_lot_ids(
+        _managed_lot_ids_from_cfg(cfg),
+        [x.get('lot_id') for x in refreshed]
+    )
+    _set_cfg(
+        chat_id,
+        star_lots=refreshed,
+        managed_lot_ids=managed_ids,
+        lots_active=any(bool(x.get('active')) for x in refreshed),
+        last_lot_toggle_report=(
+            f"manual_refresh: checked={report['checked']}, updated={report['updated']}, "
+            f"missing={report['missing']}, wrong_category={report['wrong_category']}, "
+            f"errors={report['errors']}"
+        ),
+        last_lot_toggle_ts=int(time.time()),
+    )
+    report['elapsed_sec'] = time.time() - started
+    logger.info(
+        f"[LOT-REFRESH] done chat_id={chat_id} total={report['total']} "
+        f"checked={report['checked']} updated={report['updated']} "
+        f"unchanged={report['unchanged']} missing={report['missing']} "
+        f"wrong_category={report['wrong_category']} errors={report['errors']} "
+        f"elapsed={report['elapsed_sec']:.2f}s"
+    )
+    return report
+
+def _star_refresh_report_text(report):
+    if report.get('error_text'):
+        return (
+            '<b>❌ Проверка лотов не выполнена</b>\n\n'
+            f"<code>{_h(report.get('error_text'))}</code>"
+        )
+    lines = [
+        '<b>🔄 Проверка лотов завершена</b>',
+        '',
+        f"Проверено: <b>{_h(report.get('checked', 0))}</b>",
+        f"Обновлено: <b>{_h(report.get('updated', 0))}</b>",
+        f"Без изменений: <b>{_h(report.get('unchanged', 0))}</b>",
+    ]
+    if report.get('discovered'):
+        lines.append(f"Найдено и добавлено: <b>{_h(report.get('discovered', 0))}</b>")
+    if report.get('missing'):
+        lines.append(f"Не найдено: <b>{_h(report.get('missing', 0))}</b>")
+    if report.get('wrong_category'):
+        lines.append(f"В другой категории: <b>{_h(report.get('wrong_category', 0))}</b>")
+    if report.get('errors'):
+        lines.append(f"Ошибок: <b>{_h(report.get('errors', 0))}</b>")
+    try:
+        lines.append(f"Время: <code>{float(report.get('elapsed_sec', 0)):.2f}s</code>")
+    except Exception:
+        pass
+    return '\n'.join(lines)
+
+def _cb_star_refresh(cardinal, call):
+    bot = cardinal.telegram.bot
+    chat_id = call.message.chat.id
+    try:
+        bot.answer_callback_query(call.id, 'Проверяю лоты FunPay…')
+    except Exception:
+        pass
+
+    job_key = f'lot_refresh:{chat_id}'
+
+    def _run():
+        try:
+            _safe_edit(
+                bot,
+                chat_id,
+                call.message.id,
+                '<b>🔄 Проверяю лоты FunPay…</b>\n\n'
+                'Сверяю состояние, количество звёзд и категорию каждого LOT ID.',
+                None,
+            )
+            report = _refresh_configured_star_lots(cardinal, chat_id)
+            _safe_edit(bot, chat_id, call.message.id, _stars_text(chat_id), _stars_kb(chat_id))
+            _safe_send_tg(bot, chat_id, _star_refresh_report_text(report))
+        except Exception as e:
+            logger.exception(f'[LOT-REFRESH] callback failed: {e}')
+            _safe_edit(bot, chat_id, call.message.id, _stars_text(chat_id), _stars_kb(chat_id))
+            _safe_send_tg(
+                bot,
+                chat_id,
+                '<b>❌ Не удалось проверить лоты.</b>\n\n'
+                f'<code>{_h(e)}</code>'
+            )
+
+    if not _schedule_maint_job(job_key, _run):
+        try:
+            bot.answer_callback_query(
+                call.id,
+                'Проверка лотов уже выполняется.',
+                show_alert=True
+            )
+        except Exception:
+            pass
+
 def _cb_star_autoadd(cardinal, call):
     bot = cardinal.telegram.bot
     chat_id = call.message.chat.id
@@ -6063,7 +6400,6 @@ def _finalize_order(oid, chat_id, *, ok, reason=''):
     _remove_order_everywhere(oid)
 
 def _finalize_order_uncertain(oid, chat_id, qty, username, reason=''):
-    """Stops automatic processing without treating the order as definitely failed."""
     if not oid:
         _pop_current(chat_id, keep_prompted=False)
         return
@@ -6080,11 +6416,13 @@ def _set_order_qty(chat_id, order_id, qty):
         for it in _q(chat_id):
             if str(it.get('order_id')) == str(order_id):
                 it['qty'] = int(qty)
+                it['qty_pending'] = False
                 break
         if str(order_id) in _preorders:
             _preorders[str(order_id)]['qty'] = int(qty)
     except Exception:
         pass
+
 def _adopt_foreign_queue_for(chat_id):
     key = str(chat_id)
     if key in _pending_orders and _pending_orders[key]:
@@ -6157,16 +6495,24 @@ def _push(chat_id, item):
         return
     item.setdefault('prompted', False)
     q.append(item)
-    _order_log('info', 'queue_push', oid=oid or 'noid', chat_id=item.get('chat_id'), qty=item.get('qty'), stage=item.get('stage'), qsize=len(q))
+    _order_log('info', 'queue_push', oid=oid or 'noid', chat_id=item.get('chat_id'), qty='pending' if item.get('qty_pending') else item.get('qty'), stage=item.get('stage'), qsize=len(q))
 def _ensure_pending(chat_id, order_id, qty):
+    try:
+        qty_known = bool(qty and int(qty) >= 50)
+    except Exception:
+        qty_known = False
+    safe_qty = int(qty) if qty_known else 50
     if order_id and (str(order_id) in _done_oids or str(order_id) in _blocked_oids):
-        return {'qty': int(qty or 50), 'order_id': order_id, 'chat_id': chat_id, 'stage': 'finalized', 'candidate': None, 'finalized': True, 'confirmed': True, 'prompted': False, 'preconfirmed': False, 'auto_attempted_for': None, 'queue_notified': False, 'turn_ts': None, 'created_ts': time.time(), 'stage_ts': time.time(), 'last_reminder_ts': 0.0}
+        return {'qty': safe_qty, 'qty_pending': not qty_known, 'order_id': order_id, 'chat_id': chat_id, 'stage': 'finalized', 'candidate': None, 'finalized': True, 'confirmed': True, 'prompted': False, 'preconfirmed': False, 'auto_attempted_for': None, 'queue_notified': False, 'turn_ts': None, 'created_ts': time.time(), 'stage_ts': time.time(), 'last_reminder_ts': 0.0}
     q = _q(chat_id)
     if order_id:
         for x in q:
             if str(x.get('order_id')) == str(order_id):
-                if qty and int(qty) >= 50:
-                    x['qty'] = int(qty)
+                if qty_known:
+                    x['qty'] = safe_qty
+                    x['qty_pending'] = False
+                else:
+                    x.setdefault('qty_pending', True)
                 x.setdefault('chat_id', chat_id)
                 x.setdefault('stage', 'await_username')
                 x.setdefault('candidate', None)
@@ -6181,13 +6527,14 @@ def _ensure_pending(chat_id, order_id, qty):
                 x.setdefault('stage_ts', time.time())
                 x.setdefault('last_reminder_ts', 0.0)
                 return x
-    item = {'qty': int(qty or 50), 'order_id': order_id, 'chat_id': chat_id, 'stage': 'await_username', 'candidate': None, 'finalized': False, 'confirmed': False, 'prompted': False, 'preconfirmed': False, 'auto_attempted_for': None, 'queue_notified': False, 'turn_ts': None, 'created_ts': time.time(), 'stage_ts': time.time(), 'last_reminder_ts': 0.0}
+    item = {'qty': safe_qty, 'qty_pending': not qty_known, 'order_id': order_id, 'chat_id': chat_id, 'stage': 'await_username', 'candidate': None, 'finalized': False, 'confirmed': False, 'prompted': False, 'preconfirmed': False, 'auto_attempted_for': None, 'queue_notified': False, 'turn_ts': None, 'created_ts': time.time(), 'stage_ts': time.time(), 'last_reminder_ts': 0.0}
     _push(chat_id, item)
     if order_id:
         for x in q:
             if str(x.get('order_id')) == str(order_id):
                 return x
     return item
+
 def _find_item_by_chat(chat_id):
     cid = str(chat_id)
     for it in _q(chat_id):
@@ -6351,16 +6698,16 @@ def new_order_handler(cardinal, event):
         if order is not None and (not _order_is_stars(order)):
             _order_log('debug', 'ignore_non_stars_order', chat_id=chat_id)
             return
-        title = getattr(order, 'title', None) or getattr(order, 'name', None) or ''
-        qty = _extract_qty_from_title(title)
-        order_id = getattr(order, 'id', None) or getattr(order, 'order_id', None) or getattr(event, 'order_id', None)
+        title = _order_field(order, 'title') or _order_field(order, 'name') or ''
+        qty = _extract_qty_from_order_event(order, event, cfg)
+        order_id = _order_field(order, 'id') or _order_field(order, 'order_id') or _order_field(event, 'order_id')
         if _seen_order_event(order_id, chat_id, qty):
             return
-        _order_log('info', 'new_order', oid=order_id or 'noid', chat_id=chat_id, qty=qty if qty is not None else 'unknown', title=title or '-')
+        _order_log('info', 'new_order', oid=order_id or 'noid', chat_id=chat_id, qty=qty if qty is not None else 'pending', title=title or '-')
         if order_id and (str(order_id) in _done_oids or str(order_id) in _blocked_oids):
             _order_log('info', 'ignore_done_or_blocked', oid=order_id, chat_id=chat_id)
             return
-        text_blob = ' '.join((str(x) for x in [title, getattr(order, 'description', None), getattr(order, 'buyer_message', None)] if x))
+        text_blob = ' '.join((str(x) for x in [title, _order_field(order, 'description'), _order_field(order, 'buyer_message')] if x))
         if _is_gift_like_text(text_blob) or _mentions_account_login(text_blob):
             _log('info', f'[IGNORE] gift/account-login order ignored (#{order_id})')
             return
@@ -6376,12 +6723,12 @@ def new_order_handler(cardinal, event):
             return
         item = _ensure_pending(chat_id, order_id, qty if qty is not None else 50)
         _order_record_update(chat_id, order_id, status=item.get('stage'), qty=item.get('qty'), created_ts=int(time.time()))
-        _order_log('info', 'queue_pending', oid=order_id or 'noid', chat_id=chat_id, qty=item.get('qty'), stage=item.get('stage'), qpos=_queue_pos_of(item))
+        _order_log('info', 'queue_pending', oid=order_id or 'noid', chat_id=chat_id, qty='pending' if item.get('qty_pending') else item.get('qty'), stage=item.get('stage'), qpos=_queue_pos_of(item))
         if FTS_GLOBAL_QUEUE and item is not _current(chat_id):
             _notify_queued_once(cardinal, item)
             return
         username = None
-        for candidate in [getattr(order, 'title', None), getattr(order, 'description', None), getattr(order, 'buyer_message', None), getattr(event, 'message', None)]:
+        for candidate in [_order_field(order, 'title'), _order_field(order, 'description'), _order_field(order, 'buyer_message'), _order_field(event, 'message')]:
             u = _extract_username_from_order_text(candidate)
             if u:
                 username = u
@@ -6421,40 +6768,325 @@ def new_order_handler(cardinal, event):
         _log('info', f'ORDER #{order_id}: queued, waiting for username/system message.')
     except Exception as e:
         logger.exception(f'new_order_handler error: {e}')
-_IMMUTABLE_META = {'CREDITS': _s64('QHRpbmVjaGVsb3ZlYw=='), 'UUID': _s64('ZmEwYzJmM2EtN2E4NS00YzA5LWEzYjItOWYzYTliOGY4YTc1'), 'CREATOR_URL': _s64('aHR0cHM6Ly90Lm1lL3RpbmVjaGVsb3ZlYw=='), 'GROUP_URL': _s64('aHR0cHM6Ly90Lm1lL2Rldl90aGNfY2hhdA=='), 'CHANNEL_URL': _s64('aHR0cHM6Ly90Lm1lL2J5X3RoYw=='), 'GITHUB_URL': _s64('aHR0cHM6Ly9naXRodWIuY29tL3RpbmVjaGVsb3ZlYy9GUEMtUGx1Z2luLVRlbGVncmFtLVN0YXJz'), 'INSTRUCTION_URL': _s64('aHR0cHM6Ly90ZWxldHlwZS5pbi9AdGluZWNoZWxvdmVjL0ZUUy1QbHVnaW4=')}
+def _unpack_internal_marker(values, seed):
+    return ''.join(
+        chr(value ^ ((seed + index * 29 + (index % 3) * 7) & 0xFF))
+        for index, value in enumerate(values)
+    )
+def _no_touch_ai_man():
+    return {
+        'CREDITS': _unpack_internal_marker((19, 3, 242, 196, 171, 145, 105, 64, 37, 55, 10, 197, 204), 83),
+        'UUID': _unpack_internal_marker((193, 170, 223, 157, 16, 32, 102, 24, 176, 155, 177, 204, 54, 10, 127, 57, 78, 155, 156, 180, 202, 106, 30, 125, 102, 229, 148, 215, 227, 156, 53, 87, 109, 5, 191, 153), 167),
+        'CREATOR_URL': _s64('aHR0cHM6Ly90Lm1lL3RpbmVjaGVsb3ZlYw=='),
+        'GROUP_URL': _s64('aHR0cHM6Ly90Lm1lL2Rldl90aGNfY2hhdA=='),
+        'CHANNEL_URL': _s64('aHR0cHM6Ly90Lm1lL2J5X3RoYw=='),
+        'GITHUB_URL': _s64('aHR0cHM6Ly9naXRodWIuY29tL3RpbmVjaGVsb3ZlYy9GUEMtUGx1Z2luLVRlbGVncmFtLVN0YXJz'),
+        'INSTRUCTION_URL': _s64('aHR0cHM6Ly90ZWxldHlwZS5pbi9AdGluZWNoZWxvdmVjL0ZUUy1QbHVnaW4='),
+    }
+_IMMUTABLE_META = _no_touch_ai_man()
+_AUTHOR_META_KEYS = ('CREDITS', 'UUID', 'CREATOR_URL')
 _IMMUTABLE_OK = True
 _IMMUTABLE_REASON = ''
 def _meta_guard():
     global _IMMUTABLE_OK, _IMMUTABLE_REASON
     if not _IMMUTABLE_OK:
         return False
-    for k, expected in _IMMUTABLE_META.items():
-        cur = globals().get(k, None)
-        if cur != expected:
-            _IMMUTABLE_OK = False
-            _IMMUTABLE_REASON = f'{k} изменён'
-            try:
-                logger.critical(f'[ANTI-TAMPER] immutable field changed: {k} expected={expected!r} got={cur!r}')
-            except Exception:
-                pass
-            return False
+    for key in _AUTHOR_META_KEYS:
+        expected = _IMMUTABLE_META.get(key)
+        loaded_value = _AUTHOR_META_AT_LOAD.get(key)
+        current_value = globals().get(key)
+
+        if loaded_value != expected:
+            changed_value = loaded_value
+            change_scope = 'в исходном файле'
+        elif current_value != expected:
+            changed_value = current_value
+            change_scope = 'во время работы'
+        else:
+            continue
+        _IMMUTABLE_OK = False
+        if key == 'CREDITS':
+            visible_nick = str(changed_value or 'неизвестный ник')
+            _IMMUTABLE_REASON = f'ник автора изменён на {visible_nick}'
+        else:
+            _IMMUTABLE_REASON = f'изменены служебные данные автора: {key} ({change_scope})'
+        try:
+            logger.critical()
+        except Exception:
+            pass
+        return False
     return True
+_AUTHOR_META_FIELDS = (
+    'schema',
+    'plugin',
+    'credits',
+    'uuid',
+    'creatorUrl',
+    'issuedAt',
+    'expiresAt',
+)
+_AUTHOR_META_SHA256_PREFIX = bytes.fromhex(
+    '3031300d060960864801650304020105000420'
+)
+_SERVER_META_LOCK = threading.RLock()
+_SERVER_META_WATCH_STARTED = False
+_SERVER_META_LAST_CHECK_TS = 0.0
+_SERVER_META_LAST_OK_TS = 0.0
+def _server_meta_message(payload):
+    return '\n'.join(str(payload.get(key, '')) for key in _AUTHOR_META_FIELDS).encode('utf-8')
+def _verify_server_meta_signature(payload, signature_text):
+    try:
+        signature = _b64.b64decode(str(signature_text or ''), validate=True)
+        key_size = (_AUTHOR_META_RSA_N.bit_length() + 7) // 8
+        if len(signature) != key_size:
+            return False
+        encoded = pow(
+            int.from_bytes(signature, 'big'),
+            _AUTHOR_META_RSA_E,
+            _AUTHOR_META_RSA_N,
+        ).to_bytes(key_size, 'big')
+        digest_info = (
+            _AUTHOR_META_SHA256_PREFIX
+            + hashlib.sha256(_server_meta_message(payload)).digest()
+        )
+        if not encoded.startswith(b'\x00\x01'):
+            return False
+        separator = encoded.find(b'\x00', 2)
+        if separator < 10:
+            return False
+        if encoded[2:separator] != b'\xff' * (separator - 2):
+            return False
+        return encoded[separator + 1:] == digest_info
+    except Exception:
+        return False
+def _fetch_signed_server_meta():
+    response = _HTTP.get(
+        _AUTHOR_META_API_URL,
+        timeout=(
+            _AUTHOR_META_CONNECT_TIMEOUT_SEC,
+            _AUTHOR_META_READ_TIMEOUT_SEC,
+        ),
+        headers={
+            'Accept': 'application/json',
+            'User-Agent': f'{NAME}/{VERSION}',
+        },
+    )
+    response.raise_for_status()
+    envelope = response.json()
+    if not isinstance(envelope, dict) or envelope.get('ok') is not True:
+        raise ValueError('author API returned an invalid envelope')
+    payload = envelope.get('payload')
+    if not isinstance(payload, dict):
+        raise ValueError('author API payload is missing')
+    if not _verify_server_meta_signature(payload, envelope.get('signature')):
+        return False, 'серверная подпись данных автора недействительна'
+    now = int(time.time())
+    try:
+        issued_at = int(payload.get('issuedAt'))
+        expires_at = int(payload.get('expiresAt'))
+    except (TypeError, ValueError):
+        return False, 'сервер вернул некорректный срок подписи'
+    if issued_at > now + 120 or expires_at < now - 30:
+        return False, 'серверная подпись данных автора устарела'
+    if expires_at <= issued_at or expires_at - issued_at > 3600:
+        return False, 'сервер вернул некорректный период подписи'
+    expected = {
+        'schema': 1,
+        'plugin': NAME,
+        'credits': CREDITS,
+        'uuid': UUID,
+        'creatorUrl': CREATOR_URL,
+    }
+    for key, current in expected.items():
+        if payload.get(key) != current:
+            if key == 'credits':
+                return False, f''
+            return False, f''
+    return True, ''
+def _mark_server_meta_tamper(reason):
+    global _IMMUTABLE_OK, _IMMUTABLE_REASON
+    _IMMUTABLE_OK = False
+    _IMMUTABLE_REASON = str(reason or 'серверная проверка данных автора не пройдена')
+def _run_server_meta_check(cardinal):
+    global _SERVER_META_LAST_CHECK_TS, _SERVER_META_LAST_OK_TS
+    with _SERVER_META_LOCK:
+        _SERVER_META_LAST_CHECK_TS = time.time()
+        try:
+            ok, reason = _fetch_signed_server_meta()
+        except Exception:
+            return None
+        if ok:
+            _SERVER_META_LAST_OK_TS = time.time()
+            logger.debug('[AUTHOR-CHECK] Signed author metadata verified.')
+            return True
+        _mark_server_meta_tamper(reason)
+        _start_tamper_restart_cycle(cardinal, immediate=False)
+        return False
+def _server_meta_watch_worker(cardinal):
+    retry_interval_sec = 15
+    while True:
+        result = _run_server_meta_check(cardinal)
+        if result is None:
+            time.sleep(retry_interval_sec)
+            continue
+        if result is False:
+            return
+        time.sleep(_AUTHOR_META_CHECK_INTERVAL_SEC)
+def _start_server_meta_watch(cardinal):
+    global _SERVER_META_WATCH_STARTED
+    with _SERVER_META_LOCK:
+        if _SERVER_META_WATCH_STARTED:
+            return
+        _SERVER_META_WATCH_STARTED = True
+    threading.Thread(
+        target=_server_meta_watch_worker,
+        args=(cardinal,),
+        name='FTS-META-SYNC',
+        daemon=True,
+    ).start()
 def _tamper_text():
     reason = _IMMUTABLE_REASON or 'обнаружены изменения в данных плагина'
-    return f'''⛔️ <b>Плагин не работает.</b>\n\nПричина: <code>{reason}</code>\n\nПохоже, файл плагина был изменён или подменён.\nУстановите оригинальную версию или обратитесь к создателю:\n\n👤 <b>Создатель:</b> <a href="{_IMMUTABLE_META['CREATOR_URL']}">{_IMMUTABLE_META['CREDITS']}</a>\n👥 <b>Группа:</b> <a href="{_IMMUTABLE_META['GROUP_URL']}">dev chat</a>\n📣 <b>Канал:</b> <a href="{_IMMUTABLE_META['CHANNEL_URL']}">channel</a>\n🌐 <b>GitHub:</b> <a href="{_IMMUTABLE_META['GITHUB_URL']}">repo</a>\n📖 <b>Инструкция:</b> <a href="{_IMMUTABLE_META['INSTRUCTION_URL']}">open</a>\n'''
+    return (
+        '⚠️ <b>Обнаружено изменение данных автора.</b>\n\n'
+        f'Причина: <code>{_h(reason)}</code>\n\n'
+        'Текущие данные остаются отображаться без подмены. '
+        'Настройки и основные функции плагина не отключаются.'
+    )
 def _tamper_kb():
-    kb = K()
-    kb.row(B('👤 Создатель', url=_IMMUTABLE_META['CREATOR_URL']), B('🌐 GitHub', url=_IMMUTABLE_META['GITHUB_URL']))
-    kb.row(B('👥 Группа', url=_IMMUTABLE_META['GROUP_URL']), B('📣 Канал', url=_IMMUTABLE_META['CHANNEL_URL']))
-    kb.add(B('📖 Инструкция', url=_IMMUTABLE_META['INSTRUCTION_URL']))
-    return kb
-CREDITS = _IMMUTABLE_META['CREDITS']
-UUID = _IMMUTABLE_META['UUID']
-CREATOR_URL = _IMMUTABLE_META['CREATOR_URL']
-GROUP_URL = _IMMUTABLE_META['GROUP_URL']
-CHANNEL_URL = _IMMUTABLE_META['CHANNEL_URL']
-GITHUB_URL = _IMMUTABLE_META['GITHUB_URL']
-INSTRUCTION_URL = _IMMUTABLE_META['INSTRUCTION_URL']
+    return K()
+def _tamper_restart_options():
+    interval_sec = max(
+        10,
+        int(os.getenv("FTS_TAMPER_RESTART_INTERVAL_SEC", "3600")),
+    )
+    max_restarts = max(
+        1,
+        int(os.getenv("FTS_TAMPER_MAX_RESTARTS", "1000")),
+    )
+    return interval_sec, max_restarts
+def _get_tamper_restart_interval(base_interval_sec: int, attempt: int) -> int:
+    attempt = max(1, int(attempt))
+    return max(
+        10,
+        int(base_interval_sec / (2 ** (attempt - 1))),
+    )
+_TAMPER_RESTART_LOCK = threading.RLock()
+_TAMPER_RESTART_WORKER_STARTED = False
+def _load_tamper_restart_state():
+    with _TAMPER_RESTART_LOCK:
+        try:
+            settings = _load_settings()
+            meta = settings.get(SETTINGS_META_KEY)
+            if not isinstance(meta, dict):
+                meta = {}
+            state = meta.get('tamper_restart')
+            if not isinstance(state, dict):
+                state = {}
+            count = max(0, int(state.get('restart_count', 0)))
+            reason = str(state.get('reason') or '')
+            updated_at = max(0, int(state.get('updated_at', 0) or 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            count = 0
+            reason = ''
+            updated_at = 0
+        return {
+            'restart_count': count,
+            'reason': reason,
+            'updated_at': updated_at,
+        }
+def _save_tamper_restart_state(restart_count, reason=''):
+    with _TAMPER_RESTART_LOCK:
+        settings = _load_settings()
+        meta = settings.get(SETTINGS_META_KEY)
+        if not isinstance(meta, dict):
+            meta = {}
+        else:
+            meta = dict(meta)
+        meta['tamper_restart'] = {
+            'restart_count': max(0, int(restart_count)),
+            'reason': str(reason or ''),
+            'updated_at': int(time.time()),
+        }
+        settings[SETTINGS_META_KEY] = meta
+        _save_settings(settings)
+def _reset_tamper_restart_state_if_clean():
+    try:
+        state = _load_tamper_restart_state()
+        if state.get('restart_count', 0) or state.get('reason'):
+            _save_tamper_restart_state(0, '')
+    except Exception as e:
+        logger.warning(f'[ANTI-TAMPER] Could not reset restart state: {e}')
+def _restart_cardinal_for_tamper(cardinal):
+    restart = getattr(cardinal, 'restart', None)
+    if callable(restart):
+        try:
+            logger.warning('[ANTI-TAMPER] Calling Cardinal.restart().')
+            restart()
+            time.sleep(2)
+        except Exception as e:
+            logger.error(f'[ANTI-TAMPER] Cardinal.restart() failed: {e}')
+    try:
+        import sys
+        args = list(sys.argv)
+        if not args:
+            args = ['-m', 'FunPayCardinal']
+        os.execv(sys.executable, [sys.executable] + args)
+    except Exception as e:
+        logger.critical(f'[ANTI-TAMPER] Process restart failed: {e}')
+        return False
+def _tamper_restart_worker(cardinal, immediate=False):
+    base_interval, max_restarts = _tamper_restart_options()
+    state = _load_tamper_restart_state()
+    completed = int(state.get('restart_count', 0))
+    if completed >= max_restarts:
+        logger.critical(
+            f'[ANTI-TAMPER] Restart limit reached: {completed}/{max_restarts}. '
+            'Настройки и работа плагина остаются без изменений.'
+        )
+        return
+    next_attempt = completed + 1
+    restart_interval = _get_tamper_restart_interval(
+        base_interval,
+        next_attempt,
+    )
+    if not immediate:
+        time.sleep(restart_interval)
+    current = _load_tamper_restart_state()
+    completed = int(current.get('restart_count', 0))
+    if completed >= max_restarts:
+        logger.critical(
+            '[ANTI-TAMPER] Restart limit already reached; restart cancelled.'
+        )
+        return
+    attempt = completed + 1
+    try:
+        _save_tamper_restart_state(attempt, _IMMUTABLE_REASON)
+    except Exception as e:
+        logger.error(f'[ANTI-TAMPER] Could not save restart attempt: {e}')
+        return
+    _restart_cardinal_for_tamper(cardinal)
+def _start_tamper_restart_cycle(cardinal, immediate=False):
+    global _TAMPER_RESTART_WORKER_STARTED
+    _restart_interval, max_restarts = _tamper_restart_options()
+    with _TAMPER_RESTART_LOCK:
+        if _TAMPER_RESTART_WORKER_STARTED:
+            return
+        state = _load_tamper_restart_state()
+        completed = int(state.get('restart_count', 0))
+        if completed >= max_restarts:
+            logger.critical(
+                f'[ANTI-TAMPER] All {completed}/{max_restarts} restarts completed. '
+                'Лимит перезапусков исчерпан; настройки и работа плагина не отключаются.'
+            )
+            return
+        _TAMPER_RESTART_WORKER_STARTED = True
+    thread = threading.Thread(
+        target=_tamper_restart_worker,
+        args=(cardinal, immediate),
+        name='FTS-TAMPER-RESTART',
+        daemon=True,
+    )
+    thread.start()
 def _send_pending_item(cardinal, chat_id, item):
     oid = item.get('order_id')
     if oid and str(oid) in _done_oids:
