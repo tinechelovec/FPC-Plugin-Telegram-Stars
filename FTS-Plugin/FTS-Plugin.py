@@ -6,6 +6,7 @@ import requests
 import re as _re
 import time
 import random
+import math
 import shutil
 import threading
 import html as _html, base64 as _b64
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 from telebot.apihelper import ApiTelegramException
 from collections import defaultdict
+from bs4 import BeautifulSoup
 import tg_bot.CBT as CBT
 logger = logging.getLogger('FTS-Plugin')
 LOG_TAG = '[FTS-Plugin]'
@@ -187,7 +189,7 @@ def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
 
 NAME = 'FTS-Plugin'
-VERSION = '1.7.7'
+VERSION = '1.8.0'
 DESCRIPTION = 'Плагин по продаже звезд.'
 CREDITS = '@tinechelovec'
 UUID = 'fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75'
@@ -242,6 +244,10 @@ FTS_AUTODUMP_STEP_RUB = float(os.getenv('FTS_AUTODUMP_STEP_RUB', '1'))
 FTS_AUTODUMP_RAISE_STEP_RUB = float(os.getenv('FTS_AUTODUMP_RAISE_STEP_RUB', '1'))
 FTS_BALANCE_LOT_RESERVE_RATIO = float(os.getenv('FTS_BALANCE_LOT_RESERVE_RATIO', '1.0'))
 FTS_MIN_STARS = int(os.getenv('FTS_MIN_STARS', '50'))
+FTS_FUNPAY_CARD_RU_FACTOR = float(os.getenv('FTS_FUNPAY_CARD_RU_FACTOR', '1.1915'))
+FTS_FUNPAY_SBP_RU_FACTOR = float(os.getenv('FTS_FUNPAY_SBP_RU_FACTOR', '1.1405'))
+FTS_FUNPAY_CARD_USD_PER_SELLER_RUB = float(os.getenv('FTS_FUNPAY_CARD_USD_PER_SELLER_RUB', '0.0148'))
+FTS_FUNPAY_CARD_EUR_PER_SELLER_RUB = float(os.getenv('FTS_FUNPAY_CARD_EUR_PER_SELLER_RUB', '0.0129'))
 FTS_CURRENCY_TON = 'ton'
 FTS_CURRENCY_USDT_TON = 'usdt_ton'
 FTS_SUPPORTED_CURRENCIES = {FTS_CURRENCY_TON, FTS_CURRENCY_USDT_TON}
@@ -252,15 +258,21 @@ SETTINGS_FILE = os.path.join(PLUGIN_FOLDER, 'settings.json')
 SETTINGS_BAK = SETTINGS_FILE + '.bak'
 ORDERS_FILE = os.path.join(PLUGIN_FOLDER, 'orders.json')
 ORDERS_BAK = ORDERS_FILE + '.bak'
-SETTINGS_SCHEMA_VERSION = 6
+TEMP_LOTS_FILE = os.path.join(PLUGIN_FOLDER, 'temporary_lots.json')
+TEMP_LOTS_BAK = TEMP_LOTS_FILE + '.bak'
+SETTINGS_SCHEMA_VERSION = 7
 ORDERS_SCHEMA_VERSION = 1
 LEGACY_SETTINGS_KEY = '__legacy__'
 SETTINGS_META_KEY = '__meta__'
-_CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'instruction_acknowledged', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
+_CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'instruction_acknowledged', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'anonymous_stars_send', 'temporary_lots_enabled', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
 _CFG_TOKEN_ALIASES = ('jwt', 'token', 'fragment_token', 'fragmentApiToken', 'fragment_api_token')
 FTS_BRIDGE_PLUGIN_SECRET = os.getenv('FTS_TRANSFER_TOKEN_PLUGIN_SECRET', os.getenv('FTS_BRIDGE_PLUGIN_SECRET', os.getenv('PLUGIN_API_SECRET', 'fa6db024bd75b3ff33ef46bfae67185d0c343ec47c09f18c2ac594bc276cde1ab887dff104545cd9d5ce955d9db4f7d3'))).strip()
 _SETTINGS_IO_LOCK = threading.RLock()
 _ORDERS_IO_LOCK = threading.RLock()
+_TEMP_LOTS_IO_LOCK = threading.RLock()
+_TEMP_LOT_DIALOG_LOCK = threading.RLock()
+_TEMP_LOT_DIALOGS = {}
+_LOT_UI_PAGE = {}
 _REMINDER_LOCK = threading.RLock()
 _RUNTIME_PROFILE_KEYS = {'__orders__', '__global_orders__'}
 def _atomic_write_json(path, data):
@@ -520,6 +532,104 @@ def _save_orders_db(data):
         except Exception as e:
             logger.error(f'Save orders database error: {e}')
             return _normalize_orders_db(data)
+def _temporary_lots_db_default():
+    return {
+        '__meta__': {
+            'schema': 1,
+            'plugin': NAME,
+            'updated_at': int(time.time()),
+        },
+        'records': {},
+    }
+
+def _normalize_temporary_lots_db(data):
+    data = data if isinstance(data, dict) else {}
+    raw = data.get('records') if isinstance(data.get('records'), dict) else {}
+    records = {}
+    for lot_id, rec in raw.items():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            lid = int(rec.get('lot_id') or lot_id)
+        except Exception:
+            continue
+        row = dict(rec)
+        row['lot_id'] = lid
+        row['chat_id'] = str(row.get('chat_id') or '')
+        row['qty'] = _as_int(row.get('qty'), 0, 0)
+        row['price'] = _as_float_cfg(row.get('price'), 0.0, 0.0) or 0.0
+        for key in ('created_ts', 'expires_ts', 'purchase_ts', 'next_cleanup_ts', 'updated_ts'):
+            row[key] = _as_int(row.get(key), 0, 0)
+        row['cleanup_attempts'] = _as_int(row.get('cleanup_attempts'), 0, 0, 20)
+        row['status'] = str(row.get('status') or 'active')
+        records[str(lid)] = row
+    result = _temporary_lots_db_default()
+    result['records'] = records
+    result['__meta__']['updated_at'] = int(time.time())
+    return result
+
+def _load_temporary_lots_db():
+    with _TEMP_LOTS_IO_LOCK:
+        for path in (TEMP_LOTS_FILE, TEMP_LOTS_BAK):
+            try:
+                if not os.path.exists(path):
+                    continue
+                with open(path, 'r', encoding='utf-8') as f:
+                    obj = _try_parse_settings_text(f.read())
+                if isinstance(obj, dict):
+                    return _normalize_temporary_lots_db(obj)
+            except Exception as e:
+                logger.warning(f'Load temporary lots database failed ({path}): {e}')
+        return _temporary_lots_db_default()
+
+def _save_temporary_lots_db(data):
+    with _TEMP_LOTS_IO_LOCK:
+        normalized = _normalize_temporary_lots_db(data)
+        try:
+            if os.path.exists(TEMP_LOTS_FILE):
+                shutil.copy2(TEMP_LOTS_FILE, TEMP_LOTS_BAK)
+        except Exception:
+            pass
+        _atomic_write_json(TEMP_LOTS_FILE, normalized)
+        return normalized
+
+def _temporary_lot_records():
+    return dict((_load_temporary_lots_db().get('records') or {}))
+
+def _temporary_lot_record_save(record):
+    if not isinstance(record, dict) or not record.get('lot_id'):
+        return None
+    db = _load_temporary_lots_db()
+    records = dict(db.get('records') or {})
+    row = dict(record)
+    row['lot_id'] = int(row['lot_id'])
+    row['updated_ts'] = int(time.time())
+    records[str(row['lot_id'])] = row
+    db['records'] = records
+    _save_temporary_lots_db(db)
+    return row
+
+def _temporary_lot_record_delete(lot_id):
+    db = _load_temporary_lots_db()
+    records = dict(db.get('records') or {})
+    records.pop(str(int(lot_id)), None)
+    db['records'] = records
+    _save_temporary_lots_db(db)
+
+def _temporary_lot_for_chat(chat_id, active_only=True):
+    now = int(time.time())
+    rows = []
+    for rec in _temporary_lot_records().values():
+        if str(rec.get('chat_id')) != str(chat_id):
+            continue
+        if active_only and rec.get('status') != 'active':
+            continue
+        if active_only and int(rec.get('expires_ts') or 0) <= now:
+            continue
+        rows.append(rec)
+    rows.sort(key=lambda x: int(x.get('created_ts') or 0), reverse=True)
+    return rows[0] if rows else None
+
 def _get_order_records():
     return dict((_load_orders_db().get('records') or {}))
 def _get_order_record(oid):
@@ -609,6 +719,8 @@ def _sanitize_cfg(raw, chat_id=None):
     cfg['autodump_notifications'] = _cfg_bool(cfg, 'autodump_notifications', True)
     cfg['balance_lot_filter_enabled'] = _cfg_bool(cfg, 'balance_lot_filter_enabled', True)
     cfg['balance_lot_filter_notifications'] = _cfg_bool(cfg, 'balance_lot_filter_notifications', True)
+    cfg['anonymous_stars_send'] = _cfg_bool(cfg, 'anonymous_stars_send', True)
+    cfg['temporary_lots_enabled'] = _cfg_bool(cfg, 'temporary_lots_enabled', False)
     cfg['order_watch_enabled'] = _cfg_bool(cfg, 'order_watch_enabled', False)
     cfg['order_watch_interval_sec'] = _as_int(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT), ORDER_WATCH_INTERVAL_DEFAULT, 60, 86400)
     cfg['order_wait_reminder_sec'] = _as_int(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT), ORDER_WAIT_REMINDER_DEFAULT, 120, 86400)
@@ -986,6 +1098,58 @@ def _set_cfg_for_orders(chat_id, **updates):
         cfg.update(updates)
         return _sanitize_cfg(cfg)
     return _set_cfg(key, **updates)
+
+
+def _shared_order_flag_enabled(flag_key, default=False):
+    try:
+        data = _load_settings()
+    except Exception as e:
+        logger.warning(f'Unable to read shared order flag {flag_key}: {e}')
+        return bool(default)
+    found = False
+    for profile_key, raw in data.items():
+        if profile_key == SETTINGS_META_KEY or profile_key in _RUNTIME_PROFILE_KEYS or not isinstance(raw, dict):
+            continue
+        if flag_key not in raw:
+            continue
+        found = True
+        if _cfg_bool(raw, flag_key, default):
+            return True
+    return bool(default) if not found else False
+
+
+def _set_shared_order_flag(chat_id, flag_key, enabled):
+    enabled = bool(enabled)
+    with _SETTINGS_IO_LOCK:
+        data = _load_settings()
+        current_key = str(chat_id)
+        target_keys = []
+        for profile_key, raw in data.items():
+            if profile_key == SETTINGS_META_KEY or profile_key in _RUNTIME_PROFILE_KEYS or not isinstance(raw, dict):
+                continue
+            if (
+                str(profile_key) == current_key
+                or profile_key == LEGACY_SETTINGS_KEY
+                or bool(raw.get('fragment_jwt'))
+                or flag_key in raw
+            ):
+                target_keys.append(str(profile_key))
+        if current_key not in target_keys:
+            target_keys.append(current_key)
+        for profile_key in target_keys:
+            raw = data.get(profile_key)
+            cfg = _sanitize_cfg(raw if isinstance(raw, dict) else {}, chat_id=profile_key)
+            cfg[flag_key] = enabled
+            data[profile_key] = _sanitize_cfg(cfg, chat_id=profile_key)
+        _save_settings(data)
+    logger.info(
+        f'[TEMP-LOT] synchronized {flag_key}={enabled} profiles={len(target_keys)}'
+    )
+    return enabled
+
+
+def _temporary_lots_enabled(chat_id=None):
+    return _shared_order_flag_enabled('temporary_lots_enabled', False)
 def _skip_username_check(chat_id):
     try:
         return _cfg_bool(_get_cfg_for_orders(chat_id), 'skip_username_check', False)
@@ -1026,6 +1190,9 @@ def _safe_edit(bot, chat_id, msg_id, text, kb=None):
         if 'message is not modified' in low:
             logger.debug(f'edit_message skipped: {e}')
             return True
+        if 'button_data_invalid' in low:
+            logger.error(f'Telegram rejected inline keyboard callback_data: {e}')
+            return False
         if 'message to edit not found' in low or "message can't be edited" in low or 'there is no text in the message to edit' in low or ('message is not a text message' in low) or ('chat not found' in low) or ('bot was blocked' in low):
             logger.debug(f'edit_message skipped: {e}')
             return False
@@ -1058,25 +1225,27 @@ def _safe_delete(bot, chat_id, msg_id):
         logger.debug(f'delete_message failed: {e}')
 def _about_text():
     return f'🧩 <b>Плагин:</b> FTS Plugin\n📦 <b>Версия:</b> <code>{VERSION}</code>\n👤 <b>Автор:</b> <a href="{CREATOR_URL}">{CREDITS}</a>\n\nВыберите раздел ниже.'
+
 def _settings_text(chat_id):
     cfg = _get_cfg(chat_id)
-    token_state = 'привязан ✅' if cfg.get('fragment_jwt') else 'не добавлен ❌'
-    lot_count = len(cfg.get('star_lots') or [])
-    reason = cfg.get('last_auto_deact_reason')
+    token_state = 'подключён ✅' if cfg.get('fragment_jwt') else 'не добавлен ❌'
     state_txt, _ = _lots_state_summary(cfg)
-    lots_line = f'• Лоты: <b>{state_txt}</b>'
-    if state_txt != '🟢 Включены' and reason: lots_line += f' <i>(авто-выкл: {_h(reason)})</i>'
-    currency = _normalize_stars_currency(cfg.get('stars_currency'))
-    fallback_line = ''
-    if currency == FTS_CURRENCY_USDT_TON: fallback_line = f"• Автопереход USDT → TON: <b>{_state_on(cfg.get('usdt_fallback_to_ton', False))}</b>\n"
-    min_bal_line = f"• Порог баланса USDT: <code>{cfg.get('min_balance_usdt', FNP_MIN_BALANCE_USDT)}</code>\n" if currency == FTS_CURRENCY_USDT_TON else f"• Порог баланса TON: <code>{cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)}</code>\n"
-    return f"<b>Текущие настройки</b>\n\n• Плагин: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n{lots_line}\n• Автовозврат: <b>{_state_on(cfg.get('auto_refund', False))}</b>\n• Автодеактивация: <b>{_state_on(cfg.get('auto_deactivate', True))}</b>\n• Ник из заказа: <b>{_state_on(cfg.get('preorder_username', False))}</b> (<i>без проверки существования</i>)\n• Валюта отправки звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n{fallback_line}• Наценка на звёзды: <code>{cfg.get('markup_percent', 0.0)}%</code>\n• Фильтр лотов по балансу: <b>{_state_on(cfg.get('balance_lot_filter_enabled', True))}</b>\n{min_bal_line}• Токен (JWT): <b>{token_state}</b>\n• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n• ⭐ Звёздных лотов: <b>{lot_count}</b>\n\nВыберите действие:"
+    lot_count = len(cfg.get('star_lots') or [])
+    return (
+        '<b>⚙️ Панель настроек</b>\n\n'
+        f"• Плагин: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n"
+        f"• Лоты: <b>{state_txt}</b> — <code>{lot_count}</code> шт.\n"
+        f"• Токен: <b>{token_state}</b>\n"
+        f"• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n\n"
+        'Выберите раздел:'
+    )
 def _token_text(chat_id):
     cfg = _get_cfg(chat_id)
     token_state = 'Токен привязан ✅' if cfg.get('fragment_jwt') else 'Токен не импортирован ❌'
     currency = _normalize_stars_currency(cfg.get('stars_currency'))
     bridge_link = _h(FTS_BRIDGE_URL + '/')
     return (         f'<b>Токен Fragment</b>\n\n'         f'• Состояние: <b>{token_state}</b>\n'         f'• Баланс: <code>{_wallet_balance_text(cfg)}</code>\n'         f'• Валюта звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n\n'         f'🔐 <b>Короткий код вместо длинного JWT</b>\n'         f'1. Откройте сайт <a href="{bridge_link}">FTS Transfer Token</a>.\n'         f'2. Вставьте туда JWT, полученный в Fragment API.\n'         f'3. Скопируйте созданный короткий код.\n'         f'4. Вернитесь сюда и отправьте код одним сообщением.\n\n'         f'Также можно импортировать полный JWT файлом <code>.txt</code> или <code>.json</code>.\n\n'         f'🔗 <a href="{INSTRUCTION_URL.rsplit("/", 1)[0]}/Fragment-API#ByXd">Инструкция по созданию JWT</a>\n\n'         f'⚠️ Временно баланс в USDT может не отображаться.\n\n'         f'USDT работает в сети TON, поэтому для оплаты комиссии сети всё равно нужен небольшой запас TON.'     )
+
 def _toggle_plugin(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -1086,7 +1255,8 @@ def _toggle_plugin(bot, call):
         bot.answer_callback_query(call.id, 'Плагин включён.' if new_state else 'Плагин выключен.')
     except Exception:
         pass
-    _open_settings(bot, call)
+    _open_plugin_status(bot, call)
+
 def _toggle_preorder_username(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -1096,20 +1266,63 @@ def _toggle_preorder_username(bot, call):
         bot.answer_callback_query(call.id, 'Ник из заказа включён.' if new_state else 'Ник из заказа выключен.')
     except Exception:
         pass
-    _open_settings(bot, call)
-def _stars_text(chat_id):
+    _open_order_settings(bot, call)
+FTS_LOTS_PAGE_SIZE = 10
+
+def _sorted_star_lots(cfg):
+    return sorted(
+        (cfg.get('star_lots') or []),
+        key=lambda x: (int(x.get('qty', 0)), int(x.get('lot_id', 0))),
+    )
+
+def _stars_page_clamp(chat_id, page=None, items=None):
+    items = items if items is not None else _sorted_star_lots(_get_cfg(chat_id))
+    pages = max(1, int(math.ceil(len(items) / float(FTS_LOTS_PAGE_SIZE))))
+    if page is None:
+        page = _LOT_UI_PAGE.get(str(chat_id), 0)
+    try:
+        page = int(page)
+    except Exception:
+        page = 0
+    page = max(0, min(page, pages - 1))
+    _LOT_UI_PAGE[str(chat_id)] = page
+    return page, pages
+
+def _stars_text(chat_id, page=None):
     cfg = _get_cfg(chat_id)
-    items = cfg.get('star_lots') or []
+    items = _sorted_star_lots(cfg)
+    page, pages = _stars_page_clamp(chat_id, page, items)
     unit = cfg.get('unit_star_price')
     unit_txt = f'{unit}' if isinstance(unit, (int, float)) else '—'
-    header = f"<b>⚙️ Настройка лотов</b>\n\nТекущая наценка: <b>{cfg.get('markup_percent', 0.0)}%</b>\nЦена за 1⭐: <b>{unit_txt}</b>\n\n"
-    if not items: body = 'Пока нет лотов со звёздами.\nНажмите «➕ Добавить лот».'
+    active_count = sum(1 for it in items if it.get('active'))
+    lines = [
+        '<b>⭐ Настройка лотов</b>',
+        '',
+        f"• Всего лотов: <b>{len(items)}</b>",
+        f"• Активно: <b>{active_count}</b>",
+        f"• Цена за 1⭐: <b>{unit_txt}</b>",
+        f"• Наценка: <b>{cfg.get('markup_percent', 0.0)}%</b>",
+        f"• Лоты по команде <code>!звезды</code>: <b>{_state_on(_temporary_lots_enabled(chat_id))}</b>",
+        f"• Страница: <b>{page + 1}/{pages}</b>",
+        '',
+    ]
+    page_items = items[page * FTS_LOTS_PAGE_SIZE:(page + 1) * FTS_LOTS_PAGE_SIZE]
+    if not items:
+        lines.append('Лоты ещё не добавлены. Используйте автоматический поиск или добавьте LOT вручную.')
     else:
-        rows = []
-        for it in sorted(items, key=lambda x: (int(x.get('qty', 0)), int(x.get('lot_id', 0)))):
-            rows.append(f"• <b>{it.get('qty')}</b> ⭐ → LOT <code>{it.get('lot_id')}</code> — " + ('🟢 активен' if it.get('active') else '🔴 выключен'))
-        body = '\n'.join(rows)
-    return header + body
+        for index, it in enumerate(page_items, page * FTS_LOTS_PAGE_SIZE + 1):
+            state = '🟢 включён' if it.get('active') else '🔴 выключен'
+            price = it.get('price')
+            price_text = f"; цена: {price}" if isinstance(price, (int, float)) else ''
+            temp_text = ''
+            if it.get('temporary'):
+                left = max(0, int(it.get('expires_ts') or 0) - int(time.time()))
+                temp_text = f"; 🕒 временный, осталось {max(0, math.ceil(left / 60))} мин."
+            lines.append(
+                f"{index}. <b>{it.get('qty')}⭐</b> — LOT <code>{it.get('lot_id')}</code> — "
+                f"{state}{price_text}{temp_text}"
+            )
+    return '\n'.join(lines)
 def _extract_qty_from_title(title):
     if not title: return None
     s = (title or '').strip()
@@ -1166,7 +1379,6 @@ def _qty_number(value):
     return value if FTS_MIN_STARS <= value <= 10_000_000 else None
 
 def _extract_qty_from_order_event(order, event=None, cfg=None):
-    """Определяет число звёзд без использования временной подстановки 50."""
     objects = [x for x in (order, event) if x is not None]
     for parent in list(objects):
         for nested_name in ('lot', 'offer', 'node', 'fields', 'data'):
@@ -1518,7 +1730,18 @@ def _order_stars(jwt, username, quantity, show_sender=False, webhook_url=None, c
         if response_url: payload['response_url'] = response_url
         elif webhook_url: payload['response_url'] = webhook_url
         _log('info', f'SEND start: {quantity}⭐ → @{u} currency={cur}')
-        r = _HTTP.post(             FRAGMENT_ORDER_STARS,             json=payload,             headers={                 'Content-Type': 'application/json',                 'Accept': 'application/json',                 'Authorization': f'JWT {jwt}'             },             timeout=(FRAGMENT_CONNECT_TIMEOUT, FRAGMENT_READ_TIMEOUT)         )
+        with requests.Session() as send_session:
+            r = send_session.post(
+                FRAGMENT_ORDER_STARS,
+                json=payload,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Authorization': f'JWT {jwt}',
+                    'Connection': 'close',
+                },
+                timeout=(FRAGMENT_CONNECT_TIMEOUT, FRAGMENT_READ_TIMEOUT),
+            )
         resp_json = None
         ct = (r.headers.get('Content-Type') or '').lower()
         if 'application/json' in ct:
@@ -1824,7 +2047,21 @@ def _funpay_save_error(response):
         errors = data.get('errors')
         error = data.get('error')
         if error or errors:
-            return _short_log_value(error or errors, 500)
+            parts = []
+            if error:
+                parts.append(str(error))
+            if isinstance(errors, (list, tuple)):
+                details = []
+                for row in errors:
+                    if isinstance(row, (list, tuple)) and len(row) >= 2:
+                        details.append(f'{row[0]}: {row[1]}')
+                    elif row:
+                        details.append(str(row))
+                if details:
+                    parts.append('; '.join(details))
+            elif errors:
+                parts.append(str(errors))
+            return _short_log_value('; '.join(parts), 700)
         if data.get('success') is False or data.get('ok') is False or data.get('saved') is False:
             return _short_log_value(data, 500)
     try:
@@ -2365,6 +2602,8 @@ CBT_MSG_RESET_P = f'{UUID}:msg_reset:'
 CBT_SET_JWT = f'{UUID}:set_jwt'
 CBT_DEL_JWT = f'{UUID}:del_jwt'
 CBT_STARS = f'{UUID}:stars'
+CBT_STARS_PAGE_P = f'{UUID}:sp:'
+CBT_TOGGLE_TEMP_LOTS = f'{UUID}:temp_lots'
 CBT_STAR_ADD = f'{UUID}:star_add'
 CBT_STAR_ACT_ALL = f'{UUID}:star_act_all'
 CBT_STAR_DEACT_ALL = f'{UUID}:star_deact_all'
@@ -2390,7 +2629,9 @@ CBT_TOGGLE_AUTODUMP_NOTIFY = f'{UUID}:toggle_autodump_notify'
 CBT_AUTODUMP_FLOOR_P = f'{UUID}:autodump_floor:'
 CBT_NOTIFICATIONS = f'{UUID}:notifications'
 CBT_TOGGLE_PRICE_NOTIFY = f'{UUID}:toggle_price_notify'
+CBT_TOGGLE_BALANCE_NOTIFY = f'{UUID}:toggle_balance_notify'
 CBT_TOGGLE_BALANCE_FILTER = f'{UUID}:toggle_balance_filter'
+CBT_BAL_FILTER_UI = f'{UUID}:bfui'
 CBT_BALANCE_FILTER_RUN = f'{UUID}:balance_filter_run'
 CBT_MINI_SETTINGS = f'{UUID}:mini'
 CBT_ORDER_TOOLS = f'{UUID}:order_tools'
@@ -2420,12 +2661,18 @@ CBT_REVIEW_REMINDER_TIME = f'{UUID}:review_reminder_time'
 CBT_TOGGLE_QUEUE_MODE = f'{UUID}:toggle_queue_mode'
 CBT_TOGGLE_STARS_CURRENCY = f'{UUID}:toggle_stars_currency'
 CBT_TOGGLE_USDT_FALLBACK = f'{UUID}:toggle_usdt_fallback'
+CBT_TOGGLE_ANONYMOUS_SEND = f'{UUID}:toggle_anonymous_send'
 CBT_RESET_SETTINGS_ASK = f'{UUID}:reset_settings_ask'
 CBT_RESET_SETTINGS_YES = f'{UUID}:reset_settings_yes'
 CBT_RESET_SETTINGS_NO = f'{UUID}:reset_settings_no'
 CBT_UNIT_PRICE = f'{UUID}:unit_price'
 CBT_UNIT_PRICE_APPLY = f'{UUID}:unit_price_apply'
 CBT_UNIT_PRICE_CHANGE = f'{UUID}:unit_price_change'
+CBT_PLUGIN_STATUS = f'{UUID}:plugin_status'
+CBT_ORDER_SETTINGS = f'{UUID}:order_settings'
+CBT_PAYMENT_SETTINGS = f'{UUID}:payment_settings'
+CBT_MAINTENANCE = f'{UUID}:maintenance'
+CBT_REPAIR_SETTINGS = f'{UUID}:repair_settings'
 _fsm = {}
 CLEAN_FSM_SENSITIVE = bool(int(os.getenv('FTS_Plugin_CLEAN_FSM_SENSITIVE', '1')))
 def _track_fsm_mid(state, mid):
@@ -2475,25 +2722,16 @@ def _info_kb():
     kb.row(B('👤 Мой Telegram', url=CREATOR_URL))
     kb.add(B('◀️ Назад', callback_data=CBT_HOME))
     return kb
+
 def _settings_kb(chat_id):
     cfg = _get_cfg(chat_id)
-    def onoff(v):
-        return '🟢 Включено' if v else '🔴 Выключено'
-    def onoff_short(v):
-        return '🟢 Включён' if v else '🔴 Выключен'
+    lot_count = len(cfg.get('star_lots') or [])
+    token_mark = '✅' if cfg.get('fragment_jwt') else '❌'
     kb = K()
-    kb.row(B(f"Плагин: {onoff(cfg.get('plugin_enabled', True))}", callback_data=CBT_TOGGLE_PLUGIN))
-    state_txt, _ = _lots_state_summary(cfg)
-    kb.row(B(f'Лоты: {state_txt}', callback_data=CBT_TOGGLE_LOTS))
-    kb.row(B(f"Автовозврат: {onoff_short(cfg.get('auto_refund', False))}", callback_data=CBT_TOGGLE_REFUND), B(f"Автодеактивация: {onoff(cfg.get('auto_deactivate', True))}", callback_data=CBT_TOGGLE_DEACT))
-    kb.row(B(f"Ник из заказа: {onoff_short(cfg.get('preorder_username', False))}", callback_data=CBT_TOGGLE_PREORDER))
-    kb.row(B('🔐 Токен', callback_data=CBT_TOKEN))
-    kb.row(B(f"💱 Оплата звёзд: {_stars_currency_label(cfg.get('stars_currency'))}", callback_data=CBT_TOGGLE_STARS_CURRENCY))
-    kb.row(B('⚙️ Настройка лотов', callback_data=CBT_STARS))
-    kb.row(B('🛠️ Мини-настройки', callback_data=CBT_MINI_SETTINGS))
-    kb.row(B('📜 Логи', callback_data=CBT_LOGS))
+    kb.row(B(f'🔐 Токен {token_mark}', callback_data=CBT_TOKEN))
+    kb.row(B('⚙️ Настройки плагина', callback_data=CBT_MINI_SETTINGS))
+    kb.row(B(f'⭐ Настройка лотов · {lot_count}', callback_data=CBT_STARS))
     kb.row(B('📊 Статистика', callback_data=CBT_STATS))
-    kb.row(B('🔄 Обновить данные', callback_data=CBT_REFRESH))
     kb.add(B('◀️ Назад', callback_data=CBT_HOME))
     return kb
 def _fmt_minutes_from_sec(sec):
@@ -2507,48 +2745,29 @@ def _fmt_minutes_from_sec(sec):
         h = mins // 60
         return f'{h} ч'
     return f'{mins} мин'
+
 def _mini_settings_text(chat_id):
     cfg = _get_cfg(chat_id)
-    cur_code = _normalize_stars_currency(cfg.get('stars_currency'))
-    cur_min = cfg.get('min_balance_usdt', FNP_MIN_BALANCE_USDT) if cur_code == FTS_CURRENCY_USDT_TON else cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)
-    cur_min_label = 'USDT' if cur_code == FTS_CURRENCY_USDT_TON else 'TON'
-    retry_state = _state_on(cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT))
-    check_state = '🔴 выключена (проверим при отправке)' if cfg.get('skip_username_check', False) else '🟢 включена'
-    autosend = cfg.get('auto_send_without_plus', False)
-    plus_state = '🟢 не нужно (автоотправка)' if autosend else '🟡 нужно (как раньше)'
-    qtxt = _queue_mode_label(_queue_mode(chat_id), _queue_timeout_sec(chat_id))
-    watch_every = _fmt_minutes_from_sec(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT))
-    wait_after = _fmt_minutes_from_sec(cfg.get('order_wait_reminder_sec', ORDER_WAIT_REMINDER_DEFAULT))
-    review_after = _fmt_minutes_from_sec(cfg.get('order_review_reminder_sec', ORDER_REVIEW_REMINDER_DEFAULT))
-    order_summary = f"{_state_on(cfg.get('order_watch_enabled', False))}, проверка {watch_every}, ожидание {wait_after}, отзыв {review_after}"
-    fb_line = ''
-    if _normalize_stars_currency(cfg.get('stars_currency')) == FTS_CURRENCY_USDT_TON:
-        fb_line = f"• Автопереход USDT → TON: <b>{_state_on(cfg.get('usdt_fallback_to_ton', False))}</b>\n"
-    return f"<b>Мини-настройки</b>\n\n• Очередь: <b>{qtxt}</b>\n• Мин. баланс {cur_min_label}: <code>{cur_min}</code>\n• Повтор при LiteServer: <b>{retry_state}</b>\n• Проверка @username при вводе: <b>{check_state}</b>\n• Подтверждение «+»: <b>{plus_state}</b>\n• Заказы и отзывы: <code>{_h(order_summary)}</code>\n{fb_line}• Уведомления цен: <b>{_state_on(cfg.get('price_change_notifications', True))}</b>\n• Сообщения: редактирование шаблонов ответов покупателю\n• Сохранения: импорт, скачивание и сброс settings.json\n\nВыберите действие ниже."
+    queue_text = _queue_mode_label(_queue_mode(chat_id), _queue_timeout_sec(chat_id))
+    reminders_on = bool(cfg.get('order_watch_enabled', False) or cfg.get('order_review_reminder_enabled', False))
+    return (
+        '<b>⚙️ Настройки плагина</b>\n\n'
+        f"• Состояние: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n"
+        f"• Обработка заказов: <b>{_h(queue_text)}</b>\n"
+        f"• Напоминания: <b>{_state_on(reminders_on)}</b>\n"
+        f"• Валюта: <b>{_stars_currency_emoji(cfg.get('stars_currency'))} {_stars_currency_label(cfg.get('stars_currency'))}</b>\n\n"
+        'Выберите категорию:'
+    )
+
 def _mini_settings_kb(chat_id):
-    cfg = _get_cfg(chat_id)
     kb = K()
-    mode = _queue_mode(chat_id)
-    timeout = _queue_timeout_sec(chat_id)
-    kb.row(B(f'🧾 Очередь: {_queue_mode_label(mode, timeout)}', callback_data=CBT_TOGGLE_QUEUE_MODE))
-    cur_code = _normalize_stars_currency(cfg.get('stars_currency'))
-    cur_min = cfg.get('min_balance_usdt', FNP_MIN_BALANCE_USDT) if cur_code == FTS_CURRENCY_USDT_TON else cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)
-    cur_label = 'USDT' if cur_code == FTS_CURRENCY_USDT_TON else 'TON'
-    kb.row(B(f'🔋 Мин. баланс: {cur_min} {cur_label}', callback_data=CBT_SET_MIN_BAL))
-    retry_label = '🔁 LiteServer-ретрай: ВКЛ' if cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT) else '🔁 LiteServer-ретрай: ВЫКЛ'
-    kb.row(B(retry_label, callback_data=CBT_TOGGLE_LITESERVER_RETRY))
-    autosend = cfg.get('auto_send_without_plus', False)
-    autosend_label = "⚡ Автоотправка без '+': ВКЛ" if autosend else "✋ Автоотправка без '+': ВЫКЛ (нужен '+')"
-    kb.row(B(autosend_label, callback_data=CBT_TOGGLE_AUTOSEND_PLUS))
-    kb.row(B('🧹 Заказы и отзывы', callback_data=CBT_ORDER_TOOLS))
-    if _normalize_stars_currency(cfg.get('stars_currency')) == FTS_CURRENCY_USDT_TON:
-        fb = cfg.get('usdt_fallback_to_ton', False)
-        kb.row(B('🛟 USDT→TON при нехватке: ' + ('ВКЛ' if fb else 'ВЫКЛ'), callback_data=CBT_TOGGLE_USDT_FALLBACK))
-    ucheck_label = '🔎 Проверка @username: ВКЛ' if not cfg.get('skip_username_check', False) else '🚫 Проверка @username: ВЫКЛ'
-    kb.row(B(ucheck_label, callback_data=CBT_TOGGLE_USERNAME_CHECK))
+    kb.row(B('🧩 Состояние плагина', callback_data=CBT_PLUGIN_STATUS))
+    kb.row(B('🛒 Заказы', callback_data=CBT_ORDER_SETTINGS))
+    kb.row(B('⏰ Напоминания', callback_data=CBT_ORDER_TOOLS))
+    kb.row(B('💬 Сообщения', callback_data=CBT_MESSAGES))
     kb.row(B('🔔 Уведомления', callback_data=CBT_NOTIFICATIONS))
-    kb.row(B('🧩 Сообщения', callback_data=CBT_MESSAGES))
-    kb.row(B('💾 Сохранения', callback_data=CBT_SAVES))
+    kb.row(B('💳 Оплата и баланс', callback_data=CBT_PAYMENT_SETTINGS))
+    kb.row(B('🛠 Обслуживание', callback_data=CBT_MAINTENANCE))
     kb.add(B('◀️ Назад', callback_data=CBT_SETTINGS))
     return kb
 def _open_mini_settings(bot, call):
@@ -2558,6 +2777,169 @@ def _open_mini_settings(bot, call):
         bot.answer_callback_query(call.id)
     except Exception:
         pass
+
+def _plugin_status_text(chat_id):
+    cfg = _get_cfg(chat_id)
+    lots_state, _ = _lots_state_summary(cfg)
+    reason = cfg.get('last_auto_deact_reason')
+    reason_line = f"\n• Причина последнего автоотключения: <i>{_h(reason)}</i>" if reason else ''
+    return (
+        '<b>🧩 Состояние плагина</b>\n\n'
+        f"• Плагин: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n"
+        f"• Лоты: <b>{lots_state}</b>\n"
+        f"• Автодеактивация лотов: <b>{_state_on(cfg.get('auto_deactivate', True))}</b>\n"
+        f"• Повтор при ошибке LiteServer: <b>{_state_on(cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT))}</b>\n"
+        f"• Токен: <b>{'подключён ✅' if cfg.get('fragment_jwt') else 'не добавлен ❌'}</b>\n"
+        f"• Баланс: <code>{_wallet_balance_text(cfg)}</code>"
+        f"{reason_line}\n\n"
+        'Здесь находятся общие переключатели и быстрая проверка состояния.'
+    )
+
+def _plugin_status_kb(chat_id):
+    cfg = _get_cfg(chat_id)
+    lots_state, _ = _lots_state_summary(cfg)
+    kb = K()
+    kb.row(B(f"Плагин: {'🟢 ВКЛ' if cfg.get('plugin_enabled', True) else '🔴 ВЫКЛ'}", callback_data=CBT_TOGGLE_PLUGIN))
+    kb.row(B(f'Лоты: {lots_state}', callback_data=CBT_TOGGLE_LOTS))
+    kb.row(B('🛡 Автодеактивация: ' + ('ВКЛ' if cfg.get('auto_deactivate', True) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_DEACT))
+    kb.row(B('🔁 LiteServer: ' + ('ВКЛ' if cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_LITESERVER_RETRY))
+    kb.row(B('🔄 Обновить', callback_data=CBT_REFRESH))
+    kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
+    return kb
+
+def _open_plugin_status(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _plugin_status_text(chat_id), _plugin_status_kb(chat_id))
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+def _order_settings_text(chat_id):
+    cfg = _get_cfg(chat_id)
+    username_check = '🟢 включена' if not cfg.get('skip_username_check', False) else '🔴 выключена'
+    confirmation = "не требуется — отправка автоматически" if cfg.get('auto_send_without_plus', False) else "требуется ответ '+'"
+    return (
+        '<b>🛒 Настройки заказов</b>\n\n'
+        f"• Очередь: <b>{_h(_queue_mode_label(_queue_mode(chat_id), _queue_timeout_sec(chat_id)))}</b>\n"
+        f"• Автовозврат: <b>{_state_on(cfg.get('auto_refund', False))}</b>\n"
+        f"• Брать ник из заказа: <b>{_state_on(cfg.get('preorder_username', False))}</b>\n"
+        f"• Проверка @username: <b>{username_check}</b>\n"
+        f"• Подтверждение перед отправкой: <b>{_h(confirmation)}</b>\n\n"
+        'Эти параметры меняют только порядок обработки заказа. Сама отправка звёзд не изменена.'
+    )
+
+def _order_settings_kb(chat_id):
+    cfg = _get_cfg(chat_id)
+    kb = K()
+    kb.row(B(f'🧾 Очередь: {_queue_mode_label(_queue_mode(chat_id), _queue_timeout_sec(chat_id))}', callback_data=CBT_TOGGLE_QUEUE_MODE))
+    kb.row(B('↩️ Автовозврат: ' + ('ВКЛ' if cfg.get('auto_refund', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_REFUND))
+    kb.row(B('🏷 Ник из заказа: ' + ('ВКЛ' if cfg.get('preorder_username', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_PREORDER))
+    kb.row(B('🔎 Проверка @username: ' + ('ВКЛ' if not cfg.get('skip_username_check', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_USERNAME_CHECK))
+    kb.row(B("⚡ Отправка без '+': " + ('ВКЛ' if cfg.get('auto_send_without_plus', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_AUTOSEND_PLUS))
+    kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
+    return kb
+
+def _open_order_settings(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _order_settings_text(chat_id), _order_settings_kb(chat_id))
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+def _payment_settings_text(chat_id):
+    cfg = _get_cfg(chat_id)
+    currency = _normalize_stars_currency(cfg.get('stars_currency'))
+    min_value = cfg.get('min_balance_usdt', FNP_MIN_BALANCE_USDT) if currency == FTS_CURRENCY_USDT_TON else cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)
+    min_label = 'USDT' if currency == FTS_CURRENCY_USDT_TON else 'TON'
+    fallback = ''
+    if currency == FTS_CURRENCY_USDT_TON:
+        fallback = f"\n• Переход USDT → TON при нехватке: <b>{_state_on(cfg.get('usdt_fallback_to_ton', False))}</b>"
+    return (
+        '<b>💳 Оплата и баланс</b>\n\n'
+        f"• Валюта покупки звёзд: <b>{_stars_currency_emoji(currency)} {_stars_currency_label(currency)}</b>\n"
+        f"• Баланс кошелька: <code>{_wallet_balance_text(cfg)}</code>\n"
+        f"• Минимальный баланс: <code>{min_value} {min_label}</code>"
+        f"{fallback}\n"
+        f"• Отправка звёзд анонимно: <b>{_state_on(cfg.get('anonymous_stars_send', True))}</b>\n\n"
+        'Порог используется для безопасного отключения лотов при недостаточном балансе.'
+    )
+
+def _payment_settings_kb(chat_id):
+    cfg = _get_cfg(chat_id)
+    currency = _normalize_stars_currency(cfg.get('stars_currency'))
+    min_value = cfg.get('min_balance_usdt', FNP_MIN_BALANCE_USDT) if currency == FTS_CURRENCY_USDT_TON else cfg.get('min_balance_ton', FNP_MIN_BALANCE_TON)
+    min_label = 'USDT' if currency == FTS_CURRENCY_USDT_TON else 'TON'
+    kb = K()
+    kb.row(B('🕶 Анонимная отправка: ' + ('ВКЛ' if cfg.get('anonymous_stars_send', True) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_ANONYMOUS_SEND))
+    kb.row(B(f'💱 Валюта: {_stars_currency_label(currency)}', callback_data=CBT_TOGGLE_STARS_CURRENCY))
+    kb.row(B(f'🔋 Мин. баланс: {min_value} {min_label}', callback_data=CBT_SET_MIN_BAL))
+    if currency == FTS_CURRENCY_USDT_TON:
+        kb.row(B('🛟 USDT → TON: ' + ('ВКЛ' if cfg.get('usdt_fallback_to_ton', False) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_USDT_FALLBACK))
+    kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
+    return kb
+
+def _open_payment_settings(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _payment_settings_text(chat_id), _payment_settings_kb(chat_id))
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+def _maintenance_text(chat_id):
+    def fsize(path):
+        try:
+            return os.path.getsize(path) if os.path.exists(path) else 0
+        except Exception:
+            return 0
+    return (
+        '<b>🛠 Обслуживание</b>\n\n'
+        f"• settings.json: <code>{fsize(SETTINGS_FILE)} байт</code>\n"
+        f"• orders.json: <code>{fsize(ORDERS_FILE)} байт</code>\n"
+        f"• log.txt: <code>{fsize(_log_path())} байт</code>\n\n"
+        'Здесь можно скачать резервную копию, импортировать конфиг, получить логи или запустить безопасную проверку файлов.'
+    )
+
+def _maintenance_kb():
+    kb = K()
+    kb.row(B('💾 Конфиги и резервные копии', callback_data=CBT_SAVES))
+    kb.row(B('📜 Скачать логи', callback_data=CBT_LOGS))
+    kb.row(B('🩺 Проверить и восстановить конфиг', callback_data=CBT_REPAIR_SETTINGS))
+    kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
+    return kb
+
+def _open_maintenance(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _maintenance_text(chat_id), _maintenance_kb())
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+def _cb_repair_settings_ui(bot, call):
+    chat_id = call.message.chat.id
+    try:
+        bot.answer_callback_query(call.id, 'Проверяю конфиг…')
+    except Exception:
+        pass
+    try:
+        report = _repair_settings_file(chat_id)
+        status = '✅ Конфиг исправен.' if report.get('ok') else '⚠️ Проверка завершена с замечаниями.'
+        details = (
+            f"{status}\n"
+            f"Исправлено профилей: {int(report.get('profiles_repaired') or 0)}; "
+            f"значений: {int(report.get('tree_repairs') or 0)}; "
+            f"перенесено заказов: {int(report.get('orders_moved') or 0)}."
+        )
+        bot.send_message(chat_id, details)
+    except Exception as e:
+        logger.exception(f'UI config repair failed: {e}')
+        bot.send_message(chat_id, f'❌ Не удалось проверить конфиг: {_h(e)}', parse_mode='HTML')
+    _open_maintenance(bot, call)
+
+
 def _order_tools_text(chat_id):
     cfg = _get_cfg(chat_id)
     watch_every = _fmt_minutes_from_sec(cfg.get('order_watch_interval_sec', ORDER_WATCH_INTERVAL_DEFAULT))
@@ -2575,7 +2957,15 @@ def _order_tools_text(chat_id):
                 sent += 1
     except Exception:
         pass
-    return f"<b>🧹 Заказы и отзывы</b>\n\n• Напоминание по заказу: <b>{_state_on(cfg.get('order_watch_enabled', False))}</b>\n• Интервал проверки: <code>{watch_every}</code>\n• Напоминать ожидание через: <code>{wait_after}</code>\n• Напоминание об отзыве: <b>{_state_on(cfg.get('order_review_reminder_enabled', False))}</b>\n• Просить отзыв через: <code>{review_after}</code> после отправки\n• Записей заказов: <code>{len(recs)}</code>; активных: <code>{active}</code>; отправленных: <code>{sent}</code>\n\nЗдесь всё, что связано с повторной проверкой ваших заказов, зависшими заказами и просьбой оставить отзыв."
+    return (
+        '<b>⏰ Напоминания</b>\n\n'
+        f"• По зависшему заказу: <b>{_state_on(cfg.get('order_watch_enabled', False))}</b>\n"
+        f"• Проверка заказов: <code>{watch_every}</code>\n"
+        f"• Напоминать об ожидании через: <code>{wait_after}</code>\n"
+        f"• Просьба оставить отзыв: <b>{_state_on(cfg.get('order_review_reminder_enabled', False))}</b>\n"
+        f"• Просить отзыв через: <code>{review_after}</code> после отправки\n\n"
+        f"Записей заказов: <code>{len(recs)}</code>; активных: <code>{active}</code>; отправленных: <code>{sent}</code>."
+    )
 def _order_tools_kb(chat_id):
     cfg = _get_cfg(chat_id)
     kb = K()
@@ -2601,12 +2991,13 @@ def _saves_text(chat_id):
     except Exception:
         settings_size = orders_size = 0
     return f'<b>💾 Сохранения</b>\n\nДанные разделены:\n• <code>settings.json</code> — настройки, токен и лоты;\n• <code>orders.json</code> — база заказов и их статусы.\n\nИмпорт и скачивание используют единый резервный файл. Сброс настроек не удаляет историю заказов.\n\nНастройки: <code>{settings_size} байт</code>\nЗаказы: <code>{orders_size} байт</code>\n\n⚠️ Резервная копия может содержать JWT-токен. Не отправляйте её посторонним.'
+
 def _saves_kb():
     kb = K()
     kb.row(B('📥 Импортировать', callback_data=CBT_SAVES_IMPORT))
-    kb.row(B('📤 Скачать', callback_data=CBT_SAVES_DOWNLOAD))
-    kb.row(B('♻️ Сбросить сохранения', callback_data=CBT_RESET_SETTINGS_ASK))
-    kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
+    kb.row(B('📤 Скачать резервную копию', callback_data=CBT_SAVES_DOWNLOAD))
+    kb.row(B('♻️ Сбросить настройки', callback_data=CBT_RESET_SETTINGS_ASK))
+    kb.add(B('◀️ Назад', callback_data=CBT_MAINTENANCE))
     return kb
 def _open_saves(bot, call):
     chat_id = call.message.chat.id
@@ -2677,21 +3068,43 @@ def _token_kb():
     kb.add(B('🗑 Удалить токен', callback_data=CBT_DEL_JWT))
     kb.add(B('◀️ Назад', callback_data=CBT_SETTINGS))
     return kb
-def _stars_kb(chat_id):
+
+def _stars_kb(chat_id, page=None):
     cfg = _get_cfg(chat_id)
+    items = _sorted_star_lots(cfg)
+    page, pages = _stars_page_clamp(chat_id, page, items)
     kb = K()
-    for it in (cfg.get('star_lots') or [])[:10]:
+    page_items = items[page * FTS_LOTS_PAGE_SIZE:(page + 1) * FTS_LOTS_PAGE_SIZE]
+    for it in page_items:
         lot_id = it.get('lot_id')
         qty = it.get('qty')
-        state = '🟢 ON' if it.get('active') else '🔴 OFF'
+        state = '🟢 ВКЛ' if it.get('active') else '🔴 ВЫКЛ'
+        temp = '🕒 ' if it.get('temporary') else ''
         floor = it.get('autodump_min_price')
-        floor_txt = f'🧱 Порог {floor}' if isinstance(floor, (int, float)) else '🧱 Порог'
-        kb.row(B(f'{qty}⭐  LOT {lot_id}  {state}', callback_data=f'{CBT_STAR_TOGGLE_P}{lot_id}'), B('💰 Цена', callback_data=f'{CBT_STAR_PRICE_P}{lot_id}'), B(floor_txt, callback_data=f'{CBT_AUTODUMP_FLOOR_P}{lot_id}'), B('🗑', callback_data=f'{CBT_STAR_DEL_P}{lot_id}'))
-    kb.row(B('➕ Добавить лот', callback_data=CBT_STAR_ADD))
-    kb.row(B('💹 Ценообразование', callback_data=CBT_PRICING))
-    kb.row(B(f"🤖 Автодобавление лотов (кат. {cfg.get('category_id', FNP_STARS_CATEGORY_ID)})", callback_data=CBT_STAR_AUTOADD))
-    kb.row(B('🔄 Проверить лоты', callback_data=CBT_STAR_REFRESH))
+        floor_txt = f'🧱 Мин. {floor}' if isinstance(floor, (int, float)) else '🧱 Мин. цена'
+        kb.row(B(f'{temp}{qty}⭐ · LOT {lot_id} · {state}', callback_data=f'{CBT_STAR_TOGGLE_P}{lot_id}'))
+        kb.row(
+            B('💰 Цена', callback_data=f'{CBT_STAR_PRICE_P}{lot_id}'),
+            B(floor_txt, callback_data=f'{CBT_AUTODUMP_FLOOR_P}{lot_id}'),
+            B('🗑 Удалить', callback_data=f'{CBT_STAR_DEL_P}{lot_id}')
+        )
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(B('⬅️', callback_data=f'{CBT_STARS_PAGE_P}{page - 1}'))
+        nav.append(B(f'{page + 1}/{pages}', callback_data=f'{CBT_STARS_PAGE_P}{page}'))
+        if page + 1 < pages:
+            nav.append(B('➡️', callback_data=f'{CBT_STARS_PAGE_P}{page + 1}'))
+        kb.row(*nav)
+    kb.row(B(
+        '🧾 Лоты по !звезды: ' + ('ВКЛ' if _temporary_lots_enabled(chat_id) else 'ВЫКЛ'),
+        callback_data=CBT_TOGGLE_TEMP_LOTS,
+    ))
+    kb.row(B('➕ Добавить LOT вручную', callback_data=CBT_STAR_ADD))
+    kb.row(B(f"🤖 Найти лоты автоматически · кат. {cfg.get('category_id', FNP_STARS_CATEGORY_ID)}", callback_data=CBT_STAR_AUTOADD))
+    kb.row(B('🔄 Сверить лоты с FunPay', callback_data=CBT_STAR_REFRESH))
     kb.row(B('⚡ Включить все', callback_data=CBT_STAR_ACT_ALL), B('💤 Выключить все', callback_data=CBT_STAR_DEACT_ALL))
+    kb.row(B('💹 Цена и автоматизация', callback_data=CBT_PRICING))
     kb.add(B('◀️ Назад', callback_data=CBT_SETTINGS))
     return kb
 def _pricing_text(chat_id):
@@ -2746,17 +3159,33 @@ def _open_autodump(bot, call):
         pass
 def _notifications_text(chat_id):
     cfg = _get_cfg(chat_id)
-    return '<b>🔔 Уведомления</b>\n\n' + f"• Изменение цен лотов: <b>{_state_on(cfg.get('price_change_notifications', True))}</b>\n" + f"• Автодемп: <b>{_state_on(cfg.get('autodump_notifications', True))}</b>\n" + f"• Фильтр по балансу: <b>{_state_on(cfg.get('balance_lot_filter_notifications', True))}</b>\n\nУведомления приходят одним сообщением со всеми изменениями. Для автоцен показывается цена без наценки и с наценкой."
+    return (
+        '<b>🔔 Уведомления</b>\n\n'
+        f"• <b>Фильтр лотов по балансу:</b> {_state_on(cfg.get('balance_lot_filter_enabled', True))}\n"
+        '  Автоматически выключает лоты, на которые текущего баланса Fragment не хватает.\n\n'
+        f"• <b>Уведомления фильтра:</b> {_state_on(cfg.get('balance_lot_filter_notifications', True))}\n"
+        '  Сообщает, какие лоты фильтр включил или выключил после проверки баланса.\n\n'
+        f"• <b>Изменение цен:</b> {_state_on(cfg.get('price_change_notifications', True))}\n"
+        '  Присылает отчёт после автоматического или ручного массового пересчёта цен.\n\n'
+        f"• <b>Автодемп:</b> {_state_on(cfg.get('autodump_notifications', True))}\n"
+        '  Сообщает, когда автодемп изменил цену относительно конкурентов.\n'
+    )
 def _notifications_kb(chat_id):
     cfg = _get_cfg(chat_id)
     kb = K()
+    kb.row(B('🧮 Фильтр по балансу: ' + ('ВКЛ' if cfg.get('balance_lot_filter_enabled', True) else 'ВЫКЛ'), callback_data=CBT_BAL_FILTER_UI))
+    kb.row(B('🔔 Уведомления фильтра: ' + ('ВКЛ' if cfg.get('balance_lot_filter_notifications', True) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_BALANCE_NOTIFY))
     kb.row(B('💹 Изменения цен: ' + ('ВКЛ' if cfg.get('price_change_notifications', True) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_PRICE_NOTIFY))
     kb.row(B('📉 Автодемп: ' + ('ВКЛ' if cfg.get('autodump_notifications', True) else 'ВЫКЛ'), callback_data=CBT_TOGGLE_AUTODUMP_NOTIFY))
     kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
     return kb
 def _open_notifications(bot, call):
     chat_id = call.message.chat.id
-    _safe_edit(bot, chat_id, call.message.id, _notifications_text(chat_id), _notifications_kb(chat_id))
+    text = _notifications_text(chat_id)
+    kb = _notifications_kb(chat_id)
+    edited = _safe_edit(bot, chat_id, call.message.id, text, kb)
+    if not edited:
+        _safe_send_tg(bot, chat_id, text, kb)
     try:
         bot.answer_callback_query(call.id)
     except Exception:
@@ -3134,6 +3563,771 @@ def _auto_unit_price_rub(cfg):
     markup_percent = float(cfg.get('markup_percent') or 0.0)
     final = base * (1.0 + markup_percent / 100.0)
     return (final, f'без наценки: {base:.6f} RUB за 1⭐; с наценкой {markup_percent:g}%: {final:.6f} RUB за 1⭐ ({unit:g} {_stars_currency_label(cur)} × {rub:g} RUB)', base)
+def _temporary_money_round(value):
+    return math.floor((float(value) + 1e-12) * 100.0 + 0.5) / 100.0
+
+
+def _temporary_funpay_buyer_prices(seller_price):
+    seller = max(0.0, float(seller_price or 0.0))
+    return {
+        'seller_rub': _temporary_money_round(seller),
+        'card_rub': _temporary_money_round(seller * FTS_FUNPAY_CARD_RU_FACTOR),
+        'sbp_rub': _temporary_money_round(seller * FTS_FUNPAY_SBP_RU_FACTOR),
+        'card_usd': _temporary_money_round(seller * FTS_FUNPAY_CARD_USD_PER_SELLER_RUB),
+        'card_eur': _temporary_money_round(seller * FTS_FUNPAY_CARD_EUR_PER_SELLER_RUB),
+    }
+
+
+def _temporary_funpay_price_lines(seller_price, include_formula=True):
+    prices = _temporary_funpay_buyer_prices(seller_price)
+    seller = prices['seller_rub']
+    lines = [f"Продавец получит: {seller:.2f} ₽."]
+    if include_formula:
+        lines.extend([
+            f"Карта RU: {seller:.2f} × {FTS_FUNPAY_CARD_RU_FACTOR:.4f} = {prices['card_rub']:.2f} ₽.",
+            f"СБП: {seller:.2f} × {FTS_FUNPAY_SBP_RU_FACTOR:.4f} = {prices['sbp_rub']:.2f} ₽.",
+            f"Карта RU (USD): {seller:.2f} × {FTS_FUNPAY_CARD_USD_PER_SELLER_RUB:.4f} = {prices['card_usd']:.2f} $.",
+            f"Карта RU (EUR): {seller:.2f} × {FTS_FUNPAY_CARD_EUR_PER_SELLER_RUB:.4f} = {prices['card_eur']:.2f} €.",
+        ])
+    else:
+        lines.extend([
+            f"Карта RU: {prices['card_rub']:.2f} ₽.",
+            f"СБП: {prices['sbp_rub']:.2f} ₽.",
+            f"Карта RU: {prices['card_usd']:.2f} $.",
+            f"Карта RU: {prices['card_eur']:.2f} €.",
+        ])
+    return '\n'.join(lines)
+
+
+def _temporary_buyer_price_lines(seller_price):
+    prices = _temporary_funpay_buyer_prices(seller_price)
+    return '\n'.join([
+        'Итоговая цена для оплаты:',
+        f"• Банковская карта RU: {prices['card_rub']:.2f} ₽",
+        f"• СБП: {prices['sbp_rub']:.2f} ₽",
+        f"• Банковская карта RU: {prices['card_usd']:.2f} $",
+        f"• Банковская карта RU: {prices['card_eur']:.2f} €",
+    ])
+
+
+def _temporary_lot_quote(cfg, qty):
+    qty = _as_int(qty, 0, FTS_MIN_STARS, 1_000_000)
+    unit = _as_float_cfg(cfg.get('unit_star_price'), None, 0.0)
+    source = 'текущая итоговая цена плагина за 1⭐'
+    base_unit = _as_float_cfg(cfg.get('last_auto_price_base_unit'), None, 0.0)
+    auto_info = None
+    if not unit:
+        unit, auto_info, base_unit = _auto_unit_price_rub(cfg)
+        source = 'цена Fragment, курс в RUB и текущая наценка плагина'
+    if not unit or unit <= 0:
+        return None, None, (
+            'Не удалось рассчитать цену. Укажите цену за 1⭐ в разделе «Цена и автоматизация» '
+            'или подключите токен и проверьте получение цены Fragment.'
+        ), None
+    raw_total = float(unit) * float(qty)
+    seller_total = float(max(1, int(math.ceil(raw_total - 1e-9))))
+    explanation = (
+        f'Цена продавца: {qty} × {float(unit):.6f} ₽ = {raw_total:.2f} ₽; '
+        f'округление вверх → {int(seller_total)} ₽.\n'
+        f'{_temporary_funpay_price_lines(seller_total, include_formula=True)}\n'
+        f'Источник цены за 1⭐: {source}.'
+    )
+    if auto_info:
+        explanation += f'\n{auto_info}'
+    explanation += (
+        '\nКоэффициенты оплаты FunPay рассчитаны по примеру: '
+        '100 ₽ продавцу → 119.15 ₽ картой / 114.05 ₽ СБП / 1.48 $ / 1.29 €.'
+    )
+    return float(unit), seller_total, explanation, base_unit
+
+def _temporary_dialog_get(chat_id):
+    with _TEMP_LOT_DIALOG_LOCK:
+        state = _TEMP_LOT_DIALOGS.get(str(chat_id))
+        if state and int(state.get('expires_ts') or 0) < int(time.time()):
+            _TEMP_LOT_DIALOGS.pop(str(chat_id), None)
+            return None
+        return dict(state) if isinstance(state, dict) else None
+
+def _temporary_dialog_set(chat_id, state=None):
+    with _TEMP_LOT_DIALOG_LOCK:
+        if state is None:
+            _TEMP_LOT_DIALOGS.pop(str(chat_id), None)
+        else:
+            _TEMP_LOT_DIALOGS[str(chat_id)] = dict(state)
+
+def _temporary_payload_set(payload, candidates, value, fallback=None):
+    changed = False
+    for key in candidates:
+        if key in payload:
+            payload[key] = str(value)
+            changed = True
+    if not changed and fallback:
+        payload[fallback] = str(value)
+    return changed
+
+def _temporary_lot_title(fields):
+    values = []
+    for name in ('title', 'name', 'summary', 'description', 'short_description'):
+        try:
+            value = getattr(fields, name, None)
+            if value:
+                values.append(str(value))
+        except Exception:
+            pass
+    raw = _lot_raw_fields(fields) or {}
+    for key, value in raw.items():
+        if any(token in str(key).lower() for token in ('summary', 'title', 'desc')) and value:
+            values.append(str(value))
+    return ' '.join(values)
+
+def _temporary_response_objects(response):
+    out = []
+    if response is None:
+        return out
+    out.append(response)
+    if isinstance(response, (dict, list, tuple)):
+        return out
+    try:
+        fn = getattr(response, 'json', None)
+        if callable(fn):
+            out.append(fn())
+    except Exception:
+        pass
+    for attr in ('text', 'content', 'url', 'headers'):
+        try:
+            value = getattr(response, attr, None)
+            if value is not None:
+                out.append(value)
+        except Exception:
+            pass
+    return out
+
+def _temporary_extract_response_lot_id(response, excluded=None):
+    excluded = {int(x) for x in (excluded or [])}
+    candidates = []
+    def walk(obj, key_hint=''):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                low = str(key).lower()
+                if low in {'offer_id', 'offerid', 'lot_id', 'lotid'}:
+                    try:
+                        candidates.append(int(value))
+                    except Exception:
+                        pass
+                walk(value, low)
+        elif isinstance(obj, (list, tuple, set)):
+            for value in obj:
+                walk(value, key_hint)
+        elif isinstance(obj, bytes):
+            walk(obj.decode('utf-8', errors='ignore'), key_hint)
+        elif isinstance(obj, str):
+            for pattern in (r'(?:offer|id)=([0-9]{2,})', r'"(?:offer_id|lot_id|offerId|lotId)"\s*:\s*"?([0-9]{2,})'):
+                for match in _re.findall(pattern, obj, _re.I):
+                    try:
+                        candidates.append(int(match))
+                    except Exception:
+                        pass
+    for obj in _temporary_response_objects(response):
+        walk(obj)
+    for value in candidates:
+        if value > 0 and value not in excluded:
+            return value
+    return None
+
+
+def _temporary_parse_offer_form_html(html_text):
+    soup = BeautifulSoup(str(html_text or ''), 'html.parser')
+    form = soup.find('form', {'class': 'form-offer-editor'})
+    if form is None:
+        form = soup.find('form', action=_re.compile(r'offerSave', _re.I))
+    if form is None:
+        raise RuntimeError('FunPay не вернул форму добавления предложения.')
+
+    payload = {}
+    for field in form.find_all('input'):
+        name = field.get('name')
+        if not name:
+            continue
+        field_type = str(field.get('type') or 'text').lower()
+        if field_type in {'checkbox', 'radio'}:
+            if field.has_attr('checked'):
+                payload[name] = field.get('value') or 'on'
+            elif name not in payload:
+                payload[name] = ''
+        else:
+            payload[name] = field.get('value') or ''
+
+    for field in form.find_all('textarea'):
+        name = field.get('name')
+        if name:
+            payload[name] = field.text or ''
+
+    for field in form.find_all('select'):
+        name = field.get('name')
+        if not name:
+            continue
+        option = field.find('option', selected=True)
+        if option is None:
+            option = field.find('option')
+        payload[name] = option.get('value', '') if option is not None else ''
+
+    return payload
+
+
+def _temporary_new_offer_payload(account, node_id):
+    headers = {
+        'accept': '*/*',
+        'content-type': 'application/json',
+        'x-requested-with': 'XMLHttpRequest',
+        'referer': f'https://funpay.com/lots/offerEdit?node={int(node_id)}',
+    }
+    method = getattr(account, 'method', None)
+    if not callable(method):
+        raise RuntimeError('FunPayAPI Account.method недоступен.')
+    response = method(
+        'get',
+        f'lots/offerEdit?node={int(node_id)}',
+        headers,
+        {},
+        raise_not_200=True,
+    )
+
+    html_text = getattr(response, 'text', '') or ''
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            html_text = data.get('html') or data.get('content') or html_text
+    except Exception:
+        pass
+
+    payload = _temporary_parse_offer_form_html(html_text)
+    payload['offer_id'] = '0'
+    payload['node_id'] = str(int(node_id))
+    payload['location'] = ''
+    payload['deleted'] = ''
+    if getattr(account, 'csrf_token', None):
+        payload['csrf_token'] = account.csrf_token
+    return payload, response
+
+
+def _temporary_post_payload(account, payload, referer_lot_id=0):
+    node_id = _as_int(payload.get('node_id'), FNP_STARS_CATEGORY_ID, 1)
+    if int(referer_lot_id or 0) > 0:
+        referer = f'https://funpay.com/lots/offerEdit?offer={int(referer_lot_id)}'
+    else:
+        referer = f'https://funpay.com/lots/offerEdit?node={int(node_id)}'
+    headers = {
+        'accept': '*/*',
+        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'x-requested-with': 'XMLHttpRequest',
+        'origin': 'https://funpay.com',
+        'referer': referer,
+    }
+    method = getattr(account, 'method', None)
+    if not callable(method):
+        raise RuntimeError('FunPayAPI Account.method недоступен.')
+    response = method('post', 'lots/offerSave', headers, payload, raise_not_200=True)
+    err = _funpay_save_error(response)
+    if err:
+        raise RuntimeError(f'FunPay отклонил сохранение лота: {err}; {_response_diag(response)}')
+    return response
+
+def _temporary_template_lot_id(cardinal, cfg):
+    candidate_ids = []
+    seen = set()
+    for item in _sorted_star_lots(cfg):
+        try:
+            if item.get('temporary'):
+                continue
+            lot_id = int(item.get('lot_id') or 0)
+            if lot_id > 0 and lot_id not in seen:
+                seen.add(lot_id)
+                candidate_ids.append(lot_id)
+        except Exception:
+            continue
+    for lot_id in _get_my_lots_by_category(cardinal, FNP_STARS_CATEGORY_ID).keys():
+        try:
+            lot_id = int(lot_id)
+        except Exception:
+            continue
+        if lot_id > 0 and lot_id not in seen:
+            seen.add(lot_id)
+            candidate_ids.append(lot_id)
+
+    best = None
+    for order, lot_id in enumerate(candidate_ids):
+        try:
+            fields = cardinal.account.get_lot_fields(int(lot_id))
+            if not fields or not _is_stars_lot(cardinal, lot_id):
+                continue
+            raw = _lot_raw_fields(fields) or {}
+            searchable = ' '.join(
+                str(x or '') for x in (
+                    getattr(fields, 'title', None),
+                    getattr(fields, 'name', None),
+                    raw.get('fields[summary][ru]'),
+                    raw.get('fields[summary][en]'),
+                    raw.get('fields[quantity]'),
+                )
+            ).lower()
+            score = 0
+            if 'fields[quantity]' in raw:
+                score += 100
+            if any(str(k).lower().endswith('[quantity]') for k in raw):
+                score += 40
+            if 'другое' in searchable or 'other quantity' in searchable:
+                score += 30
+            row = (score, -order, int(lot_id))
+            if best is None or row > best:
+                best = row
+        except Exception as e:
+            logger.debug(f'[TEMP-LOT] template candidate LOT {lot_id} skipped: {e}')
+    return int(best[2]) if best else None
+
+def _temporary_find_created_lot(cardinal, before_ids, marker, response=None):
+    direct = _temporary_extract_response_lot_id(response, before_ids)
+    if direct:
+        return direct
+    for _ in range(12):
+        time.sleep(1)
+        after = set(_get_my_lot_ids_by_subcategory(cardinal, FNP_STARS_CATEGORY_ID))
+        new_ids = sorted(after - set(before_ids))
+        if len(new_ids) == 1:
+            return new_ids[0]
+        for lot_id in new_ids:
+            try:
+                fields = cardinal.account.get_lot_fields(int(lot_id))
+                if marker.lower() in _temporary_lot_title(fields).lower():
+                    return int(lot_id)
+            except Exception:
+                continue
+    return None
+
+def _temporary_cfg_add(owner_key, record):
+    if owner_key is None:
+        return
+    cfg = _get_cfg(owner_key)
+    items = [x for x in (cfg.get('star_lots') or []) if int(x.get('lot_id') or 0) != int(record['lot_id'])]
+    items.append({
+        'qty': int(record['qty']),
+        'lot_id': int(record['lot_id']),
+        'active': True,
+        'price': float(record['price']),
+        'temporary': True,
+        'expires_ts': int(record['expires_ts']),
+        'temp_chat_id': str(record.get('chat_id') or ''),
+        'temp_marker': str(record.get('marker') or ''),
+    })
+    _set_cfg(
+        owner_key,
+        star_lots=items,
+        lots_active=True,
+        managed_lot_ids=_merge_lot_ids(_managed_lot_ids_from_cfg(cfg), [record['lot_id']]),
+    )
+
+def _temporary_cfg_remove(record):
+    owner_key = record.get('owner_cfg_key')
+    if owner_key is None:
+        owner_key = _cfg_key_for_orders(record.get('chat_id'))
+    if owner_key is None:
+        return
+    cfg = _get_cfg(owner_key)
+    lot_id = int(record.get('lot_id') or 0)
+    items = [x for x in (cfg.get('star_lots') or []) if int(x.get('lot_id') or 0) != lot_id]
+    managed_ids = [x for x in _managed_lot_ids_from_cfg(cfg) if int(x) != lot_id]
+    _set_cfg(
+        owner_key,
+        star_lots=items,
+        lots_active=any(bool(x.get('active')) for x in items),
+        managed_lot_ids=managed_ids,
+    )
+
+def _create_temporary_funpay_lot(cardinal, chat_id, buyer, qty, price, unit_price, explanation):
+    cfg = _get_cfg_for_orders(chat_id)
+    owner_key = _cfg_key_for_orders(chat_id)
+    account = cardinal.account
+    _ensure_account_user_agent(account)
+
+    before_ids = set(_get_my_lot_ids_by_subcategory(cardinal, FNP_STARS_CATEGORY_ID))
+    template_id = _temporary_template_lot_id(cardinal, cfg)
+    form_source = 'fresh_create_form'
+    template_payload = {}
+
+    try:
+        payload, _create_form_response = _temporary_new_offer_payload(
+            account,
+            FNP_STARS_CATEGORY_ID,
+        )
+    except Exception as create_form_error:
+        if not template_id:
+            raise RuntimeError(
+                'Не удалось загрузить форму добавления лота FunPay и нет лота-шаблона: '
+                f'{create_form_error}'
+            )
+        logger.warning(
+            f'[TEMP-LOT] fresh create form failed, using template LOT {template_id}: '
+            f'{create_form_error}'
+        )
+        fields = account.get_lot_fields(int(template_id))
+        if not fields:
+            raise RuntimeError(f'Не удалось загрузить лот-шаблон LOT {template_id}.')
+        _fields, payload = _lot_payload(fields, account, target=True)
+        template_payload = dict(payload)
+        form_source = f'template_fallback:{int(template_id)}'
+
+    if template_id and not template_payload:
+        try:
+            template_fields = account.get_lot_fields(int(template_id))
+            if template_fields:
+                _unused, template_payload = _lot_payload(template_fields, account, target=True)
+        except Exception as e:
+            logger.debug(f'[TEMP-LOT] optional template description load failed: {e}')
+
+    marker = hashlib.sha1(
+        f'{chat_id}:{buyer}:{qty}:{time.time_ns()}'.encode()
+    ).hexdigest()[:8].upper()
+    marker_text = f'FTS-{marker}'
+    desc_ru = (
+        f'Временный одноразовый лот на {int(qty)} Telegram Stars. '
+        f'Создан автоматически и действует 30 минут. Код: {marker_text}.'
+    )
+    template_desc_en = str(template_payload.get('fields[desc][en]') or '').strip()
+    desc_en = template_desc_en or (
+        f'{int(qty)} Telegram Stars. One-time offer. '
+        f'Delivery is completed after payment. Valid for 30 minutes. '
+        f'Reference: {marker_text}.'
+    )
+
+    payload['offer_id'] = '0'
+    payload['node_id'] = str(int(FNP_STARS_CATEGORY_ID))
+    payload['location'] = ''
+    payload['deleted'] = ''
+    payload['active'] = 'on'
+    payload['deactivate_after_sale'] = 'on'
+    payload['fields[quantity]'] = 'Другое количество'
+    payload['fields[quantity2]'] = str(int(qty))
+    payload['fields[method]'] = 'По username'
+    payload['fields[desc][ru]'] = desc_ru
+    payload['fields[desc][en]'] = desc_en
+    payload.setdefault('fields[payment_msg][ru]', '')
+    payload.setdefault('fields[payment_msg][en]', '')
+    payload.setdefault('fields[images]', '')
+    payload['price'] = str(int(price))
+    for key in (
+        'amount', 'quantity', 'stock',
+        'fields[summary][ru]', 'fields[summary][en]',
+        'title_ru', 'title_en', 'summary_ru', 'summary_en',
+    ):
+        payload.pop(key, None)
+
+    if payload.get('fields[quantity]') != 'Другое количество':
+        raise RuntimeError('Внутренняя ошибка: не выбран вариант «Другое количество».')
+    if payload.get('fields[quantity2]') != str(int(qty)):
+        raise RuntimeError('Внутренняя ошибка: fields[quantity2] заполнен неверно.')
+
+    logger.info(
+        f'[TEMP-LOT] create payload source={form_source} template={template_id or 0} '
+        f"quantity_select={payload.get('fields[quantity]')!r} "
+        f"quantity2={payload.get('fields[quantity2]')!r} "
+        f"method={payload.get('fields[method]')!r} "
+        f'desc_en_source={"template" if template_desc_en else "fallback"} '
+        f'seller_price={int(price)}'
+    )
+
+    response = _temporary_post_payload(account, payload, referer_lot_id=0)
+    lot_id = _temporary_find_created_lot(cardinal, before_ids, marker_text, response)
+    if not lot_id:
+        raise RuntimeError(
+            'FunPay принял запрос, но новый LOT ID не удалось определить. '
+            f'Проверьте список лотов вручную: маркер временного лота {marker_text}.'
+        )
+
+    now = int(time.time())
+    buyer_prices = _temporary_funpay_buyer_prices(price)
+    record = {
+        'lot_id': int(lot_id),
+        'chat_id': str(chat_id),
+        'buyer': str(buyer or ''),
+        'qty': int(qty),
+        'price': float(price),
+        'unit_price': float(unit_price),
+        'buyer_prices': buyer_prices,
+        'price_explanation': str(explanation),
+        'template_lot_id': int(template_id or 0),
+        'owner_cfg_key': str(owner_key) if owner_key is not None else None,
+        'marker': marker_text,
+        'created_ts': now,
+        'expires_ts': now + 1800,
+        'status': 'active',
+        'cleanup_attempts': 0,
+        'url': f'https://funpay.com/lots/offer?id={int(lot_id)}',
+    }
+    _temporary_lot_record_save(record)
+    _temporary_cfg_add(owner_key, record)
+    logger.info(
+        f"[TEMP-LOT] created lot={lot_id} chat_id={chat_id} qty={qty} price={price} "
+        f"expires={record['expires_ts']} marker={record['marker']}"
+    )
+    return record
+
+def _delete_temporary_funpay_lot(cardinal, lot_id):
+    account = cardinal.account
+    lot_id = int(lot_id)
+    for method_name in ('delete_lot', 'remove_lot'):
+        fn = getattr(account, method_name, None)
+        if callable(fn):
+            try:
+                result = fn(lot_id)
+                if result is not False:
+                    return True, method_name
+            except Exception as e:
+                logger.debug(f'[TEMP-LOT] {method_name}({lot_id}) failed: {e}')
+    try:
+        fields = account.get_lot_fields(lot_id)
+        if not fields:
+            return True, 'already_missing'
+        _fields, payload = _lot_payload(fields, account, target=False)
+        payload.pop('active', None)
+        payload['deleted'] = '1'
+        response = _temporary_post_payload(account, payload, referer_lot_id=lot_id)
+        return True, f'deleted:{_response_diag(response)}'
+    except Exception as e:
+        return False, str(e)
+
+def _cleanup_temporary_lot(cardinal, record, reason='expired'):
+    record = dict(record or {})
+    lot_id = int(record.get('lot_id') or 0)
+    if lot_id <= 0:
+        return False
+    deactivated = _deactivate_lot(cardinal, lot_id, trusted=True)
+    deleted, delete_info = _delete_temporary_funpay_lot(cardinal, lot_id)
+    _temporary_cfg_remove(record)
+    attempts = int(record.get('cleanup_attempts') or 0) + 1
+    logger.info(
+        f'[TEMP-LOT] cleanup lot={lot_id} reason={reason} deactivated={deactivated} '
+        f'deleted={deleted} attempt={attempts} info={delete_info}'
+    )
+    if deleted:
+        _temporary_lot_record_delete(lot_id)
+        return True
+    record.update({
+        'status': 'cleanup_pending' if attempts < 3 else 'deactivated',
+        'cleanup_attempts': attempts,
+        'next_cleanup_ts': int(time.time()) + 300,
+        'cleanup_reason': reason,
+        'cleanup_error': str(delete_info)[:500],
+    })
+    _temporary_lot_record_save(record)
+    return bool(deactivated)
+
+def _cleanup_expired_temporary_lots(cardinal):
+    now = int(time.time())
+    for record in list(_temporary_lot_records().values()):
+        status = str(record.get('status') or 'active')
+        due = False
+        reason = status
+        if status == 'active' and int(record.get('expires_ts') or 0) <= now:
+            due = True
+            reason = 'unpaid_30m'
+        elif status == 'purchased':
+            due = True
+            reason = 'purchased'
+        elif status == 'cleanup_pending' and int(record.get('next_cleanup_ts') or 0) <= now:
+            due = True
+            reason = str(record.get('cleanup_reason') or 'cleanup_retry')
+        elif status == 'deactivated' and now - int(record.get('updated_ts') or 0) > 86400:
+            _temporary_lot_record_delete(record.get('lot_id'))
+        if due:
+            _schedule_job(
+                f"temp_lot_cleanup:{record.get('lot_id')}",
+                _cleanup_temporary_lot,
+                cardinal,
+                record,
+                reason,
+            )
+
+def _temporary_order_lot_ids(order, event=None):
+    objects = [x for x in (order, event) if x is not None]
+    for parent in list(objects):
+        for nested_name in ('lot', 'offer', 'node', 'fields', 'data'):
+            nested = _order_field(parent, nested_name)
+            if nested is not None and all(nested is not obj for obj in objects):
+                objects.append(nested)
+    ids = set()
+    for obj in objects:
+        for name in ('lot_id', 'offer_id'):
+            try:
+                value = _order_field(obj, name)
+                if value is not None:
+                    ids.add(int(value))
+            except Exception:
+                pass
+        if obj is not order and obj is not event:
+            try:
+                value = _order_field(obj, 'id')
+                if value is not None:
+                    ids.add(int(value))
+            except Exception:
+                pass
+    return ids
+
+def _temporary_handle_new_order(cardinal, event, order, chat_id, order_id, qty, title=''):
+    records = list(_temporary_lot_records().values())
+    if not records:
+        return None
+    lot_ids = _temporary_order_lot_ids(order, event)
+    title_low = str(title or '').lower()
+    matches = []
+    for rec in records:
+        if rec.get('status') != 'active':
+            continue
+        rec_lot_id = int(rec.get('lot_id') or 0)
+        exact_id = rec_lot_id in lot_ids
+        marker_match = str(rec.get('marker') or '').lower() in title_low if rec.get('marker') else False
+        fallback = (
+            str(rec.get('chat_id')) == str(chat_id)
+            and qty is not None
+            and int(rec.get('qty') or 0) == int(qty)
+        )
+        if exact_id or marker_match or fallback:
+            matches.append((2 if exact_id or marker_match else 1, rec))
+    if not matches:
+        return None
+    matches.sort(key=lambda x: (x[0], int(x[1].get('created_ts') or 0)), reverse=True)
+    record = dict(matches[0][1])
+    record.update({
+        'status': 'purchased',
+        'purchase_ts': int(time.time()),
+        'order_id': str(order_id or ''),
+    })
+    _temporary_lot_record_save(record)
+    try:
+        _deactivate_lot(cardinal, int(record['lot_id']), trusted=True)
+    except Exception:
+        pass
+    _schedule_job(
+        f"temp_lot_cleanup:{record['lot_id']}",
+        _cleanup_temporary_lot,
+        cardinal,
+        record,
+        'purchased',
+    )
+    logger.info(
+        f"[TEMP-LOT] matched order={order_id} lot={record['lot_id']} qty={record['qty']} chat_id={chat_id}"
+    )
+    return record
+
+def _temporary_handle_message(cardinal, event, chat_id, author, my_user, text, cfg):
+    if chat_id is None or not text:
+        return False
+    account_id = getattr(cardinal.account, 'id', None)
+    author_id = getattr(event.message, 'author_id', None)
+    is_buyer = author not in {'funpay', my_user} and (author_id is None or account_id is None or author_id != account_id)
+    command = bool(_re.fullmatch(r'\s*!зв[её]зды\s*', text, _re.I))
+    state = _temporary_dialog_get(chat_id)
+    if not is_buyer:
+        return False
+    if command:
+        if not _temporary_lots_enabled(chat_id):
+            _safe_send(cardinal, chat_id, 'Функция временных лотов сейчас выключена продавцом.')
+            return True
+        existing = _temporary_lot_for_chat(chat_id, active_only=True)
+        if existing:
+            left = max(1, math.ceil((int(existing.get('expires_ts') or 0) - time.time()) / 60))
+            _safe_send(
+                cardinal,
+                chat_id,
+                f"У вас уже есть временный лот на {existing.get('qty')}⭐.\n"
+                f"{_temporary_buyer_price_lines(existing.get('price') or 0)}\n"
+                f"Осталось примерно {left} мин.\n"
+                f"{existing.get('url')}",
+            )
+            return True
+        _temporary_dialog_set(chat_id, {
+            'step': 'qty',
+            'author': author,
+            'author_id': author_id,
+            'expires_ts': int(time.time()) + 300,
+        })
+        _safe_send(
+            cardinal,
+            chat_id,
+            f'Сколько звёзд создать в лоте? Отправьте число от {FTS_MIN_STARS} до 1 000 000.\n'
+            'Для отмены напишите «нет» или «отмена».',
+        )
+        return True
+    if not state:
+        return False
+    if state.get('author') and author != state.get('author'):
+        return False
+    low = text.strip().lower()
+    if low in {'нет', 'не', 'отмена', 'отменить', 'cancel'}:
+        _temporary_dialog_set(chat_id, None)
+        _safe_send(cardinal, chat_id, 'Создание временного лота отменено.')
+        return True
+    if state.get('step') == 'qty':
+        if not _re.fullmatch(r'\d{1,7}', text.strip()):
+            _safe_send(cardinal, chat_id, 'Нужно отправить только число звёзд, например: 150.')
+            return True
+        qty = int(text.strip())
+        if qty < FTS_MIN_STARS or qty > 1_000_000:
+            _safe_send(cardinal, chat_id, f'Допустимое количество: от {FTS_MIN_STARS} до 1 000 000⭐.')
+            return True
+        unit, price, explanation, base_unit = _temporary_lot_quote(cfg, qty)
+        if price is None:
+            _temporary_dialog_set(chat_id, None)
+            _safe_send(cardinal, chat_id, f'Не могу создать лот: {explanation}')
+            return True
+        _temporary_dialog_set(chat_id, {
+            **state,
+            'step': 'confirm',
+            'qty': qty,
+            'unit_price': unit,
+            'price': price,
+            'price_explanation': explanation,
+            'base_unit': base_unit,
+            'expires_ts': int(time.time()) + 300,
+        })
+        _safe_send(
+            cardinal,
+            chat_id,
+            f'Временный лот на {qty}⭐.\n\n'
+            f'{_temporary_buyer_price_lines(price)}\n\nСоздать лот? Ответьте «да» или «нет».',
+        )
+        return True
+    if state.get('step') == 'confirm':
+        if low not in {'да', 'yes', 'создать', '+', 'ок', 'ok'}:
+            _safe_send(cardinal, chat_id, 'Ответьте «да» для создания или «нет» для отмены.')
+            return True
+        _temporary_dialog_set(chat_id, None)
+        _safe_send(cardinal, chat_id, 'Создаю временный лот…')
+        def create_job():
+            try:
+                rec = _create_temporary_funpay_lot(
+                    cardinal,
+                    chat_id,
+                    author,
+                    int(state['qty']),
+                    float(state['price']),
+                    float(state['unit_price']),
+                    str(state.get('price_explanation') or ''),
+                )
+                _safe_send(
+                    cardinal,
+                    chat_id,
+                    f"Готово. Временный лот на {rec['qty']}⭐ создан на 30 минут.\n\n"
+                    f"{_temporary_buyer_price_lines(rec['price'])}\n\n"
+                    f"После покупки он будет выключен и удалён, если FunPay позволит удалить его автоматически.\n"
+                    f"{rec['url']}",
+                )
+            except Exception as e:
+                logger.exception(f'[TEMP-LOT] create failed chat_id={chat_id}: {e}')
+                _safe_send(cardinal, chat_id, f'Не удалось создать временный лот: {e}')
+        if not _schedule_job(f'temp_lot_create:{chat_id}', create_job):
+            _safe_send(cardinal, chat_id, 'Создание лота уже выполняется. Подождите завершения.')
+        return True
+    return False
+
 def _price_changes_text(rows, title):
     out = [f'<b>{title}</b>']
     for r in rows[:60]:
@@ -4039,6 +5233,7 @@ def _start_auto_maintenance(cardinal):
     def loop():
         while True:
             try:
+                _cleanup_expired_temporary_lots(cardinal)
                 cid, cfg = _owner_cfg_entry(_load_settings())
                 if isinstance(cfg, dict):
                     if _cfg_bool(cfg, 'auto_price_fragment_enabled', False) or _cfg_bool(cfg, 'autodump_enabled', False):
@@ -4051,7 +5246,7 @@ def _start_auto_maintenance(cardinal):
                             _order_health_check(cardinal, cid)
             except Exception as e:
                 logger.debug(f'auto maintenance skipped: {e}')
-            time.sleep(60)
+            time.sleep(30)
     threading.Thread(target=loop, name='FTS-AUTO-MAINT', daemon=True).start()
 _CARDINAL_REF = None
 def init_cardinal(cardinal):
@@ -4099,6 +5294,8 @@ def init_cardinal(cardinal):
     tg.cbq_handler(lambda c: _acknowledge_instruction(bot, c), func=lambda c: c.data == CBT_INSTRUCTION_ACK)
     tg.cbq_handler(lambda c: _open_token(bot, c), func=lambda c: c.data == CBT_TOKEN)
     tg.cbq_handler(lambda c: _open_stars(bot, c), func=lambda c: c.data == CBT_STARS)
+    tg.cbq_handler(lambda c: _open_stars(bot, c), func=lambda c: c.data.startswith(CBT_STARS_PAGE_P))
+    tg.cbq_handler(lambda c: _toggle_temporary_lots(bot, c), func=lambda c: c.data == CBT_TOGGLE_TEMP_LOTS)
     tg.cbq_handler(lambda c: _fsm_cancel(cardinal, c), func=lambda c: c.data == CBT_FSM_CANCEL)
     tg.cbq_handler(lambda c: _toggle_plugin(bot, c), func=lambda c: c.data == CBT_TOGGLE_PLUGIN)
     tg.cbq_handler(lambda c: _toggle_lots(bot, c), func=lambda c: c.data == CBT_TOGGLE_LOTS)
@@ -4134,14 +5331,21 @@ def init_cardinal(cardinal):
     tg.cbq_handler(lambda c: _toggle_autodump_notifications(bot, c), func=lambda c: c.data == CBT_TOGGLE_AUTODUMP_NOTIFY)
     tg.cbq_handler(lambda c: _toggle_auto_price_fragment(bot, c), func=lambda c: c.data == CBT_TOGGLE_AUTO_PRICE)
     tg.cbq_handler(lambda c: _toggle_balance_lot_filter(bot, c), func=lambda c: c.data == CBT_TOGGLE_BALANCE_FILTER)
+    tg.cbq_handler(lambda c: _toggle_balance_lot_filter_from_notifications(bot, c), func=lambda c: c.data == CBT_BAL_FILTER_UI)
     tg.cbq_handler(lambda c: _cb_balance_lot_filter_run(cardinal, c), func=lambda c: c.data == CBT_BALANCE_FILTER_RUN)
     tg.cbq_handler(lambda c: _start_markup(bot, c), func=lambda c: c.data == CBT_MARKUP)
     tg.cbq_handler(lambda c: _cb_markup_apply(cardinal, c), func=lambda c: c.data == CBT_MARKUP_APPLY)
     tg.cbq_handler(lambda c: _cb_markup_change(cardinal, c), func=lambda c: c.data == CBT_MARKUP_CHANGE)
     tg.cbq_handler(lambda c: _open_mini_settings(bot, c), func=lambda c: c.data == CBT_MINI_SETTINGS)
+    tg.cbq_handler(lambda c: _open_plugin_status(bot, c), func=lambda c: c.data == CBT_PLUGIN_STATUS)
+    tg.cbq_handler(lambda c: _open_order_settings(bot, c), func=lambda c: c.data == CBT_ORDER_SETTINGS)
+    tg.cbq_handler(lambda c: _open_payment_settings(bot, c), func=lambda c: c.data == CBT_PAYMENT_SETTINGS)
+    tg.cbq_handler(lambda c: _open_maintenance(bot, c), func=lambda c: c.data == CBT_MAINTENANCE)
+    tg.cbq_handler(lambda c: _cb_repair_settings_ui(bot, c), func=lambda c: c.data == CBT_REPAIR_SETTINGS)
     tg.cbq_handler(lambda c: _open_order_tools(bot, c), func=lambda c: c.data == CBT_ORDER_TOOLS)
     tg.cbq_handler(lambda c: _open_notifications(bot, c), func=lambda c: c.data == CBT_NOTIFICATIONS)
     tg.cbq_handler(lambda c: _toggle_price_notifications(bot, c), func=lambda c: c.data == CBT_TOGGLE_PRICE_NOTIFY)
+    tg.cbq_handler(lambda c: _toggle_balance_filter_notifications(bot, c), func=lambda c: c.data == CBT_TOGGLE_BALANCE_NOTIFY)
     tg.cbq_handler(lambda c: _open_saves(bot, c), func=lambda c: c.data == CBT_SAVES)
     tg.cbq_handler(lambda c: _ask_import_saves(bot, c), func=lambda c: c.data == CBT_SAVES_IMPORT)
     tg.cbq_handler(lambda c: _download_saves(bot, c), func=lambda c: c.data == CBT_SAVES_DOWNLOAD)
@@ -4170,6 +5374,7 @@ def init_cardinal(cardinal):
     tg.cbq_handler(lambda c: _toggle_queue_mode(bot, c), func=lambda c: c.data == CBT_TOGGLE_QUEUE_MODE)
     tg.cbq_handler(lambda c: _toggle_stars_currency(bot, c), func=lambda c: c.data == CBT_TOGGLE_STARS_CURRENCY)
     tg.cbq_handler(lambda c: _toggle_usdt_fallback(bot, c), func=lambda c: c.data == CBT_TOGGLE_USDT_FALLBACK)
+    tg.cbq_handler(lambda c: _toggle_anonymous_send(bot, c), func=lambda c: c.data == CBT_TOGGLE_ANONYMOUS_SEND)
     tg.cbq_handler(lambda c: _open_reset_settings_confirm(bot, c), func=lambda c: c.data == CBT_RESET_SETTINGS_ASK)
     tg.cbq_handler(lambda c: _cb_reset_settings_yes(cardinal, c), func=lambda c: c.data == CBT_RESET_SETTINGS_YES)
     tg.cbq_handler(lambda c: _cb_reset_settings_no(bot, c), func=lambda c: c.data == CBT_RESET_SETTINGS_NO)
@@ -4638,9 +5843,15 @@ def _open_token(bot, call):
         bot.answer_callback_query(call.id)
     except Exception:
         pass
-def _open_stars(bot, call):
+def _open_stars(bot, call, page=None):
     chat_id = call.message.chat.id
-    _safe_edit(bot, chat_id, call.message.id, _stars_text(chat_id), _stars_kb(chat_id))
+    if page is None and str(getattr(call, 'data', '')).startswith(CBT_STARS_PAGE_P):
+        try:
+            page = int(str(call.data)[len(CBT_STARS_PAGE_P):])
+        except Exception:
+            page = None
+    page, _pages = _stars_page_clamp(chat_id, page)
+    _safe_edit(bot, chat_id, call.message.id, _stars_text(chat_id, page), _stars_kb(chat_id, page))
     try:
         bot.answer_callback_query(call.id)
     except Exception:
@@ -4858,6 +6069,19 @@ def _star_deact_all(bot, call):
     except Exception:
         pass
     _open_stars(bot, call)
+def _toggle_temporary_lots(bot, call):
+    chat_id = call.message.chat.id
+    enabled = not _temporary_lots_enabled(chat_id)
+    _set_shared_order_flag(chat_id, 'temporary_lots_enabled', enabled)
+    try:
+        bot.answer_callback_query(
+            call.id,
+            'Команда !звезды включена.' if enabled else 'Команда !звезды выключена.',
+        )
+    except Exception:
+        pass
+    _open_stars(bot, call)
+
 def _star_toggle(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -4891,8 +6115,17 @@ def _star_delete(bot, call):
     chat_id = call.message.chat.id
     lot_id = int(call.data.split(':')[-1])
     cfg = _get_cfg(chat_id)
+    found = next((x for x in (cfg.get('star_lots') or []) if int(x.get('lot_id', 0)) == lot_id), None)
     items = [x for x in cfg.get('star_lots') or [] if int(x.get('lot_id', 0)) != lot_id]
-    _set_cfg(chat_id, star_lots=items)
+    _set_cfg(chat_id, star_lots=items, lots_active=any(bool(x.get('active')) for x in items))
+    if found and found.get('temporary') and _CARDINAL_REF is not None:
+        record = _temporary_lot_records().get(str(lot_id)) or {
+            'lot_id': lot_id,
+            'chat_id': found.get('temp_chat_id'),
+            'owner_cfg_key': str(chat_id),
+            'status': 'cleanup_pending',
+        }
+        _schedule_job(f'temp_lot_cleanup:{lot_id}', _cleanup_temporary_lot, _CARDINAL_REF, record, 'manual_delete')
     _open_stars(bot, call)
 _MAINT_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv('FTS_MAINT_WORKERS', '1')), thread_name_prefix='FTS-MAINT')
 _MAINT_JOBS = {}
@@ -4949,7 +6182,14 @@ def _autoadd_star_lots(cardinal, chat_id, category_id):
     for it in existing_list:
         try:
             lid = int(it.get('lot_id'))
-            existing_map[lid] = {'lot_id': lid, 'qty': int(it.get('qty') or 0) if it.get('qty') is not None else None, 'active': bool(it.get('active', False)), 'autodump_min_price': it.get('autodump_min_price')}
+            row = dict(it)
+            row.update({
+                'lot_id': lid,
+                'qty': int(it.get('qty') or 0) if it.get('qty') is not None else None,
+                'active': bool(it.get('active', False)),
+                'autodump_min_price': it.get('autodump_min_price'),
+            })
+            existing_map[lid] = row
         except Exception:
             continue
     raw_lots = _get_my_subcategory_lots_safe(cardinal, category_id)
@@ -5032,7 +6272,6 @@ def _autoadd_star_lots(cardinal, chat_id, category_id):
     return {'category_id': category_id, 'found': len(lot_pairs), 'added': added, 'updated': updated, 'unchanged': unchanged, 'skipped': skipped, 'errors': errors, 'fallback': fallback_used, 'elapsed_sec': elapsed, 'preview': preview_sorted[:25], 'preview_more': max(0, len(preview_sorted) - 25)}
 
 def _lot_active_value(fields, fallback=False):
-    """Read the real lot state from FunPay fields without bool('off') mistakes."""
     raw = _lot_raw_fields(fields) or {}
     value = raw.get('active')
     if value is None:
@@ -5062,7 +6301,6 @@ def _lot_qty_from_fields(fields, fallback=None):
         return None
 
 def _refresh_configured_star_lots(cardinal, chat_id):
-    """Re-check configured lots by LOT ID and synchronize qty/active state."""
     started = time.time()
     cfg = _get_cfg(chat_id)
     current = [dict(x) for x in (cfg.get('star_lots') or []) if isinstance(x, dict)]
@@ -5294,6 +6532,30 @@ def _toggle_price_notifications(bot, call):
     except Exception:
         pass
     _open_notifications(bot, call)
+def _toggle_balance_filter_notifications(bot, call):
+    chat_id = call.message.chat.id
+    v = not _cfg_bool(_get_cfg(chat_id), 'balance_lot_filter_notifications', True)
+    _set_cfg(chat_id, balance_lot_filter_notifications=v)
+    try:
+        bot.answer_callback_query(call.id, 'Уведомления фильтра баланса включены.' if v else 'Уведомления фильтра баланса выключены.')
+    except Exception:
+        pass
+    _open_notifications(bot, call)
+
+def _toggle_balance_lot_filter_from_notifications(bot, call):
+    chat_id = call.message.chat.id
+    cfg = _get_cfg(chat_id)
+    new_state = not _cfg_bool(cfg, 'balance_lot_filter_enabled', True)
+    _set_cfg(chat_id, balance_lot_filter_enabled=new_state)
+    try:
+        bot.answer_callback_query(
+            call.id,
+            'Фильтр лотов по балансу включён.' if new_state else 'Фильтр лотов по балансу выключен.'
+        )
+    except Exception:
+        pass
+    _open_notifications(bot, call)
+
 def _toggle_auto_price_fragment(bot, call):
     chat_id = call.message.chat.id
     v = not _cfg_bool(_get_cfg(chat_id), 'auto_price_fragment_enabled', False)
@@ -5349,6 +6611,7 @@ def _cb_autodump_run(cardinal, call):
         _open_autodump(bot, call)
     except Exception:
         pass
+
 def _toggle_liteserver_retry(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5358,7 +6621,8 @@ def _toggle_liteserver_retry(bot, call):
         bot.answer_callback_query(call.id, 'LiteServer-ретрай включён.' if new_state else 'LiteServer-ретрай выключен.')
     except Exception:
         pass
-    _open_mini_settings(bot, call)
+    _open_plugin_status(bot, call)
+
 def _toggle_autosend_plus(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5368,7 +6632,7 @@ def _toggle_autosend_plus(bot, call):
         bot.answer_callback_query(call.id, "Автоотправка без '+' включена." if new_state else "Теперь требуется подтверждение '+'.")
     except Exception:
         pass
-    _open_mini_settings(bot, call)
+    _open_order_settings(bot, call)
 def _ask_order_timer(bot, call, *, step, cfg_key, title, default_sec, min_min, max_min, example):
     chat_id = call.message.chat.id
     cur_min = max(1, int((_get_cfg(chat_id).get(cfg_key, default_sec) or default_sec) // 60))
@@ -5427,6 +6691,7 @@ def _cb_order_watch_run(cardinal, call):
             bot.answer_callback_query(call.id, 'Проверка уже выполняется.', show_alert=True)
         except Exception:
             pass
+
 def _toggle_queue_mode(bot, call):
     chat_id = call.message.chat.id
     cur = _queue_mode(chat_id)
@@ -5436,7 +6701,8 @@ def _toggle_queue_mode(bot, call):
         bot.answer_callback_query(call.id, f'Очередь: {_queue_mode_label(nxt, _queue_timeout_sec(chat_id))}')
     except Exception:
         pass
-    _open_mini_settings(bot, call)
+    _open_order_settings(bot, call)
+
 def _toggle_stars_currency(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5447,10 +6713,8 @@ def _toggle_stars_currency(bot, call):
         bot.answer_callback_query(call.id, f'Оплата звёзд: {_stars_currency_label(nxt)}')
     except Exception:
         pass
-    try:
-        _open_settings(bot, call)
-    except Exception:
-        _open_mini_settings(bot, call)
+    _open_payment_settings(bot, call)
+
 def _toggle_usdt_fallback(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5460,7 +6724,19 @@ def _toggle_usdt_fallback(bot, call):
         bot.answer_callback_query(call.id, 'Автопереход USDT → TON включён.' if new_state else 'Автопереход USDT → TON выключен.')
     except Exception:
         pass
-    _open_mini_settings(bot, call)
+    _open_payment_settings(bot, call)
+
+def _toggle_anonymous_send(bot, call):
+    chat_id = call.message.chat.id
+    cfg = _get_cfg(chat_id)
+    new_state = not _cfg_bool(cfg, 'anonymous_stars_send', True)
+    _set_cfg(chat_id, anonymous_stars_send=new_state)
+    try:
+        bot.answer_callback_query(call.id, 'Звёзды будут отправляться анонимно.' if new_state else 'Имя отправителя будет показано получателю.')
+    except Exception:
+        pass
+    _open_payment_settings(bot, call)
+
 def _toggle_username_check(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5470,7 +6746,7 @@ def _toggle_username_check(bot, call):
         bot.answer_callback_query(call.id, 'Проверка @username при вводе отключена (проверим при отправке).' if new_state else 'Проверка @username при вводе включена.')
     except Exception:
         pass
-    _open_mini_settings(bot, call)
+    _open_order_settings(bot, call)
 def _toggle_lots(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5496,7 +6772,7 @@ def _toggle_lots(bot, call):
             known_ids = _merge_lot_ids(known_ids, _ids_from_report(rep))
             if desired and (not known_ids) and (not (rep.get('ok') or rep.get('skip'))):
                 bot.answer_callback_query(call.id, 'Не нашёл лоты для включения. Запустите «Автодобавление лотов» в настройке лотов или добавьте LOT вручную.', show_alert=True)
-                _open_settings(bot, call)
+                _open_plugin_status(bot, call)
                 return
     effective_state = any((bool(x.get('active')) for x in star_lots)) if star_lots else desired
     if _CARDINAL_REF is not None and (rep.get('skip') or rep.get('err')) and not (rep.get('ok')):
@@ -5516,19 +6792,21 @@ def _toggle_lots(bot, call):
         answer = _lot_failure_user_text(failed_ids, 'Не все лоты удалось изменить.')
         suffix = ''
     bot.answer_callback_query(call.id, answer + suffix, show_alert=has_failures)
-    _open_settings(bot, call)
+    _open_plugin_status(bot, call)
+
 def _toggle_refund(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
     cfg = _set_cfg(chat_id, auto_refund=not bool(cfg.get('auto_refund', False)))
     bot.answer_callback_query(call.id, 'Автовозврат включён.' if cfg['auto_refund'] else 'Автовозврат выключен.', show_alert=False)
-    _open_settings(bot, call)
+    _open_order_settings(bot, call)
+
 def _toggle_deact(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
     cfg = _set_cfg(chat_id, auto_deactivate=not bool(cfg.get('auto_deactivate', True)))
     bot.answer_callback_query(call.id, 'Автодеактивация включена.' if cfg['auto_deactivate'] else 'Автодеактивация выключена.', show_alert=False)
-    _open_settings(bot, call)
+    _open_plugin_status(bot, call)
 def _toggle_balance_lot_filter(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5551,6 +6829,7 @@ def _cb_balance_lot_filter_run(cardinal, call):
         _open_pricing(bot, call)
     except Exception:
         pass
+
 def _refresh(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
@@ -5563,7 +6842,7 @@ def _refresh(bot, call):
         _maybe_auto_price_update(_CARDINAL_REF, chat_id)
         _maybe_autodump_update(_CARDINAL_REF, chat_id)
         _apply_balance_lot_filter(_CARDINAL_REF, chat_id, cfg2)
-    _open_settings(bot, call)
+    _open_plugin_status(bot, call)
     try:
         bot.answer_callback_query(call.id, 'Обновлено.', show_alert=False)
     except Exception:
@@ -6534,7 +7813,6 @@ def _ensure_pending(chat_id, order_id, qty):
             if str(x.get('order_id')) == str(order_id):
                 return x
     return item
-
 def _find_item_by_chat(chat_id):
     cid = str(chat_id)
     for it in _q(chat_id):
@@ -6703,6 +7981,7 @@ def new_order_handler(cardinal, event):
         order_id = _order_field(order, 'id') or _order_field(order, 'order_id') or _order_field(event, 'order_id')
         if _seen_order_event(order_id, chat_id, qty):
             return
+        _temporary_handle_new_order(cardinal, event, order, chat_id, order_id, qty, title)
         _order_log('info', 'new_order', oid=order_id or 'noid', chat_id=chat_id, qty=qty if qty is not None else 'pending', title=title or '-')
         if order_id and (str(order_id) in _done_oids or str(order_id) in _blocked_oids):
             _order_log('info', 'ignore_done_or_blocked', oid=order_id, chat_id=chat_id)
@@ -7116,14 +8395,31 @@ def _send_pending_item(cardinal, chat_id, item):
     was_head = item is _current(chat_id)
     _set_sending(chat_id, True)
     try:
-        resp = _send_stars_with_currency_fallback(cardinal, chat_id, cfg, jwt, username=username, quantity=qty, show_sender=False)
+        anonymous_send = _cfg_bool(cfg, 'anonymous_stars_send', True)
+        resp = _send_stars_with_currency_fallback(
+            cardinal, chat_id, cfg, jwt, username=username, quantity=qty,
+            show_sender=not anonymous_send
+        )
     finally:
         _set_sending(chat_id, False)
     if (resp or {}).get('uncertain'):
         net_error = str((resp or {}).get('network_error') or 'network_error')
         human = (             f'Fragment API не подтвердил результат отправки ({net_error}). '             'Автоматический повтор остановлен, чтобы не отправить звёзды дважды.'         )
         item.update(stage='delivery_unknown', finalized=True)
-        _safe_send(             cardinal,             chat_id,             '⚠️ <b>Статус отправки не подтверждён.</b>\n\n'             f'API Fragment не ответил за {int(FRAGMENT_READ_TIMEOUT)} сек. '             'Запрос мог быть выполнен, поэтому повторная отправка и автоматический возврат отключены.\n'             'Проверьте операцию вручную в Fragment/по балансу и у получателя.'         )
+        if net_error == 'read_timeout':
+            network_detail = f'API Fragment не вернул ответ за {int(FRAGMENT_READ_TIMEOUT)} сек.'
+        elif net_error == 'connection_error':
+            network_detail = 'Сервер Fragment закрыл соединение до возврата HTTP-ответа.'
+        else:
+            network_detail = 'Не удалось получить подтверждённый ответ от Fragment API.'
+        _safe_send(
+            cardinal,
+            chat_id,
+            '⚠️ <b>Статус отправки не подтверждён.</b>\n\n'
+            f'{network_detail} '
+            'Запрос мог быть выполнен, поэтому повторная отправка и автоматический возврат отключены.\n'
+            'Проверьте операцию вручную в Fragment, изменение баланса и получение звёзд пользователем.'
+        )
         _order_log(             'error',             'send_uncertain',             oid=oid or 'noid',             chat_id=chat_id,             qty=qty,             username=username,             status=(resp or {}).get('status'),             network_error=net_error,             reason=human         )
         _log('error', f'SEND UNCERTAIN {qty}⭐ -> @{username}: {human}')
         if oid:
@@ -7311,6 +8607,8 @@ def new_message_handler(cardinal, event):
         if _is_sending(chat_id) and author != 'funpay':
             return
         cfg = _get_cfg_for_orders(chat_id)
+        if cfg.get('plugin_enabled', True) and _temporary_handle_message(cardinal, event, chat_id, author, my_user, text, cfg):
+            return
         try:
             user_mid = getattr(event.message, 'message_id', None) or getattr(event.message, 'id', None)
         except Exception:
