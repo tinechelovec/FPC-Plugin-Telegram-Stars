@@ -3,6 +3,7 @@ import json
 import hashlib
 import logging
 import requests
+from urllib.parse import quote
 import re as _re
 import time
 import random
@@ -189,7 +190,7 @@ def _s64(x):
     return _b64.b64decode(x.encode()).decode('utf-8')
 
 NAME = 'FTS-Plugin'
-VERSION = '1.8.0'
+VERSION = '1.8.1'
 DESCRIPTION = 'Плагин по продаже звезд.'
 CREDITS = '@tinechelovec'
 UUID = 'fa0c2f3a-7a85-4c09-a3b2-9f3a9b8f8a75'
@@ -260,11 +261,11 @@ ORDERS_FILE = os.path.join(PLUGIN_FOLDER, 'orders.json')
 ORDERS_BAK = ORDERS_FILE + '.bak'
 TEMP_LOTS_FILE = os.path.join(PLUGIN_FOLDER, 'temporary_lots.json')
 TEMP_LOTS_BAK = TEMP_LOTS_FILE + '.bak'
-SETTINGS_SCHEMA_VERSION = 7
+SETTINGS_SCHEMA_VERSION = 8
 ORDERS_SCHEMA_VERSION = 1
 LEGACY_SETTINGS_KEY = '__legacy__'
 SETTINGS_META_KEY = '__meta__'
-_CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'instruction_acknowledged', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'anonymous_stars_send', 'temporary_lots_enabled', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
+_CFG_KNOWN_KEYS = {'plugin_enabled', 'lots_active', 'auto_refund', 'auto_deactivate', 'preorder_username', 'instruction_acknowledged', 'unit_star_price', 'markup_percent', 'fragment_jwt', 'wallet_version', 'balance_ton', 'balance_usdt', 'last_wallet_raw', 'fragment_proxy_type', 'fragment_proxy_host', 'fragment_proxy_port', 'fragment_proxy_username', 'fragment_proxy_password', 'fragment_proxy_last_ok', 'fragment_proxy_last_ping_ms', 'fragment_proxy_last_check_ts', 'fragment_proxy_last_error', 'templates', 'category_id', 'min_balance_ton', 'min_balance_usdt', 'star_lots', 'retry_liteserver', 'auto_send_without_plus', 'skip_username_check', 'queue_mode', 'queue_timeout_sec', 'stars_currency', 'usdt_fallback_to_ton', 'price_change_notifications', 'auto_price_fragment_enabled', 'autodump_enabled', 'autodump_interval_sec', 'autodump_notifications', 'balance_lot_filter_enabled', 'balance_lot_filter_notifications', 'anonymous_stars_send', 'temporary_lots_enabled', 'last_auto_deact_reason', 'managed_lot_ids', 'last_lot_toggle_report', 'last_lot_toggle_ts', 'order_watch_enabled', 'order_watch_interval_sec', 'order_wait_reminder_sec', 'order_review_reminder_enabled', 'order_review_reminder_sec', 'order_records', 'last_order_watch_ts', 'last_usdt_fallback_reason', 'last_usdt_fallback_ts', 'last_auto_price_base_unit', 'last_auto_price_ts', 'autodump_last_ts', 'config_version'}
 _CFG_TOKEN_ALIASES = ('jwt', 'token', 'fragment_token', 'fragmentApiToken', 'fragment_api_token')
 FTS_BRIDGE_PLUGIN_SECRET = os.getenv('FTS_TRANSFER_TOKEN_PLUGIN_SECRET', os.getenv('FTS_BRIDGE_PLUGIN_SECRET', os.getenv('PLUGIN_API_SECRET', 'fa6db024bd75b3ff33ef46bfae67185d0c343ec47c09f18c2ac594bc276cde1ab887dff104545cd9d5ce955d9db4f7d3'))).strip()
 _SETTINGS_IO_LOCK = threading.RLock()
@@ -693,6 +694,30 @@ def _sanitize_cfg(raw, chat_id=None):
     cfg['preorder_username'] = _cfg_bool(cfg, 'preorder_username', False)
     cfg['instruction_acknowledged'] = _cfg_bool(cfg, 'instruction_acknowledged', False)
     cfg['fragment_jwt'] = str(cfg.get('fragment_jwt')).strip() if cfg.get('fragment_jwt') else None
+    proxy_type = str(cfg.get('fragment_proxy_type') or '').strip().lower()
+    cfg['fragment_proxy_type'] = proxy_type if proxy_type in {'http', 'socks4', 'socks5'} else None
+    cfg['fragment_proxy_host'] = _clean_config_string(cfg.get('fragment_proxy_host'), 255)
+    cfg['fragment_proxy_host'] = cfg['fragment_proxy_host'].strip() if cfg.get('fragment_proxy_host') else None
+    cfg['fragment_proxy_port'] = _as_int(cfg.get('fragment_proxy_port'), 0, 0, 65535)
+    cfg['fragment_proxy_username'] = _clean_config_string(cfg.get('fragment_proxy_username'), 255)
+    cfg['fragment_proxy_username'] = cfg['fragment_proxy_username'] if cfg.get('fragment_proxy_username') else None
+    cfg['fragment_proxy_password'] = _clean_config_string(cfg.get('fragment_proxy_password'), 255)
+    cfg['fragment_proxy_password'] = cfg['fragment_proxy_password'] if cfg.get('fragment_proxy_password') else None
+    cfg['fragment_proxy_last_ok'] = _cfg_bool(cfg, 'fragment_proxy_last_ok', False)
+    cfg['fragment_proxy_last_ping_ms'] = _as_float_cfg(cfg.get('fragment_proxy_last_ping_ms'), None, 0.0)
+    cfg['fragment_proxy_last_check_ts'] = _as_int(cfg.get('fragment_proxy_last_check_ts'), 0, 0)
+    cfg['fragment_proxy_last_error'] = _clean_config_string(cfg.get('fragment_proxy_last_error'), 500)
+    cfg['fragment_proxy_last_error'] = cfg['fragment_proxy_last_error'].strip() if cfg.get('fragment_proxy_last_error') else None
+    if not (cfg.get('fragment_proxy_type') and cfg.get('fragment_proxy_host') and cfg.get('fragment_proxy_port')):
+        cfg['fragment_proxy_type'] = None
+        cfg['fragment_proxy_host'] = None
+        cfg['fragment_proxy_port'] = 0
+        cfg['fragment_proxy_username'] = None
+        cfg['fragment_proxy_password'] = None
+        cfg['fragment_proxy_last_ok'] = False
+        cfg['fragment_proxy_last_ping_ms'] = None
+        cfg['fragment_proxy_last_check_ts'] = 0
+        cfg['fragment_proxy_last_error'] = None
     cfg['unit_star_price'] = _as_float_cfg(cfg.get('unit_star_price'), None, 0.0)
     cfg['markup_percent'] = _as_float_cfg(cfg.get('markup_percent'), 0.0) or 0.0
     cfg['wallet_version'] = str(cfg.get('wallet_version')).strip() if cfg.get('wallet_version') else None
@@ -1166,6 +1191,131 @@ def _set_cfg(chat_id, **updates):
         data[key] = cfg
         _save_settings(data)
         return cfg
+
+_FRAGMENT_PROXY_PROTOCOLS = {
+    'http': ('HTTP', 'http'),
+    'socks4': ('SOCKS4', 'socks4a'),
+    'socks5': ('SOCKS5', 'socks5h'),
+}
+
+def _fragment_proxy_is_configured(cfg):
+    return bool(
+        isinstance(cfg, dict)
+        and cfg.get('fragment_proxy_type') in _FRAGMENT_PROXY_PROTOCOLS
+        and cfg.get('fragment_proxy_host')
+        and _as_int(cfg.get('fragment_proxy_port'), 0, 1, 65535)
+    )
+
+def _fragment_proxy_cfg(chat_id=None, jwt=None):
+    try:
+        data = _load_settings()
+        if chat_id is not None:
+            raw = data.get(str(chat_id))
+            if isinstance(raw, dict):
+                if _fragment_proxy_is_configured(raw) or not jwt or raw.get('fragment_jwt') == jwt:
+                    return _sanitize_cfg(raw, chat_id=str(chat_id))
+        if jwt:
+            for key, raw in data.items():
+                if key == SETTINGS_META_KEY or not isinstance(raw, dict):
+                    continue
+                if str(raw.get('fragment_jwt') or '') == str(jwt):
+                    return _sanitize_cfg(raw, chat_id=key)
+        _key, raw = _owner_cfg_entry(data, chat_id)
+        if isinstance(raw, dict):
+            return _sanitize_cfg(raw, chat_id=_key)
+    except Exception as e:
+        logger.debug(f'Fragment proxy config lookup failed: {e}')
+    return _sanitize_cfg({})
+
+def _fragment_proxy_url(cfg):
+    if not _fragment_proxy_is_configured(cfg):
+        return None
+    proxy_type = str(cfg.get('fragment_proxy_type'))
+    _label, scheme = _FRAGMENT_PROXY_PROTOCOLS[proxy_type]
+    host = str(cfg.get('fragment_proxy_host') or '').strip()
+    if ':' in host and not host.startswith('['):
+        host = f'[{host}]'
+    port = int(cfg.get('fragment_proxy_port'))
+    username = cfg.get('fragment_proxy_username')
+    password = cfg.get('fragment_proxy_password')
+    auth = ''
+    if username:
+        auth = quote(str(username), safe='')
+        if password is not None:
+            auth += ':' + quote(str(password), safe='')
+        auth += '@'
+    return f'{scheme}://{auth}{host}:{port}'
+
+def _fragment_proxy_kwargs(jwt=None, chat_id=None, cfg=None):
+    cfg = cfg if isinstance(cfg, dict) else _fragment_proxy_cfg(chat_id=chat_id, jwt=jwt)
+    proxy_url = _fragment_proxy_url(cfg)
+    if not proxy_url:
+        return {}
+    return {'proxies': {'http': proxy_url, 'https': proxy_url}}
+
+def _fragment_proxy_label(cfg):
+    protocol = _FRAGMENT_PROXY_PROTOCOLS.get(str((cfg or {}).get('fragment_proxy_type') or ''))
+    return protocol[0] if protocol else '—'
+
+def _fragment_proxy_address(cfg):
+    if not _fragment_proxy_is_configured(cfg):
+        return '—'
+    host = str(cfg.get('fragment_proxy_host') or '')
+    return f'{host}:{int(cfg.get("fragment_proxy_port") or 0)}'
+
+def _fragment_proxy_status_short(cfg):
+    if not _fragment_proxy_is_configured(cfg):
+        return 'не настроен ❌'
+    if cfg.get('fragment_proxy_last_ok'):
+        ping = cfg.get('fragment_proxy_last_ping_ms')
+        return f'подключён ✅, {float(ping):.0f} мс' if isinstance(ping, (int, float)) else 'подключён ✅'
+    if cfg.get('fragment_proxy_last_check_ts'):
+        return 'не работает ❌'
+    return 'не проверен ⚠️'
+
+def _fragment_proxy_redact_error(error, cfg):
+    text = _short_log_value(error, 500)
+    username = (cfg or {}).get('fragment_proxy_username')
+    password = (cfg or {}).get('fragment_proxy_password')
+    if username and password is not None:
+        pairs = (
+            f'{username}:{password}',
+            f'{quote(str(username), safe="")}:{quote(str(password), safe="")}',
+        )
+        for pair in pairs:
+            text = text.replace(pair, '***:***')
+    if password:
+        text = text.replace(str(password), '***')
+        try:
+            text = text.replace(quote(str(password), safe=''), '***')
+        except Exception:
+            pass
+    if 'Missing dependencies for SOCKS support' in text:
+        return 'Для SOCKS4/SOCKS5 не установлен PySocks. Установите: pip install PySocks'
+    return text
+
+def _test_fragment_proxy_cfg(cfg, jwt=None):
+    if not _fragment_proxy_is_configured(cfg):
+        return (False, None, 'Прокси заполнен не полностью.', 0)
+    kwargs = _fragment_proxy_kwargs(jwt=jwt, cfg=cfg)
+    headers = {'Accept': 'application/json', 'User-Agent': f'{NAME}/{VERSION} proxy-check'}
+    if jwt:
+        headers['Authorization'] = f'JWT {jwt}'
+    started = time.perf_counter()
+    try:
+        with requests.Session() as session:
+            response = session.get(
+                FRAGMENT_WALLET_URLS[0],
+                headers=headers,
+                timeout=(10, 20),
+                allow_redirects=True,
+                **kwargs,
+            )
+        ping_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        return (True, ping_ms, None, int(response.status_code))
+    except Exception as e:
+        return (False, None, _fragment_proxy_redact_error(e, cfg), 0)
+
 def _state_on(v):
     return '🟢 Включено' if v else '🔴 Выключено'
 def _normalize_stars_currency(v):
@@ -1513,7 +1663,7 @@ def _extract_username_from_any(x, depth=0):
     except Exception:
         pass
     return None
-def _check_username_exists(username, jwt):
+def _check_username_exists(username, jwt, chat_id=None):
     if not username: return False
     uname = username.lstrip('@').strip()
     urls = []
@@ -1523,16 +1673,18 @@ def _check_username_exists(username, jwt):
     urls.append(f'{FRAGMENT_BASE}/misc/user/{uname}/')
     headers_with_jwt = {'Accept': 'application/json'}
     if jwt: headers_with_jwt['Authorization'] = f'JWT {jwt}'
+    proxy_cfg = _fragment_proxy_cfg(chat_id=chat_id, jwt=jwt)
+    proxy_kwargs = _fragment_proxy_kwargs(jwt=jwt, chat_id=chat_id, cfg=proxy_cfg)
     for url in urls:
         try:
-            r = _HTTP.get(url, headers=headers_with_jwt, timeout=8)
+            r = _HTTP.get(url, headers=headers_with_jwt, timeout=8, **proxy_kwargs)
             if r.status_code == 200:
                 try:
                     data = r.json()
                     if isinstance(data, dict) and (data.get('username') or data.get('user') or data.get('id')): return True
                 except Exception:
                     pass
-            r2 = _HTTP.get(url, headers={'Accept': 'application/json'}, timeout=8)
+            r2 = _HTTP.get(url, headers={'Accept': 'application/json'}, timeout=8, **proxy_kwargs)
             if r2.status_code == 200:
                 try:
                     data = r2.json()
@@ -1540,7 +1692,7 @@ def _check_username_exists(username, jwt):
                 except Exception:
                     pass
         except Exception as e:
-            logger.debug(f'_check_username_exists {url} failed: {e}')
+            logger.debug(f'_check_username_exists {url} failed: {_fragment_proxy_redact_error(e, proxy_cfg)}')
     return False
 def _check_username_exists_throttled(username, jwt, chat_id=None):
     key = str(chat_id) if chat_id is not None else '__global__'
@@ -1549,7 +1701,7 @@ def _check_username_exists_throttled(username, jwt, chat_id=None):
     wait = last + _USERNAME_CHECK_GAP - now
     if wait > 0: time.sleep(min(wait + random.random() * _USERNAME_CHECK_JITTER, _USERNAME_CHECK_GAP + _USERNAME_CHECK_JITTER))
     _last_username_check_ts[key] = time.time()
-    return _check_username_exists(username, jwt)
+    return _check_username_exists(username, jwt, chat_id=chat_id)
 def _as_balance_float(v):
     try:
         if isinstance(v, bool) or v is None: return None
@@ -1636,12 +1788,14 @@ def _fragment_error_detail(data, text=''):
 def _is_fragment_auth_error(status, data=None, text=''):
     detail = _fragment_error_detail(data, text).lower()
     return status in (401, 403) or any(marker in detail for marker in _FRAGMENT_AUTH_ERRORS)
-def _check_fragment_wallet(jwt):
+def _check_fragment_wallet(jwt, chat_id=None):
     headers = {'Accept': 'application/json', 'Authorization': f'JWT {jwt}'}
+    proxy_cfg = _fragment_proxy_cfg(chat_id=chat_id, jwt=jwt)
+    proxy_kwargs = _fragment_proxy_kwargs(jwt=jwt, chat_id=chat_id, cfg=proxy_cfg)
     last_result = None
     for url in FRAGMENT_WALLET_URLS:
         try:
-            r = _HTTP.get(url, headers=headers, timeout=20)
+            r = _HTTP.get(url, headers=headers, timeout=20, **proxy_kwargs)
             try:
                 data = r.json()
             except Exception:
@@ -1657,7 +1811,7 @@ def _check_fragment_wallet(jwt):
                 return (ver, bal_ton, bal_usdt, raw)
             last_result = raw
         except Exception as e:
-            last_result = {'_network_error': str(e), '_url': url}
+            last_result = {'_network_error': _fragment_proxy_redact_error(e, proxy_cfg), '_url': url}
     logger.warning(f'Fragment wallet check failed: {_fragment_error_detail(last_result)}')
     return (None, None, None, last_result)
 _LS_RE = _re.compile('(?:\\blite\\s*server\\b|liteserver)', _re.I)
@@ -1702,14 +1856,14 @@ def _is_balance_failure_resp(resp):
         return any((x in low for x in ('not enough', 'insufficient', 'balance', 'low ton balance', 'no jetton wallet', 'недостат', 'не хватает')))
     except Exception:
         return False
-def _order_stars_with_retry(jwt, username, quantity, show_sender=False, webhook_url=None, retry_enabled=False, currency=None, response_url=None):
-    resp = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url)
+def _order_stars_with_retry(jwt, username, quantity, show_sender=False, webhook_url=None, retry_enabled=False, currency=None, response_url=None, proxy_chat_id=None):
+    resp = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url, proxy_chat_id=proxy_chat_id)
     if resp.get('ok') or not retry_enabled: return resp
     if resp.get('safe_to_retry'):
         delay = random.uniform(LITESERVER_RETRY_SLEEP_MIN, LITESERVER_RETRY_SLEEP_MAX)
         _log('warn', f'SEND retry: connection was not established, attempt=2, sleep={delay:.2f}s')
         time.sleep(delay)
-        resp2 = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url)
+        resp2 = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url, proxy_chat_id=proxy_chat_id)
         resp2['_retried'] = True
         return resp2
     if resp.get('uncertain'): return resp
@@ -1717,13 +1871,15 @@ def _order_stars_with_retry(jwt, username, quantity, show_sender=False, webhook_
         delay = random.uniform(LITESERVER_RETRY_SLEEP_MIN, LITESERVER_RETRY_SLEEP_MAX)
         _log('warn', f'SEND retry: liteserver transient error, attempt=2, sleep={delay:.2f}s')
         time.sleep(delay)
-        resp2 = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url)
+        resp2 = _order_stars(jwt, username=username, quantity=quantity, show_sender=show_sender, webhook_url=webhook_url, currency=currency, response_url=response_url, proxy_chat_id=proxy_chat_id)
         resp2['_retried'] = True
         return resp2
     return resp
-def _order_stars(jwt, username, quantity, show_sender=False, webhook_url=None, currency=None, response_url=None):
+def _order_stars(jwt, username, quantity, show_sender=False, webhook_url=None, currency=None, response_url=None, proxy_chat_id=None):
     u = username.lstrip('@').strip()
     cur = _normalize_stars_currency(currency)
+    proxy_cfg = _fragment_proxy_cfg(chat_id=proxy_chat_id, jwt=jwt)
+    proxy_kwargs = _fragment_proxy_kwargs(jwt=jwt, chat_id=proxy_chat_id, cfg=proxy_cfg)
     try:
         payload = {'username': u, 'quantity': quantity, 'show_sender': bool(show_sender)}
         if cur == FTS_CURRENCY_USDT_TON: payload['currency'] = FTS_CURRENCY_USDT_TON
@@ -1741,6 +1897,7 @@ def _order_stars(jwt, username, quantity, show_sender=False, webhook_url=None, c
                     'Connection': 'close',
                 },
                 timeout=(FRAGMENT_CONNECT_TIMEOUT, FRAGMENT_READ_TIMEOUT),
+                **proxy_kwargs,
             )
         resp_json = None
         ct = (r.headers.get('Content-Type') or '').lower()
@@ -1762,28 +1919,32 @@ def _order_stars(jwt, username, quantity, show_sender=False, webhook_url=None, c
         _log('info' if ok else 'error', f"SEND result: ok={ok} status={r.status_code} currency={cur} order_status={status_val or '-'} flags={','.join(sorted(ok_flags)) or '-'} body={body_text}")
         return {             'ok': ok,             'status': r.status_code,             'text': r.text,             'json': resp_json,             'currency': cur,             'order_status': status_val.upper() if status_val else None,             'fragment_order_id': _fragment_order_id(resp_json)         }
     except requests.exceptions.ConnectTimeout as e:
-        _log('error', f'SEND connect timeout: {e}')
-        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'connect_timeout',             'safe_to_retry': True,             'uncertain': False         }
+        err = _fragment_proxy_redact_error(e, proxy_cfg)
+        _log('error', f'SEND connect timeout: {err}')
+        return {             'ok': False,             'status': 0,             'text': err,             'json': None,             'currency': cur,             'network_error': 'connect_timeout',             'safe_to_retry': True,             'uncertain': False         }
     except requests.exceptions.ReadTimeout as e:
-        _log('error', f'SEND read timeout, delivery status unknown: {e}')
-        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'read_timeout',             'safe_to_retry': False,             'uncertain': True         }
+        err = _fragment_proxy_redact_error(e, proxy_cfg)
+        _log('error', f'SEND read timeout, delivery status unknown: {err}')
+        return {             'ok': False,             'status': 0,             'text': err,             'json': None,             'currency': cur,             'network_error': 'read_timeout',             'safe_to_retry': False,             'uncertain': True         }
     except requests.exceptions.ConnectionError as e:
-        _log('error', f'SEND connection error, delivery status unknown: {e}')
-        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'connection_error',             'safe_to_retry': False,             'uncertain': True         }
+        err = _fragment_proxy_redact_error(e, proxy_cfg)
+        _log('error', f'SEND connection error, delivery status unknown: {err}')
+        return {             'ok': False,             'status': 0,             'text': err,             'json': None,             'currency': cur,             'network_error': 'connection_error',             'safe_to_retry': False,             'uncertain': True         }
     except Exception as e:
-        _log('error', f'SEND exception: {e}')
-        return {             'ok': False,             'status': 0,             'text': str(e),             'json': None,             'currency': cur,             'network_error': 'unexpected_error',             'safe_to_retry': False,             'uncertain': False         }
+        err = _fragment_proxy_redact_error(e, proxy_cfg)
+        _log('error', f'SEND exception: {err}')
+        return {             'ok': False,             'status': 0,             'text': err,             'json': None,             'currency': cur,             'network_error': 'unexpected_error',             'safe_to_retry': False,             'uncertain': False         }
 
 def _send_stars_with_currency_fallback(cardinal, chat_id, cfg, jwt, username, quantity, show_sender=False):
     cur = _normalize_stars_currency(cfg.get('stars_currency'))
-    resp = _order_stars_with_retry(jwt, username=username, quantity=quantity, show_sender=show_sender, retry_enabled=bool(cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT)), currency=cur)
+    resp = _order_stars_with_retry(jwt, username=username, quantity=quantity, show_sender=show_sender, retry_enabled=bool(cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT)), currency=cur, proxy_chat_id=chat_id)
     if cur == FTS_CURRENCY_USDT_TON and (not (resp or {}).get('ok')) and _cfg_bool(cfg, 'usdt_fallback_to_ton', False) and _is_balance_failure_resp(resp):
         try:
             _set_cfg_for_orders(chat_id, stars_currency=FTS_CURRENCY_TON, last_usdt_fallback_reason='USDT balance is not enough for Fragment order', last_usdt_fallback_ts=int(time.time()))
         except Exception:
             pass
         _safe_send(cardinal, chat_id, '⚠️ USDT не хватило для оплаты. Переключаю оплату звёзд на TON и пробую ещё раз…')
-        resp = _order_stars_with_retry(jwt, username=username, quantity=quantity, show_sender=show_sender, retry_enabled=bool(cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT)), currency=FTS_CURRENCY_TON)
+        resp = _order_stars_with_retry(jwt, username=username, quantity=quantity, show_sender=show_sender, retry_enabled=bool(cfg.get('retry_liteserver', LITESERVER_RETRY_DEFAULT)), currency=FTS_CURRENCY_TON, proxy_chat_id=chat_id)
         resp['_currency_fallback'] = 'usdt_ton->ton'
     return resp
 def _send_order_result_message(cardinal, chat_id, qty, username, order_url, resp=None):
@@ -2451,7 +2612,7 @@ def _auto_refund_order(cardinal, order_id, chat_id, reason):
         return False
 def _coin_unit_for_balance(cfg, cur):
     cur = _normalize_stars_currency(cur)
-    data, src = _fetch_fragment_prices(cfg.get('fragment_jwt'))
+    data, src = _fetch_fragment_prices(cfg.get('fragment_jwt'), cfg=cfg)
     unit = _fragment_unit_price(data, cur) if data is not None else None
     if unit:
         return (float(unit), f'Fragment Prices: {unit:g} {_stars_currency_label(cur)} за 1⭐')
@@ -2526,7 +2687,7 @@ def _apply_balance_lot_filter(cardinal, chat_id, cfg, bal_ton=None, bal_usdt=Non
     return (True, 'Фильтр проверил лоты: менять нечего. ' + info)
 def _maybe_auto_deactivate(cardinal, cfg, chat_id=None):
     jwt = cfg.get('fragment_jwt')
-    ver, bal_ton, bal_usdt, _raw = _check_fragment_wallet(jwt) if jwt else (None, None, None, None)
+    ver, bal_ton, bal_usdt, _raw = _check_fragment_wallet(jwt, chat_id=chat_id) if jwt else (None, None, None, None)
     if bal_ton is None and bal_usdt is None:
         logger.warning('[BALANCE] Не удалось получить баланс Fragment.')
         return
@@ -2673,6 +2834,11 @@ CBT_ORDER_SETTINGS = f'{UUID}:order_settings'
 CBT_PAYMENT_SETTINGS = f'{UUID}:payment_settings'
 CBT_MAINTENANCE = f'{UUID}:maintenance'
 CBT_REPAIR_SETTINGS = f'{UUID}:repair_settings'
+CBT_PROXY = f'{UUID}:proxy'
+CBT_PROXY_SET = f'{UUID}:proxy_set'
+CBT_PROXY_TYPE_P = f'{UUID}:proxy_type:'
+CBT_PROXY_CHECK = f'{UUID}:proxy_check'
+CBT_PROXY_DELETE = f'{UUID}:proxy_delete'
 _fsm = {}
 CLEAN_FSM_SENSITIVE = bool(int(os.getenv('FTS_Plugin_CLEAN_FSM_SENSITIVE', '1')))
 def _track_fsm_mid(state, mid):
@@ -2755,11 +2921,14 @@ def _mini_settings_text(chat_id):
         f"• Состояние: <b>{_state_on(cfg.get('plugin_enabled', True))}</b>\n"
         f"• Обработка заказов: <b>{_h(queue_text)}</b>\n"
         f"• Напоминания: <b>{_state_on(reminders_on)}</b>\n"
-        f"• Валюта: <b>{_stars_currency_emoji(cfg.get('stars_currency'))} {_stars_currency_label(cfg.get('stars_currency'))}</b>\n\n"
+        f"• Валюта: <b>{_stars_currency_emoji(cfg.get('stars_currency'))} {_stars_currency_label(cfg.get('stars_currency'))}</b>\n"
+        f"• Прокси Fragment API: <b>{_h(_fragment_proxy_status_short(cfg))}</b>\n\n"
         'Выберите категорию:'
     )
 
 def _mini_settings_kb(chat_id):
+    cfg = _get_cfg(chat_id)
+    proxy_mark = '✅' if _fragment_proxy_is_configured(cfg) and cfg.get('fragment_proxy_last_ok') else '❌'
     kb = K()
     kb.row(B('🧩 Состояние плагина', callback_data=CBT_PLUGIN_STATUS))
     kb.row(B('🛒 Заказы', callback_data=CBT_ORDER_SETTINGS))
@@ -2767,6 +2936,7 @@ def _mini_settings_kb(chat_id):
     kb.row(B('💬 Сообщения', callback_data=CBT_MESSAGES))
     kb.row(B('🔔 Уведомления', callback_data=CBT_NOTIFICATIONS))
     kb.row(B('💳 Оплата и баланс', callback_data=CBT_PAYMENT_SETTINGS))
+    kb.row(B(f'🌐 Прокси Fragment {proxy_mark}', callback_data=CBT_PROXY))
     kb.row(B('🛠 Обслуживание', callback_data=CBT_MAINTENANCE))
     kb.add(B('◀️ Назад', callback_data=CBT_SETTINGS))
     return kb
@@ -2777,6 +2947,158 @@ def _open_mini_settings(bot, call):
         bot.answer_callback_query(call.id)
     except Exception:
         pass
+
+
+def _proxy_settings_text(chat_id):
+    cfg = _get_cfg(chat_id)
+    configured = _fragment_proxy_is_configured(cfg)
+    state = _fragment_proxy_status_short(cfg)
+    protocol = _fragment_proxy_label(cfg)
+    address = _fragment_proxy_address(cfg)
+    auth = 'есть ✅' if cfg.get('fragment_proxy_username') else 'нет'
+    checked_ts = int(cfg.get('fragment_proxy_last_check_ts') or 0)
+    checked = time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(checked_ts)) if checked_ts else '—'
+    ping = cfg.get('fragment_proxy_last_ping_ms')
+    ping_text = f'{float(ping):.0f} мс' if isinstance(ping, (int, float)) else '—'
+    error = cfg.get('fragment_proxy_last_error')
+    error_line = f'\n• Последняя ошибка: <code>{_h(error)}</code>' if error else ''
+    details = (
+        f'• Тип: <b>{_h(protocol)}</b>\n'
+        f'• Адрес: <code>{_h(address)}</code>\n'
+        f'• Авторизация: <b>{auth}</b>\n'
+        f'• Последняя проверка: <code>{_h(checked)}</code>\n'
+        f'• Пинг: <code>{_h(ping_text)}</code>'
+        if configured else
+        'Прокси ещё не добавлен.'
+    )
+    return (
+        '<b>🌐 Прокси для Fragment API</b>\n\n'
+        f'• Состояние: <b>{_h(state)}</b>\n'
+        f'{details}{error_line}\n\n'
+        'Через этот прокси идут только запросы к Fragment API: проверка пользователя, '
+        'баланс, цены и отправка звёзд. FunPay, обновление плагина и другие сервисы его не используют.\n\n'
+        'При вводе логина или пароля отправьте <code>-</code>, если авторизация не нужна.'
+    )
+
+def _proxy_settings_kb(chat_id):
+    cfg = _get_cfg(chat_id)
+    kb = K()
+    kb.row(B('➕ Установить / заменить', callback_data=CBT_PROXY_SET))
+    if _fragment_proxy_is_configured(cfg):
+        kb.row(B('🔄 Проверить прокси', callback_data=CBT_PROXY_CHECK))
+        kb.row(B('🗑 Удалить прокси', callback_data=CBT_PROXY_DELETE))
+    kb.add(B('◀️ Назад', callback_data=CBT_MINI_SETTINGS))
+    return kb
+
+def _open_proxy_settings(bot, call):
+    chat_id = call.message.chat.id
+    _safe_edit(bot, chat_id, call.message.id, _proxy_settings_text(chat_id), _proxy_settings_kb(chat_id))
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+def _proxy_type_kb():
+    kb = K()
+    kb.row(
+        B('HTTP', callback_data=f'{CBT_PROXY_TYPE_P}http'),
+        B('SOCKS4', callback_data=f'{CBT_PROXY_TYPE_P}socks4'),
+        B('SOCKS5', callback_data=f'{CBT_PROXY_TYPE_P}socks5'),
+    )
+    kb.add(B('◀️ Назад', callback_data=CBT_PROXY))
+    return kb
+
+def _start_proxy_setup(bot, call):
+    chat_id = call.message.chat.id
+    _fsm.pop(chat_id, None)
+    _safe_edit(
+        bot,
+        chat_id,
+        call.message.id,
+        '<b>🌐 Установка прокси</b>\n\nВыберите тип прокси:',
+        _proxy_type_kb(),
+    )
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+def _proxy_prompt(bot, chat_id, state, text):
+    msg = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=_kb_cancel_fsm())
+    _track_fsm_mid(state, getattr(msg, 'message_id', None))
+    _fsm[chat_id] = state
+    return msg
+
+def _choose_proxy_type(bot, call):
+    chat_id = call.message.chat.id
+    proxy_type = str(call.data[len(CBT_PROXY_TYPE_P):]).strip().lower()
+    if proxy_type not in _FRAGMENT_PROXY_PROTOCOLS:
+        try:
+            bot.answer_callback_query(call.id, 'Неизвестный тип прокси.', show_alert=True)
+        except Exception:
+            pass
+        return
+    state = {'step': 'proxy_host', 'proxy_type': proxy_type}
+    _fsm[chat_id] = state
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    _proxy_prompt(
+        bot,
+        chat_id,
+        state,
+        f'Выбран <b>{_h(_FRAGMENT_PROXY_PROTOCOLS[proxy_type][0])}</b>.\n'
+        'Введите IP-адрес или домен прокси без порта.\nПример: <code>127.0.0.1</code>',
+    )
+
+def _check_saved_proxy(bot, call):
+    chat_id = call.message.chat.id
+    cfg = _get_cfg(chat_id)
+    if not _fragment_proxy_is_configured(cfg):
+        try:
+            bot.answer_callback_query(call.id, 'Прокси не настроен.', show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        bot.answer_callback_query(call.id, 'Проверяю прокси…')
+    except Exception:
+        pass
+    ok, ping, error, http_status = _test_fragment_proxy_cfg(cfg, cfg.get('fragment_jwt'))
+    updates = {
+        'fragment_proxy_last_ok': bool(ok),
+        'fragment_proxy_last_ping_ms': ping,
+        'fragment_proxy_last_check_ts': int(time.time()),
+        'fragment_proxy_last_error': None if ok else error,
+    }
+    _set_cfg(chat_id, **updates)
+    if ok:
+        msg = f'✅ Прокси работает. Пинг: <b>{float(ping):.0f} мс</b>. HTTP Fragment: <code>{http_status}</code>.'
+    else:
+        msg = f'❌ Прокси не работает.\nОшибка: <code>{_h(error)}</code>'
+    _safe_edit(bot, chat_id, call.message.id, _proxy_settings_text(chat_id), _proxy_settings_kb(chat_id))
+    _safe_send_tg(bot, chat_id, msg)
+
+def _delete_proxy(bot, call):
+    chat_id = call.message.chat.id
+    _set_cfg(
+        chat_id,
+        fragment_proxy_type=None,
+        fragment_proxy_host=None,
+        fragment_proxy_port=0,
+        fragment_proxy_username=None,
+        fragment_proxy_password=None,
+        fragment_proxy_last_ok=False,
+        fragment_proxy_last_ping_ms=None,
+        fragment_proxy_last_check_ts=0,
+        fragment_proxy_last_error=None,
+    )
+    try:
+        bot.answer_callback_query(call.id, 'Прокси удалён.')
+    except Exception:
+        pass
+    _safe_edit(bot, chat_id, call.message.id, _proxy_settings_text(chat_id), _proxy_settings_kb(chat_id))
 
 def _plugin_status_text(chat_id):
     cfg = _get_cfg(chat_id)
@@ -2990,7 +3312,7 @@ def _saves_text(chat_id):
         orders_size = os.path.getsize(ORDERS_FILE) if os.path.exists(ORDERS_FILE) else 0
     except Exception:
         settings_size = orders_size = 0
-    return f'<b>💾 Сохранения</b>\n\nДанные разделены:\n• <code>settings.json</code> — настройки, токен и лоты;\n• <code>orders.json</code> — база заказов и их статусы.\n\nИмпорт и скачивание используют единый резервный файл. Сброс настроек не удаляет историю заказов.\n\nНастройки: <code>{settings_size} байт</code>\nЗаказы: <code>{orders_size} байт</code>\n\n⚠️ Резервная копия может содержать JWT-токен. Не отправляйте её посторонним.'
+    return f'<b>💾 Сохранения</b>\n\nДанные разделены:\n• <code>settings.json</code> — настройки, токен и лоты;\n• <code>orders.json</code> — база заказов и их статусы.\n\nИмпорт и скачивание используют единый резервный файл. Сброс настроек не удаляет историю заказов.\n\nНастройки: <code>{settings_size} байт</code>\nЗаказы: <code>{orders_size} байт</code>\n\n⚠️ Резервная копия может содержать JWT-токен, логин и пароль прокси. Не отправляйте её посторонним.'
 
 def _saves_kb():
     kb = K()
@@ -3024,7 +3346,7 @@ def _download_saves(bot, call):
         backup = {             'format': 'FTS-Plugin-backup',             'backup_version': 2,             'created_at': int(time.time()),             'settings': _load_settings(),             'orders': _load_orders_db()         }
         payload = json.dumps(backup, indent=4, ensure_ascii=False).encode('utf-8')
         fname = f"FTS-Plugin-backup-{time.strftime('%Y%m%d-%H%M%S')}.json"
-        bot.send_document(chat_id, (fname, payload), caption='💾 Резервная копия настроек и базы заказов FTS-Plugin. Файл может содержать JWT-токен.')
+        bot.send_document(chat_id, (fname, payload), caption='💾 Резервная копия настроек и базы заказов FTS-Plugin. Файл может содержать JWT-токен и данные прокси.')
         try:
             bot.answer_callback_query(call.id, 'Сохранения отправлены.')
         except Exception:
@@ -3435,14 +3757,16 @@ def _num(v):
         return _parse_number_token(m.group(0))
     except Exception:
         return None
-def _fetch_fragment_prices(jwt):
+def _fetch_fragment_prices(jwt, chat_id=None, cfg=None):
     headers = {'Accept': 'application/json'}
     if jwt:
         headers['Authorization'] = f'JWT {jwt}'
+    proxy_cfg = cfg if isinstance(cfg, dict) else _fragment_proxy_cfg(chat_id=chat_id, jwt=jwt)
+    proxy_kwargs = _fragment_proxy_kwargs(jwt=jwt, chat_id=chat_id, cfg=proxy_cfg)
     last = ''
     for url in FRAGMENT_PRICES_URLS:
         try:
-            r = _HTTP.get(url, headers=headers, timeout=20)
+            r = _HTTP.get(url, headers=headers, timeout=20, **proxy_kwargs)
             if r.status_code < 400:
                 try:
                     return (r.json(), url)
@@ -3450,7 +3774,7 @@ def _fetch_fragment_prices(jwt):
                     return ({'raw': r.text}, url)
             last = f'{url}: HTTP {r.status_code} {r.text[:160]}'
         except Exception as e:
-            last = f'{url}: {e}'
+            last = f'{url}: {_fragment_proxy_redact_error(e, proxy_cfg)}'
     return (None, last)
 def _price_nodes(x):
     if isinstance(x, dict):
@@ -3548,7 +3872,7 @@ def _tonapi_rates_rub():
     out['usdt'] = out['usdt'] or usd_rub()
     return {k: v for k, v in out.items() if v}
 def _auto_unit_price_rub(cfg):
-    data, src = _fetch_fragment_prices(cfg.get('fragment_jwt'))
+    data, src = _fetch_fragment_prices(cfg.get('fragment_jwt'), cfg=cfg)
     if data is None:
         return (None, f'Не удалось получить Fragment Prices: {src}', None)
     cur = _normalize_stars_currency(cfg.get('stars_currency'))
@@ -5286,7 +5610,7 @@ def init_cardinal(cardinal):
     tg.msg_handler(_send_home, commands=['fnp', 'stars_thc'])
     tg.msg_handler(_send_info, commands=['fnphelp'])
     tg.msg_handler(lambda m: _fix_fts_command(cardinal, m), commands=['fix_fts'])
-    fsm_steps = {'set_min_balance', 'star_add_qty', 'star_add_lotid', 'msg_edit_value', 'unit_star_price_value', 'markup_percent', 'set_jwt', 'saves_import', 'local_plugin_update', 'star_price_value', 'autodump_floor_value', 'set_autodump_interval', 'set_order_watch_interval', 'set_order_wait_reminder', 'set_review_reminder_time'}
+    fsm_steps = {'set_min_balance', 'star_add_qty', 'star_add_lotid', 'msg_edit_value', 'unit_star_price_value', 'markup_percent', 'set_jwt', 'saves_import', 'local_plugin_update', 'star_price_value', 'autodump_floor_value', 'set_autodump_interval', 'set_order_watch_interval', 'set_order_wait_reminder', 'set_review_reminder_time', 'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password'}
     tg.msg_handler(lambda m: _handle_fsm(m, cardinal), func=lambda m: m.chat.id in _fsm and _fsm[m.chat.id].get('step') in fsm_steps, content_types=['text', 'document'])
     tg.cbq_handler(lambda c: _open_home(bot, c), func=lambda c: c.data.startswith(f'{CBT.EDIT_PLUGIN}:{UUID}') or c.data.startswith(f'{CBT.PLUGIN_SETTINGS}:{UUID}') or c.data == f'{UUID}:0' or (c.data == CBT_HOME))
     tg.cbq_handler(lambda c: _open_settings(bot, c), func=lambda c: c.data == CBT_SETTINGS)
@@ -5337,6 +5661,11 @@ def init_cardinal(cardinal):
     tg.cbq_handler(lambda c: _cb_markup_apply(cardinal, c), func=lambda c: c.data == CBT_MARKUP_APPLY)
     tg.cbq_handler(lambda c: _cb_markup_change(cardinal, c), func=lambda c: c.data == CBT_MARKUP_CHANGE)
     tg.cbq_handler(lambda c: _open_mini_settings(bot, c), func=lambda c: c.data == CBT_MINI_SETTINGS)
+    tg.cbq_handler(lambda c: _open_proxy_settings(bot, c), func=lambda c: c.data == CBT_PROXY)
+    tg.cbq_handler(lambda c: _start_proxy_setup(bot, c), func=lambda c: c.data == CBT_PROXY_SET)
+    tg.cbq_handler(lambda c: _choose_proxy_type(bot, c), func=lambda c: c.data.startswith(CBT_PROXY_TYPE_P))
+    tg.cbq_handler(lambda c: _check_saved_proxy(bot, c), func=lambda c: c.data == CBT_PROXY_CHECK)
+    tg.cbq_handler(lambda c: _delete_proxy(bot, c), func=lambda c: c.data == CBT_PROXY_DELETE)
     tg.cbq_handler(lambda c: _open_plugin_status(bot, c), func=lambda c: c.data == CBT_PLUGIN_STATUS)
     tg.cbq_handler(lambda c: _open_order_settings(bot, c), func=lambda c: c.data == CBT_ORDER_SETTINGS)
     tg.cbq_handler(lambda c: _open_payment_settings(bot, c), func=lambda c: c.data == CBT_PAYMENT_SETTINGS)
@@ -6834,7 +7163,7 @@ def _refresh(bot, call):
     chat_id = call.message.chat.id
     cfg = _get_cfg(chat_id)
     if cfg.get('fragment_jwt'):
-        ver, bal, usdt, raw = _check_fragment_wallet(cfg['fragment_jwt'])
+        ver, bal, usdt, raw = _check_fragment_wallet(cfg['fragment_jwt'], chat_id=chat_id)
         if ver is not None or bal is not None or usdt is not None or (raw is not None):
             _set_cfg(chat_id, wallet_version=ver, balance_ton=round(bal, 6) if isinstance(bal, (int, float)) else None, balance_usdt=round(usdt, 6) if isinstance(usdt, (int, float)) else None, last_wallet_raw=raw)
     if _CARDINAL_REF is not None:
@@ -6861,7 +7190,7 @@ def _ask_set_min_balance(bot, call):
     bot.send_message(chat_id, f'Введите новый порог баланса в {label} (сейчас {cur}). Можно с точкой или запятой. Пример: 5.5\n(или /cancel)', reply_markup=_kb_cancel_fsm())
 def _cancel_cmd(cardinal, chat_id):
     st = _fsm.get(chat_id) or {}
-    if st.get('step') in {'set_jwt', 'saves_import', 'local_plugin_update'}:
+    if st.get('step') in {'set_jwt', 'saves_import', 'local_plugin_update', 'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password'}:
         _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, st)
     _fsm.pop(chat_id, None)
     if _has_queue(chat_id):
@@ -7026,10 +7355,10 @@ def _redeem_bridge_code(code):
     result['token'] = token
     result['code'] = normalized
     return (True, 'ok', result)
-def _validate_fragment_jwt(jwt):
+def _validate_fragment_jwt(jwt, chat_id=None):
     if not _is_jwt_like(jwt):
         return (False, 'format', None, None, None, None)
-    ver, bal_ton, bal_usdt, raw = _check_fragment_wallet(jwt)
+    ver, bal_ton, bal_usdt, raw = _check_fragment_wallet(jwt, chat_id=chat_id)
     if isinstance(raw, dict) and raw.get('_auth_error'):
         return (False, 'auth', ver, bal_ton, bal_usdt, raw)
     if isinstance(bal_ton, (int, float)) or isinstance(bal_usdt, (int, float)):
@@ -7041,6 +7370,136 @@ def _handle_fsm(message, cardinal):
     chat_id = message.chat.id
     text = (message.text or '').strip()
     state = _fsm.get(chat_id) or {}
+    if state.get('step') in {'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password'}:
+        _track_fsm_mid(state, getattr(message, 'message_id', None))
+        if text.lower() in ('/cancel', 'cancel', 'отмена'):
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            _safe_send_tg(cardinal.telegram.bot, chat_id, '❌ Настройка прокси отменена.')
+            return
+        step = state.get('step')
+        if step == 'proxy_host':
+            host = text.strip().strip('[]')
+            if '://' in host:
+                host = host.split('://', 1)[1].split('/', 1)[0].split('@')[-1]
+            if (
+                not host
+                or len(host) > 255
+                or any(ch.isspace() for ch in host)
+                or any(ch in host for ch in '/?#@')
+                or (host.count(':') == 1 and host.rsplit(':', 1)[1].isdigit())
+            ):
+                _proxy_prompt(
+                    cardinal.telegram.bot,
+                    chat_id,
+                    state,
+                    '❌ Некорректный адрес. Введите только IP или домен без порта.\n'
+                    'Пример: <code>127.0.0.1</code>',
+                )
+                return
+            state['proxy_host'] = host
+            state['step'] = 'proxy_port'
+            _proxy_prompt(
+                cardinal.telegram.bot,
+                chat_id,
+                state,
+                'Введите порт прокси от <code>1</code> до <code>65535</code>.',
+            )
+            return
+        if step == 'proxy_port':
+            try:
+                port = int(text)
+                if not 1 <= port <= 65535:
+                    raise ValueError()
+            except Exception:
+                _proxy_prompt(
+                    cardinal.telegram.bot,
+                    chat_id,
+                    state,
+                    '❌ Некорректный порт. Введите число от <code>1</code> до <code>65535</code>.',
+                )
+                return
+            state['proxy_port'] = port
+            state['step'] = 'proxy_username'
+            _proxy_prompt(
+                cardinal.telegram.bot,
+                chat_id,
+                state,
+                'Введите логин прокси.\nЕсли авторизация не нужна, отправьте <code>-</code>.',
+            )
+            return
+        if step == 'proxy_username':
+            if len(text) > 255:
+                _proxy_prompt(
+                    cardinal.telegram.bot,
+                    chat_id,
+                    state,
+                    '❌ Логин слишком длинный. Максимум 255 символов.',
+                )
+                return
+            state['proxy_username'] = None if text == '-' else text
+            state['step'] = 'proxy_password'
+            _proxy_prompt(
+                cardinal.telegram.bot,
+                chat_id,
+                state,
+                'Введите пароль прокси.\nЕсли авторизация не нужна, отправьте <code>-</code>.',
+            )
+            return
+        if step == 'proxy_password':
+            if len(text) > 255:
+                _proxy_prompt(
+                    cardinal.telegram.bot,
+                    chat_id,
+                    state,
+                    '❌ Пароль слишком длинный. Максимум 255 символов.',
+                )
+                return
+            candidate = {
+                'fragment_proxy_type': state.get('proxy_type'),
+                'fragment_proxy_host': state.get('proxy_host'),
+                'fragment_proxy_port': state.get('proxy_port'),
+                'fragment_proxy_username': state.get('proxy_username'),
+                'fragment_proxy_password': None if text == '-' else text,
+            }
+            checking = cardinal.telegram.bot.send_message(chat_id, '🔄 Проверяю соединение через прокси…')
+            _track_fsm_mid(state, getattr(checking, 'message_id', None))
+            _fsm[chat_id] = state
+            cfg = _get_cfg(chat_id)
+            ok, ping, error, http_status = _test_fragment_proxy_cfg(candidate, cfg.get('fragment_jwt'))
+            if not ok:
+                _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+                _fsm.pop(chat_id, None)
+                cardinal.telegram.bot.send_message(
+                    chat_id,
+                    '❌ <b>Прокси не работает.</b>\n\n'
+                    f'Ошибка: <code>{_h(error)}</code>\n\n'
+                    'Старые настройки прокси не изменены.',
+                    parse_mode='HTML',
+                    reply_markup=_proxy_settings_kb(chat_id),
+                )
+                return
+            _set_cfg(
+                chat_id,
+                **candidate,
+                fragment_proxy_last_ok=True,
+                fragment_proxy_last_ping_ms=ping,
+                fragment_proxy_last_check_ts=int(time.time()),
+                fragment_proxy_last_error=None,
+            )
+            _cleanup_fsm_msgs(cardinal.telegram.bot, chat_id, state)
+            _fsm.pop(chat_id, None)
+            cardinal.telegram.bot.send_message(
+                chat_id,
+                '✅ <b>Прокси подключён.</b>\n\n'
+                f'Тип: <b>{_h(_fragment_proxy_label(candidate))}</b>\n'
+                f'Адрес: <code>{_h(_fragment_proxy_address(candidate))}</code>\n'
+                f'Пинг: <code>{float(ping):.0f} мс</code>\n'
+                f'HTTP Fragment: <code>{int(http_status)}</code>',
+                parse_mode='HTML',
+                reply_markup=_proxy_settings_kb(chat_id),
+            )
+            return
     if state.get('step') == 'set_jwt':
         _track_fsm_mid(state, getattr(message, 'message_id', None))
     if state.get('step') == 'msg_edit_value':
@@ -7509,7 +7968,7 @@ def _handle_fsm(message, cardinal):
                 return
             jwt_val = _clean_jwt_text((bridge_payload or {}).get('token'))
         jwt_val = _clean_jwt_text(jwt_val or '')
-        ok, reason, ver, bal, usdt, resp = _validate_fragment_jwt(jwt_val)
+        ok, reason, ver, bal, usdt, resp = _validate_fragment_jwt(jwt_val, chat_id=chat_id)
         if not ok:
             if reason == 'auth':
                 detail = _fragment_error_detail(resp) or 'Authentication credentials were not provided.'
@@ -7533,7 +7992,7 @@ def _handle_fsm(message, cardinal):
             pass
         return
 def _reset_settings_confirm_text():
-    return '⚠️ <b>Сброс настроек</b>\n\nЭто действие очистит только <code>settings.json</code>.\nНастройки и JWT будут сброшены, но база <code>orders.json</code> и история заказов сохранятся.\n\n<b>Точно хотите сбросить настройки?</b>'
+    return '⚠️ <b>Сброс настроек</b>\n\nЭто действие очистит только <code>settings.json</code>.\nНастройки, JWT и прокси будут сброшены, но база <code>orders.json</code> и история заказов сохранятся.\n\n<b>Точно хотите сбросить настройки?</b>'
 def _reset_settings_confirm_kb():
     kb = K()
     kb.row(B('✅ Да, сбросить', callback_data=CBT_RESET_SETTINGS_YES), B('❌ Отмена', callback_data=CBT_RESET_SETTINGS_NO))
